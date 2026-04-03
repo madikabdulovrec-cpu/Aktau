@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>M&M Fabrica — Приложение</title>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@300;400;500;600;700;800;900&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ===== RESET & BASE ===== */
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --yellow: #FFE600;
+  --yellow-dark: #E6CF00;
+  --pink: #FF2D7B;
+  --pink-dark: #E0196A;
+  --dark: #1A1A1A;
+  --gray: #666;
+  --light: #F5F5F5;
+  --white: #FFFFFF;
+  --green: #25D366;
+  --radius: 20px;
+  --radius-sm: 12px;
+  --radius-xs: 8px;
+  --shadow: 0 4px 20px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 40px rgba(0,0,0,0.12);
+  --transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+}
+html { font-size: 16px; -webkit-tap-highlight-color: transparent; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--light); color: var(--dark);
+  overflow-x: hidden; max-width: 480px; margin: 0 auto;
+  min-height: 100vh; position: relative; padding-bottom: 80px;
+}
+h1,h2,h3,h4,h5 { font-family: 'Unbounded', sans-serif; }
+a { text-decoration: none; color: inherit; }
+button { border: none; cursor: pointer; font-family: inherit; }
+input, textarea, select { font-family: inherit; outline: none; }
+::-webkit-scrollbar { width:0; height:0; }
+
+/* ===== SPLASH ===== */
+.splash { position:fixed; inset:0; z-index:9999; background:var(--yellow); display:flex; flex-direction:column; align-items:center; justify-content:center; transition: opacity 0.5s, visibility 0.5s; }
+.splash.hidden { opacity:0; visibility:hidden; pointer-events:none; }
+.splash-logo { font-family:'Unbounded'; font-size:3rem; font-weight:900; color:var(--dark); letter-spacing:-2px; }
+.splash-logo span { color:var(--pink); }
+.splash-sub { font-family:'Unbounded'; font-size:0.65rem; letter-spacing:0.3em; text-transform:uppercase; margin-top:8px; color:var(--dark); opacity:0.7; }
+.splash-loader { width:40px; height:40px; border:3px solid rgba(0,0,0,0.1); border-top-color:var(--pink); border-radius:50%; animation:spin 0.8s linear infinite; margin-top:30px; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* ===== STATUS BAR ===== */
+.status-bar { background:var(--yellow); padding:8px 20px; display:flex; justify-content:space-between; align-items:center; font-size:0.75rem; font-weight:600; position:sticky; top:0; z-index:100; }
+
+/* ===== APP HEADER ===== */
+.app-header { background:var(--yellow); padding:12px 20px 16px; display:flex; justify-content:space-between; align-items:center; position:sticky; top:30px; z-index:99; }
+.app-header-logo { font-family:'Unbounded'; font-size:1.6rem; font-weight:900; }
+.app-header-logo span { color:var(--pink); }
+.header-actions { display:flex; gap:12px; align-items:center; }
+.header-btn { width:40px; height:40px; border-radius:50%; background:rgba(0,0,0,0.08); display:flex; align-items:center; justify-content:center; font-size:1.1rem; transition:var(--transition); position:relative; }
+.header-btn:active { transform:scale(0.9); }
+.notif-badge { position:absolute; top:-2px; right:-2px; width:16px; height:16px; border-radius:50%; background:var(--pink); color:white; font-size:0.6rem; display:flex; align-items:center; justify-content:center; font-weight:700; }
+
+/* ===== PAGE SYSTEM ===== */
+.page { display:none; animation:fadeIn 0.3s ease; }
+.page.active { display:block; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+@keyframes slideUp { from{transform:translateY(100%)} to{transform:translateY(0)} }
+@keyframes popIn { from{opacity:0;transform:scale(0.9)} to{opacity:1;transform:scale(1)} }
+@keyframes confetti { 0%{transform:translateY(0) rotate(0);opacity:1} 100%{transform:translateY(100vh) rotate(720deg);opacity:0} }
+
+/* ===== BUTTONS ===== */
+.btn-primary { display:block; width:100%; padding:16px; background:var(--pink); color:white; border-radius:50px; font-weight:700; font-size:0.9rem; text-align:center; transition:var(--transition); box-shadow:0 4px 16px rgba(255,45,123,0.3); }
+.btn-primary:active { transform:scale(0.97); background:var(--pink-dark); }
+.btn-secondary { display:block; width:100%; padding:16px; background:var(--yellow); color:var(--dark); border-radius:50px; font-weight:700; font-size:0.9rem; text-align:center; transition:var(--transition); }
+.btn-secondary:active { transform:scale(0.97); }
+.btn-outline { display:block; width:100%; padding:14px; background:transparent; color:var(--dark); border:2px solid #eee; border-radius:50px; font-weight:600; font-size:0.85rem; text-align:center; transition:var(--transition); }
+.btn-outline:active { background:var(--light); }
+.btn-whatsapp { display:flex; align-items:center; justify-content:center; gap:8px; width:100%; padding:16px; background:var(--green); color:white; border-radius:50px; font-weight:700; font-size:0.9rem; transition:var(--transition); }
+.btn-whatsapp:active { transform:scale(0.97); }
+.btn-sm { padding:10px 20px; font-size:0.8rem; border-radius:50px; font-weight:600; display:inline-block; }
+
+/* ===== SECTION ===== */
+.section-header { display:flex; justify-content:space-between; align-items:center; padding:24px 20px 12px; }
+.section-title { font-family:'Unbounded'; font-size:1rem; font-weight:700; }
+.section-link { color:var(--pink); font-weight:600; font-size:0.8rem; }
+
+/* ===== PAGE BACK HEADER ===== */
+.page-back-header { display:flex; align-items:center; gap:12px; padding:16px 20px; background:var(--yellow); }
+.back-btn { width:36px; height:36px; border-radius:50%; background:rgba(0,0,0,0.08); display:flex; align-items:center; justify-content:center; font-size:1rem; transition:var(--transition); }
+.back-btn:active { transform:scale(0.9); }
+.page-title { font-family:'Unbounded'; font-size:1rem; font-weight:700; }
+
+/* ===== CARDS ===== */
+.card { background:white; border-radius:var(--radius-sm); padding:20px; box-shadow:var(--shadow); margin-bottom:12px; }
+.card-sm { background:white; border-radius:var(--radius-sm); padding:16px; box-shadow:var(--shadow); }
+
+/* ===== HERO CARD ===== */
+.hero-card { margin:16px 20px; border-radius:var(--radius); background:linear-gradient(135deg,var(--pink) 0%,#FF6B9D 100%); color:white; padding:28px 24px; position:relative; overflow:hidden; }
+.hero-card::after { content:''; position:absolute; top:-30px; right:-30px; width:120px; height:120px; border-radius:50%; background:rgba(255,255,255,0.15); }
+.hero-greeting { font-size:0.85rem; opacity:0.9; margin-bottom:4px; }
+.hero-title { font-family:'Unbounded'; font-size:1.3rem; font-weight:700; margin-bottom:12px; line-height:1.3; }
+.hero-btn { display:inline-flex; align-items:center; gap:8px; background:white; color:var(--pink); padding:12px 24px; border-radius:50px; font-weight:700; font-size:0.85rem; transition:var(--transition); position:relative; z-index:1; }
+.hero-btn:active { transform:scale(0.95); }
+
+/* ===== QUICK ACTIONS ===== */
+.quick-actions { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:0 20px; margin-top:20px; }
+.quick-action { background:white; border-radius:var(--radius-sm); padding:16px 8px; text-align:center; box-shadow:var(--shadow); transition:var(--transition); }
+.quick-action:active { transform:scale(0.95); }
+.quick-action-icon { width:48px; height:48px; border-radius:14px; margin:0 auto 8px; display:flex; align-items:center; justify-content:center; font-size:1.4rem; }
+.quick-action-icon.yellow { background:rgba(255,230,0,0.2); }
+.quick-action-icon.pink { background:rgba(255,45,123,0.15); }
+.quick-action-icon.green { background:rgba(37,211,102,0.15); }
+.quick-action-icon.blue { background:rgba(59,130,246,0.15); }
+.quick-action-label { font-size:0.7rem; font-weight:600; color:var(--gray); }
+
+/* ===== STATS BAR ===== */
+.stats-bar { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; padding:0 20px; margin:16px 0; }
+.stat-item { background:white; border-radius:var(--radius-sm); padding:14px 8px; text-align:center; box-shadow:var(--shadow); }
+.stat-num { font-family:'Unbounded'; font-size:1.2rem; font-weight:800; color:var(--pink); }
+.stat-label { font-size:0.6rem; color:var(--gray); margin-top:2px; text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+
+/* ===== SCROLL CONTAINERS ===== */
+.h-scroll { display:flex; gap:12px; padding:0 20px; overflow-x:auto; scroll-snap-type:x mandatory; -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+.h-scroll::-webkit-scrollbar { display:none; }
+
+/* ===== SERVICE CARDS ===== */
+.service-mini-card { flex:0 0 200px; scroll-snap-align:start; background:white; border-radius:var(--radius-sm); padding:20px 16px; box-shadow:var(--shadow); }
+.service-mini-badge { display:inline-block; padding:4px 10px; border-radius:20px; font-size:0.6rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:10px; }
+.badge-hit { background:var(--pink); color:white; }
+.badge-new { background:var(--yellow); color:var(--dark); }
+.badge-premium { background:var(--dark); color:var(--yellow); }
+.badge-exclusive { background:linear-gradient(135deg,#8B5CF6,#EC4899); color:white; }
+.service-mini-title { font-family:'Unbounded'; font-size:0.85rem; font-weight:700; margin-bottom:6px; }
+.service-mini-desc { font-size:0.75rem; color:var(--gray); line-height:1.4; margin-bottom:12px; }
+.service-mini-price { font-family:'Unbounded'; font-size:0.9rem; font-weight:700; color:var(--pink); }
+.service-mini-unit { font-size:0.65rem; color:var(--gray); }
+
+/* ===== PROGRAM CARDS ===== */
+.program-card { flex:0 0 260px; scroll-snap-align:start; border-radius:var(--radius); padding:24px 20px; color:white; position:relative; overflow:hidden; cursor:pointer; }
+.program-card.vip { background:linear-gradient(135deg,#1a1a1a,#333); }
+.program-card.youth { background:linear-gradient(135deg,#8B5CF6,#6D28D9); }
+.program-card.reforma { background:linear-gradient(135deg,var(--pink),#FF6B9D); }
+.program-card.secret { background:linear-gradient(135deg,#F59E0B,#D97706); }
+.program-card.balance { background:linear-gradient(135deg,#10B981,#059669); }
+.program-letter { font-family:'Unbounded'; font-size:3rem; font-weight:900; opacity:0.15; position:absolute; top:10px; right:16px; }
+.program-name { font-family:'Unbounded'; font-size:1rem; font-weight:700; margin-bottom:6px; }
+.program-desc { font-size:0.75rem; opacity:0.85; line-height:1.4; margin-bottom:14px; }
+.program-meta { display:flex; gap:12px; margin-bottom:14px; flex-wrap:wrap; }
+.program-meta-item { font-size:0.7rem; opacity:0.8; display:flex; align-items:center; gap:4px; }
+.program-price { font-family:'Unbounded'; font-size:1.1rem; font-weight:700; }
+.program-btn { display:inline-block; margin-top:12px; padding:10px 20px; border-radius:50px; background:rgba(255,255,255,0.2); color:white; font-weight:600; font-size:0.8rem; transition:var(--transition); backdrop-filter:blur(4px); }
+.program-btn:active { background:rgba(255,255,255,0.35); }
+
+/* ===== REVIEWS ===== */
+.review-card { flex:0 0 280px; background:white; border-radius:var(--radius-sm); padding:20px; box-shadow:var(--shadow); }
+.review-stars { color:#F59E0B; font-size:0.85rem; margin-bottom:8px; }
+.review-text { font-size:0.8rem; color:var(--dark); line-height:1.5; margin-bottom:12px; font-style:italic; }
+.review-author { font-weight:600; font-size:0.8rem; }
+.review-date { font-size:0.7rem; color:var(--gray); }
+
+/* ===== CATALOG ===== */
+.filter-tabs { display:flex; gap:8px; padding:16px 20px; overflow-x:auto; scrollbar-width:none; }
+.filter-tabs::-webkit-scrollbar { display:none; }
+.filter-tab { flex-shrink:0; padding:10px 18px; border-radius:50px; font-size:0.78rem; font-weight:600; background:white; color:var(--gray); border:2px solid #eee; transition:var(--transition); white-space:nowrap; }
+.filter-tab.active { background:var(--pink); color:white; border-color:var(--pink); }
+.catalog-grid { padding:0 20px; display:flex; flex-direction:column; gap:12px; }
+.catalog-card { background:white; border-radius:var(--radius-sm); padding:20px; box-shadow:var(--shadow); display:flex; justify-content:space-between; align-items:center; transition:var(--transition); }
+.catalog-card:active { transform:scale(0.98); }
+.catalog-info { flex:1; }
+.catalog-badge { display:inline-block; padding:3px 8px; border-radius:6px; font-size:0.6rem; font-weight:700; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.05em; }
+.catalog-name { font-family:'Unbounded'; font-size:0.85rem; font-weight:600; margin-bottom:4px; }
+.catalog-desc { font-size:0.73rem; color:var(--gray); line-height:1.4; margin-bottom:8px; }
+.catalog-price { font-family:'Unbounded'; font-size:0.95rem; font-weight:700; color:var(--pink); }
+.catalog-session { font-size:0.65rem; color:var(--gray); }
+.catalog-book-btn { padding:10px 18px; border-radius:50px; background:var(--yellow); color:var(--dark); font-weight:700; font-size:0.75rem; transition:var(--transition); flex-shrink:0; margin-left:12px; }
+
+/* ===== BOOKING ===== */
+.booking-steps { display:flex; justify-content:center; gap:8px; padding:20px; align-items:center; }
+.booking-step { width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:0.75rem; font-weight:700; background:#eee; color:var(--gray); transition:var(--transition); }
+.booking-step.active { background:var(--pink); color:white; }
+.booking-step.done { background:var(--green); color:white; }
+.step-line { width:30px; height:2px; background:#eee; }
+.step-line.done { background:var(--green); }
+.booking-section { display:none; animation:fadeIn 0.3s ease; }
+.booking-section.active { display:block; }
+.service-select-item { background:white; border-radius:var(--radius-sm); padding:16px; box-shadow:var(--shadow); display:flex; align-items:center; gap:14px; cursor:pointer; transition:var(--transition); border:2px solid transparent; margin-bottom:10px; }
+.service-select-item.selected { border-color:var(--pink); background:rgba(255,45,123,0.04); }
+.service-select-icon { width:44px; height:44px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:1.3rem; flex-shrink:0; }
+.service-select-name { font-weight:600; font-size:0.85rem; }
+.service-select-price { font-size:0.75rem; color:var(--pink); font-weight:600; }
+
+/* Calendar */
+.calendar-wrapper { background:white; border-radius:var(--radius); padding:20px; box-shadow:var(--shadow); margin-bottom:16px; }
+.calendar-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+.calendar-month { font-family:'Unbounded'; font-size:0.9rem; font-weight:600; }
+.calendar-days { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; text-align:center; margin-bottom:8px; }
+.calendar-day-name { font-size:0.65rem; color:var(--gray); font-weight:600; padding:4px; }
+.calendar-day { aspect-ratio:1; display:flex; align-items:center; justify-content:center; border-radius:50%; font-size:0.8rem; font-weight:500; cursor:pointer; transition:var(--transition); }
+.calendar-day.today { background:var(--yellow); font-weight:700; }
+.calendar-day.selected { background:var(--pink); color:white; font-weight:700; }
+.calendar-day.disabled { opacity:0.3; pointer-events:none; }
+.time-slots { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+.time-slot { padding:12px; text-align:center; border-radius:var(--radius-xs); background:white; box-shadow:var(--shadow); font-weight:600; font-size:0.85rem; transition:var(--transition); cursor:pointer; }
+.time-slot.selected { background:var(--pink); color:white; }
+.time-slot.disabled { opacity:0.3; pointer-events:none; }
+
+/* Form */
+.form-group { margin-bottom:16px; }
+.form-label { font-weight:600; font-size:0.8rem; margin-bottom:6px; display:block; }
+.form-input { width:100%; padding:14px 16px; border-radius:var(--radius-xs); border:2px solid #eee; font-size:0.9rem; transition:var(--transition); background:white; }
+.form-input:focus { border-color:var(--pink); }
+textarea.form-input { resize:none; min-height:80px; }
+
+/* ===== MODALS ===== */
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:200; display:none; align-items:flex-end; justify-content:center; backdrop-filter:blur(4px); }
+.modal-overlay.active { display:flex; }
+.modal { background:white; border-radius:24px 24px 0 0; width:100%; max-width:480px; max-height:85vh; overflow-y:auto; animation:slideUp 0.3s ease; padding:24px 20px 40px; }
+.modal-handle { width:40px; height:4px; border-radius:2px; background:#ddd; margin:0 auto 16px; }
+.modal-title { font-family:'Unbounded'; font-size:1.1rem; font-weight:700; margin-bottom:16px; text-align:center; }
+
+/* ===== TOAST ===== */
+.toast { position:fixed; top:60px; left:50%; transform:translateX(-50%) translateY(-100px); background:var(--dark); color:white; padding:14px 24px; border-radius:50px; font-size:0.85rem; font-weight:600; z-index:300; transition:transform 0.3s ease; white-space:nowrap; box-shadow:var(--shadow-lg); }
+.toast.show { transform:translateX(-50%) translateY(0); }
+
+/* ===== FAQ ===== */
+.faq-list { padding:0 20px; }
+.faq-item { background:white; border-radius:var(--radius-sm); margin-bottom:8px; box-shadow:var(--shadow); overflow:hidden; }
+.faq-question { padding:16px 18px; font-weight:600; font-size:0.85rem; display:flex; justify-content:space-between; align-items:center; cursor:pointer; }
+.faq-arrow { transition:transform 0.3s; font-size:0.8rem; color:var(--gray); }
+.faq-item.open .faq-arrow { transform:rotate(180deg); }
+.faq-answer { max-height:0; overflow:hidden; transition:max-height 0.3s ease; padding:0 18px; font-size:0.8rem; color:var(--gray); line-height:1.5; }
+.faq-item.open .faq-answer { max-height:200px; padding-bottom:16px; }
+
+/* ===== PROCESS STEPS ===== */
+.process-steps { padding:0 20px; }
+.process-step { background:white; border-radius:var(--radius-sm); padding:20px; margin-bottom:12px; box-shadow:var(--shadow); display:flex; gap:16px; align-items:flex-start; }
+.step-number { width:36px; height:36px; border-radius:50%; background:var(--yellow); display:flex; align-items:center; justify-content:center; font-family:'Unbounded'; font-weight:800; font-size:0.9rem; flex-shrink:0; }
+
+/* ===== CONTACT ===== */
+.contact-card { background:white; border-radius:var(--radius); padding:20px; margin:0 20px 16px; box-shadow:var(--shadow); }
+.contact-row { display:flex; gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid #f0f0f0; }
+.contact-row:last-child { border-bottom:none; }
+
+/* ===== PROMO BANNER ===== */
+.promo-banner { margin:16px 20px; border-radius:var(--radius); background:linear-gradient(135deg,var(--dark) 0%,#333 100%); color:white; padding:20px; position:relative; overflow:hidden; }
+.promo-banner::after { content:''; position:absolute; top:-20px; right:-20px; width:100px; height:100px; border-radius:50%; background:var(--yellow); opacity:0.15; }
+.promo-tag { font-size:0.65rem; font-weight:700; color:var(--yellow); text-transform:uppercase; letter-spacing:0.1em; margin-bottom:8px; }
+.promo-title { font-family:'Unbounded'; font-size:0.95rem; font-weight:700; margin-bottom:6px; line-height:1.3; }
+.promo-text { font-size:0.75rem; opacity:0.8; line-height:1.4; margin-bottom:14px; }
+
+/* ===== PRICE LIST ===== */
+.price-tab-bar { display:flex; gap:6px; padding:0 20px 12px; overflow-x:auto; scrollbar-width:none; }
+.price-tab-bar::-webkit-scrollbar { display:none; }
+.price-tab-btn { flex-shrink:0; padding:8px 16px; border-radius:50px; font-size:0.7rem; font-weight:600; background:white; color:var(--gray); border:2px solid #eee; transition:var(--transition); white-space:nowrap; }
+.price-tab-btn.active { background:var(--dark); color:var(--yellow); border-color:var(--dark); }
+.price-panel { display:none; padding:0 20px; }
+.price-panel.active { display:block; }
+.price-row { display:flex; justify-content:space-between; align-items:center; padding:14px 0; border-bottom:1px solid #f0f0f0; }
+.price-row:last-child { border-bottom:none; }
+.price-name { font-weight:600; font-size:0.8rem; flex:1; }
+.price-sessions { font-size:0.7rem; color:var(--gray); margin:0 12px; }
+.price-amount { font-family:'Unbounded'; font-size:0.8rem; font-weight:700; color:var(--pink); white-space:nowrap; }
+
+/* ===== FLOATING WHATSAPP ===== */
+.fab-whatsapp { position:fixed; bottom:90px; right:16px; width:54px; height:54px; border-radius:50%; background:var(--green); color:white; display:flex; align-items:center; justify-content:center; font-size:1.5rem; box-shadow:0 4px 16px rgba(37,211,102,0.4); z-index:90; transition:var(--transition); animation:pulse 2s infinite; cursor:pointer; }
+@keyframes pulse { 0%,100%{box-shadow:0 4px 16px rgba(37,211,102,0.4)} 50%{box-shadow:0 4px 30px rgba(37,211,102,0.6)} }
+
+/* ===== BOTTOM NAV ===== */
+.bottom-nav { position:fixed; bottom:0; left:50%; transform:translateX(-50%); width:100%; max-width:480px; background:white; border-top:1px solid #eee; display:flex; justify-content:space-around; align-items:center; padding:8px 0 12px; z-index:100; box-shadow:0 -4px 20px rgba(0,0,0,0.06); }
+.nav-item { display:flex; flex-direction:column; align-items:center; gap:2px; cursor:pointer; transition:var(--transition); padding:4px 12px; }
+.nav-item.active .nav-icon { color:var(--pink); }
+.nav-item.active .nav-label { color:var(--pink); }
+.nav-icon { font-size:1.3rem; color:#aaa; transition:var(--transition); }
+.nav-label { font-size:0.6rem; font-weight:600; color:#aaa; transition:var(--transition); }
+.nav-center { width:56px; height:56px; border-radius:50%; background:var(--pink); color:white; display:flex; align-items:center; justify-content:center; font-size:1.5rem; margin-top:-20px; box-shadow:0 4px 16px rgba(255,45,123,0.4); transition:var(--transition); }
+
+/* ============================================================ */
+/* ===== PERSONAL CABINET (NEW!) ===== */
+/* ============================================================ */
+
+/* Profile Header */
+.profile-hero {
+  background: linear-gradient(135deg, var(--yellow) 0%, #FFD700 100%);
+  padding: 24px 20px 30px; border-radius: 0 0 30px 30px; position: relative;
+}
+.profile-avatar-ring {
+  width: 90px; height: 90px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--pink), #FF6B9D);
+  padding: 3px; margin: 0 auto 12px;
+}
+.profile-avatar-inner {
+  width: 100%; height: 100%; border-radius: 50%; background: white;
+  display: flex; align-items: center; justify-content: center; font-size: 2.2rem;
+}
+.profile-user-name { font-family:'Unbounded'; font-size:1.1rem; font-weight:700; text-align:center; }
+.profile-user-phone { font-size:0.8rem; color:var(--gray); text-align:center; margin-top:4px; }
+.profile-user-since { font-size:0.68rem; color:var(--gray); text-align:center; margin-top:2px; }
+.profile-quick-stats {
+  display: grid; grid-template-columns: repeat(3,1fr);
+  gap: 8px; margin: 16px 0 0; padding: 0;
+}
+.pqs-item {
+  background: rgba(255,255,255,0.8); border-radius: 14px; padding: 12px 8px;
+  text-align: center; backdrop-filter: blur(6px);
+}
+.pqs-num { font-family:'Unbounded'; font-size:1.1rem; font-weight:700; color:var(--pink); }
+.pqs-label { font-size:0.6rem; color:var(--gray); text-transform:uppercase; font-weight:600; margin-top:2px; }
+
+/* Cabinet Tabs */
+.cab-tabs {
+  display: flex; gap: 4px; padding: 16px 20px 0;
+  overflow-x: auto; scrollbar-width: none;
+}
+.cab-tabs::-webkit-scrollbar { display:none; }
+.cab-tab {
+  flex-shrink: 0; padding: 10px 16px; border-radius: 12px 12px 0 0;
+  font-size: 0.72rem; font-weight: 600; background: #eee; color: var(--gray);
+  transition: var(--transition); white-space: nowrap; cursor: pointer;
+}
+.cab-tab.active { background: white; color: var(--dark); box-shadow: 0 -2px 10px rgba(0,0,0,0.05); }
+.cab-panel { display:none; padding:16px 20px; animation:fadeIn 0.3s ease; }
+.cab-panel.active { display:block; }
+
+/* Subscription Cards */
+.sub-card {
+  border-radius: var(--radius); padding: 20px; margin-bottom: 14px;
+  position: relative; overflow: hidden; color: white;
+}
+.sub-card.active-sub { background: linear-gradient(135deg, var(--pink), #FF6B9D); }
+.sub-card.expired-sub { background: linear-gradient(135deg, #9CA3AF, #6B7280); }
+.sub-card.frozen-sub { background: linear-gradient(135deg, #3B82F6, #2563EB); }
+.sub-card-badge {
+  display: inline-block; padding: 3px 10px; border-radius: 20px;
+  font-size: 0.6rem; font-weight: 700; text-transform: uppercase;
+  background: rgba(255,255,255,0.25); margin-bottom: 10px;
+}
+.sub-card-name { font-family:'Unbounded'; font-size:0.95rem; font-weight:700; margin-bottom:4px; }
+.sub-card-detail { font-size:0.75rem; opacity:0.9; margin-bottom:2px; }
+.sub-progress { background:rgba(255,255,255,0.25); border-radius:20px; height:8px; margin-top:12px; overflow:hidden; }
+.sub-progress-bar { height:100%; border-radius:20px; background:white; transition:width 0.6s ease; }
+.sub-card-action { display:inline-block; margin-top:12px; padding:8px 16px; border-radius:50px; background:rgba(255,255,255,0.2); color:white; font-weight:600; font-size:0.75rem; cursor:pointer; transition:var(--transition); }
+.sub-card-action:active { background:rgba(255,255,255,0.35); }
+
+/* Anthropometry */
+.anthro-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px; }
+.anthro-card {
+  background: white; border-radius: var(--radius-sm); padding: 16px;
+  box-shadow: var(--shadow); text-align: center;
+}
+.anthro-label { font-size:0.68rem; color:var(--gray); text-transform:uppercase; font-weight:600; margin-bottom:6px; }
+.anthro-values { display:flex; justify-content:center; align-items:center; gap:8px; }
+.anthro-old { font-size:0.85rem; color:#ccc; text-decoration:line-through; }
+.anthro-new { font-family:'Unbounded'; font-size:1.1rem; font-weight:700; color:var(--dark); }
+.anthro-diff {
+  font-size:0.7rem; font-weight:700; padding:2px 8px; border-radius:20px;
+  display:inline-block; margin-top:4px;
+}
+.anthro-diff.good { background:rgba(16,185,129,0.15); color:#059669; }
+.anthro-diff.neutral { background:rgba(245,158,11,0.15); color:#D97706; }
+.anthro-diff.up { background:rgba(255,45,123,0.1); color:var(--pink); }
+
+/* Comparison Chart Mini */
+.anthro-comparison {
+  background: white; border-radius: var(--radius-sm); padding: 20px;
+  box-shadow: var(--shadow); margin-bottom: 16px;
+}
+.anthro-bar-row { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+.anthro-bar-label { width:60px; font-size:0.7rem; font-weight:600; text-align:right; }
+.anthro-bar-track { flex:1; height:24px; background:#f0f0f0; border-radius:12px; position:relative; overflow:hidden; }
+.anthro-bar-first { position:absolute; left:0; top:0; height:100%; border-radius:12px; background:rgba(255,45,123,0.3); }
+.anthro-bar-last { position:absolute; left:0; top:0; height:100%; border-radius:12px; background:var(--pink); }
+.anthro-bar-vals { display:flex; justify-content:space-between; font-size:0.65rem; color:var(--gray); margin-top:2px; }
+
+/* Gratitude / Motivation */
+.gratitude-card {
+  background: linear-gradient(135deg, #FEF3C7, #FDE68A); border-radius: var(--radius);
+  padding: 24px; margin-bottom: 14px; text-align: center;
+  position: relative; overflow: hidden;
+}
+.gratitude-card::before {
+  content: ''; position: absolute; top: -15px; right: -15px;
+  width: 80px; height: 80px; border-radius: 50%;
+  background: rgba(255,255,255,0.4);
+}
+.gratitude-emoji { font-size: 3rem; margin-bottom: 10px; }
+.gratitude-title { font-family:'Unbounded'; font-size:0.95rem; font-weight:700; margin-bottom:6px; }
+.gratitude-text { font-size:0.8rem; color:var(--gray); line-height:1.5; }
+.gratitude-date { font-size:0.7rem; color:#B5A33B; margin-top:8px; }
+.gratitude-streak {
+  background:linear-gradient(135deg, var(--pink), #FF6B9D);
+  color:white; border-radius:var(--radius); padding:20px;
+  text-align:center; margin-bottom:14px;
+}
+.streak-num { font-family:'Unbounded'; font-size:2.5rem; font-weight:900; }
+.streak-label { font-size:0.8rem; opacity:0.9; }
+.streak-fire { font-size:1.5rem; }
+
+/* Tips */
+.tip-card {
+  background:white; border-radius:var(--radius-sm); padding:18px;
+  box-shadow:var(--shadow); margin-bottom:12px;
+  border-left:4px solid var(--pink);
+}
+.tip-category { font-size:0.65rem; color:var(--pink); text-transform:uppercase; font-weight:700; letter-spacing:0.05em; margin-bottom:4px; }
+.tip-title { font-weight:700; font-size:0.85rem; margin-bottom:4px; }
+.tip-text { font-size:0.78rem; color:var(--gray); line-height:1.5; }
+
+/* Visit History */
+.visit-item {
+  background:white; border-radius:var(--radius-sm); padding:16px;
+  box-shadow:var(--shadow); margin-bottom:10px;
+  display:flex; gap:14px; align-items:center;
+}
+.visit-date-box {
+  width:50px; height:50px; border-radius:12px;
+  background:var(--yellow); display:flex; flex-direction:column;
+  align-items:center; justify-content:center; flex-shrink:0;
+}
+.visit-day { font-family:'Unbounded'; font-size:1rem; font-weight:700; }
+.visit-month { font-size:0.55rem; text-transform:uppercase; font-weight:600; color:var(--gray); }
+.visit-info { flex:1; }
+.visit-service { font-weight:600; font-size:0.85rem; }
+.visit-time { font-size:0.7rem; color:var(--gray); }
+
+/* Purchase Flow */
+.purchase-card {
+  background:white; border-radius:var(--radius); padding:20px;
+  box-shadow:var(--shadow); margin-bottom:14px; border:2px solid transparent;
+  transition:var(--transition); cursor:pointer;
+}
+.purchase-card.selected-purchase { border-color:var(--pink); background:rgba(255,45,123,0.03); }
+.purchase-card:active { transform:scale(0.98); }
+.purchase-popular {
+  display:inline-block; padding:3px 10px; border-radius:20px;
+  background:var(--yellow); font-size:0.6rem; font-weight:700; margin-bottom:8px;
+}
+.purchase-name { font-family:'Unbounded'; font-size:0.9rem; font-weight:700; margin-bottom:4px; }
+.purchase-desc { font-size:0.75rem; color:var(--gray); line-height:1.4; margin-bottom:8px; }
+.purchase-price-row { display:flex; justify-content:space-between; align-items:center; }
+.purchase-price { font-family:'Unbounded'; font-size:1.1rem; font-weight:700; color:var(--pink); }
+.purchase-old-price { text-decoration:line-through; color:#ccc; font-size:0.85rem; }
+
+/* Confetti */
+.confetti-container { position:fixed; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:999; overflow:hidden; }
+.confetti-piece { position:absolute; width:10px; height:10px; top:-20px; animation:confetti 2.5s ease-out forwards; }
+
+/* Notification items */
+.notif-item { background:white; border-radius:var(--radius-sm); padding:16px; margin-bottom:10px; box-shadow:var(--shadow); display:flex; gap:14px; align-items:flex-start; }
+.notif-unread { border-left:3px solid var(--pink); }
+.notif-icon { width:40px; height:40px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:1.1rem; flex-shrink:0; }
+
+/* Profile menu items */
+.profile-menu-item { background:white; border-radius:var(--radius-sm); padding:16px 18px; margin-bottom:8px; display:flex; align-items:center; gap:14px; box-shadow:var(--shadow); cursor:pointer; transition:var(--transition); }
+.profile-menu-item:active { transform:scale(0.98); }
+.profile-menu-icon { width:40px; height:40px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:1.1rem; flex-shrink:0; }
+.profile-menu-label { font-weight:600; font-size:0.85rem; }
+.profile-menu-sub { font-size:0.7rem; color:var(--gray); }
+
+/* Success check */
+.success-check { width:80px; height:80px; border-radius:50%; background:var(--green); color:white; display:flex; align-items:center; justify-content:center; font-size:2.5rem; margin:30px auto 20px; animation:popIn 0.4s ease; }
+</style>
+</head>
+<body>
+
+<!-- SPLASH -->
+<div class="splash" id="splash">
+  <div class="splash-logo">M<span>&</span>M</div>
+  <div class="splash-sub">Fabrica</div>
+  <div class="splash-loader"></div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<!-- CONFETTI CONTAINER -->
+<div class="confetti-container" id="confettiContainer"></div>
+
+<!-- STATUS BAR -->
+<div class="status-bar">
+  <span>9:41</span>
+  <span>M&M Fabrica</span>
+  <span>📶 🔋</span>
+</div>
+
+<!-- ==================== PAGE: HOME ==================== -->
+<div class="page active" id="page-home">
+  <div class="app-header">
+    <div class="app-header-logo">M<span>&</span>M</div>
+    <div class="header-actions">
+      <button class="header-btn" onclick="showPage('notifications')">🔔<span class="notif-badge">3</span></button>
+      <button class="header-btn" onclick="showPage('cabinet')">👤</button>
+    </div>
+  </div>
+
+  <div class="hero-card">
+    <div class="hero-greeting">Добро пожаловать в</div>
+    <div class="hero-title">Фабрику Красивых Тел ✨</div>
+    <button class="hero-btn" onclick="showPage('booking')">Записаться на сеанс ★</button>
+  </div>
+
+  <div class="quick-actions">
+    <div class="quick-action" onclick="showPage('services')"><div class="quick-action-icon yellow">💆</div><div class="quick-action-label">Услуги</div></div>
+    <div class="quick-action" onclick="showPage('programs')"><div class="quick-action-icon pink">🎯</div><div class="quick-action-label">Программы</div></div>
+    <div class="quick-action" onclick="showPage('shop')"><div class="quick-action-icon blue">🛒</div><div class="quick-action-label">Купить</div></div>
+    <div class="quick-action" onclick="openWhatsApp()"><div class="quick-action-icon green">💬</div><div class="quick-action-label">WhatsApp</div></div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat-item"><div class="stat-num">64</div><div class="stat-label">Аппарата</div></div>
+    <div class="stat-item"><div class="stat-num">32</div><div class="stat-label">Техники</div></div>
+    <div class="stat-item"><div class="stat-num">4000+</div><div class="stat-label">Клиентов</div></div>
+    <div class="stat-item"><div class="stat-num">300м²</div><div class="stat-label">Студия</div></div>
+  </div>
+
+  <div class="section-header">
+    <div class="section-title">Популярные услуги</div>
+    <button class="section-link" onclick="showPage('services')">Все →</button>
+  </div>
+  <div class="h-scroll">
+    <div class="service-mini-card" onclick="openServiceModal('cryo')"><span class="service-mini-badge badge-hit">ХИТ</span><div class="service-mini-title">Криолиполиз</div><div class="service-mini-desc">Локальное уменьшение жировых отложений охлаждением</div><div class="service-mini-price">80 000 ₸ <span class="service-mini-unit">/ сеанс</span></div></div>
+    <div class="service-mini-card" onclick="openServiceModal('magnetic')"><span class="service-mini-badge badge-premium">PREMIUM</span><div class="service-mini-title">Magnetic Pro</div><div class="service-mini-desc">Магнитная стимуляция для разрушения жировых клеток</div><div class="service-mini-price">75 000 ₸ <span class="service-mini-unit">/ сеанс</span></div></div>
+    <div class="service-mini-card" onclick="openServiceModal('indiba')"><span class="service-mini-badge badge-exclusive">ЭКСКЛЮЗИВ</span><div class="service-mini-title">Индиба</div><div class="service-mini-desc">Радиочастотная терапия для глубокого прогрева тканей</div><div class="service-mini-price">50 000 ₸ <span class="service-mini-unit">/ сеанс</span></div></div>
+    <div class="service-mini-card"><span class="service-mini-badge badge-new">НОВИНКА</span><div class="service-mini-title">Холодная плазма</div><div class="service-mini-desc">Неинвазивное обновление кожи лица</div><div class="service-mini-price">72 000 ₸ <span class="service-mini-unit">/ сеанс</span></div></div>
+    <div class="service-mini-card"><span class="service-mini-badge badge-hit">ТОП</span><div class="service-mini-title">LPG массаж</div><div class="service-mini-desc">Роликово-вакуумная методика моделирования фигуры</div><div class="service-mini-price">18 000 ₸ <span class="service-mini-unit">/ сеанс</span></div></div>
+  </div>
+
+  <div class="promo-banner">
+    <div class="promo-tag">🔥 Специальное предложение</div>
+    <div class="promo-title">Бесплатная InBody-диагностика</div>
+    <div class="promo-text">Узнай состав своего тела: % жира, воды, мышц. Получи индивидуальный план!</div>
+    <button class="btn-sm" style="background:var(--yellow);color:var(--dark);font-weight:700;" onclick="showPage('booking')">Записаться →</button>
+  </div>
+
+  <div class="section-header"><div class="section-title">Программы</div><button class="section-link" onclick="showPage('programs')">Все →</button></div>
+  <div class="h-scroll">
+    <div class="program-card vip"><div class="program-letter">V</div><div class="program-name">Программа VIP</div><div class="program-desc">Премиальный формат работы со всем телом. Сопровождение 24/7.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 2 часа</span></div><div class="program-price">360 000 ₸</div></div>
+    <div class="program-card youth"><div class="program-letter">К</div><div class="program-name">Код молодости</div><div class="program-desc">Комплексная программа для лица и шеи.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 2 часа</span></div><div class="program-price">480 000 ₸</div></div>
+    <div class="program-card reforma"><div class="program-letter">R</div><div class="program-name">Re:Forma</div><div class="program-desc">Мягкое послеродовое восстановление.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 60 мин</span></div><div class="program-price">180 000 ₸</div></div>
+    <div class="program-card secret"><div class="program-letter">С</div><div class="program-name">Секретное оружие</div><div class="program-desc">Точечная коррекция живота и боков.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 90 мин</span></div><div class="program-price">255 000 ₸</div></div>
+    <div class="program-card balance"><div class="program-letter">B</div><div class="program-name">Balance</div><div class="program-desc">Гармонизация фигуры и баланс пропорций.</div><div class="program-meta"><span class="program-meta-item">📅 10 сеансов</span><span class="program-meta-item">⏱ 3 часа</span></div><div class="program-price">325 000 ₸</div></div>
+  </div>
+
+  <div class="section-header"><div class="section-title">Как это работает</div></div>
+  <div class="process-steps">
+    <div class="process-step"><div class="step-number">1</div><div><div style="font-family:Unbounded;font-size:0.8rem;font-weight:600;margin-bottom:4px;">Анализ InBody</div><div style="font-size:0.75rem;color:var(--gray);line-height:1.4;">Диагностика состава тела: объёмы, застойные зоны, % жира и воды.</div></div></div>
+    <div class="process-step"><div class="step-number">2</div><div><div style="font-family:Unbounded;font-size:0.8rem;font-weight:600;margin-bottom:4px;">Подготовка тканей</div><div style="font-size:0.75rem;color:var(--gray);line-height:1.4;">Работа с застойными зонами для эффективной коррекции.</div></div></div>
+    <div class="process-step"><div class="step-number">3</div><div><div style="font-family:Unbounded;font-size:0.8rem;font-weight:600;margin-bottom:4px;">Коррекция объёмов</div><div style="font-size:0.75rem;color:var(--gray);line-height:1.4;">Воздействие на проблемные зоны по индивидуальному плану.</div></div></div>
+    <div class="process-step"><div class="step-number">4</div><div><div style="font-family:Unbounded;font-size:0.8rem;font-weight:600;margin-bottom:4px;">Формирование формы</div><div style="font-size:0.75rem;color:var(--gray);line-height:1.4;">Закрепление результата и финальная шлифовка контуров.</div></div></div>
+  </div>
+
+  <div class="section-header"><div class="section-title">Отзывы</div></div>
+  <div class="h-scroll">
+    <div class="review-card"><div class="review-stars">⭐⭐⭐⭐⭐</div><div class="review-text">«Девочки, вы лучшие! Результаты супер!»</div><div class="review-author">Мадина А.</div><div class="review-date">Ноябрь 2025</div></div>
+    <div class="review-card"><div class="review-stars">⭐⭐⭐⭐⭐</div><div class="review-text">«Самая шикарная студия коррекции фигуры!»</div><div class="review-author">Ольга Б.</div><div class="review-date">Ноябрь 2025</div></div>
+    <div class="review-card"><div class="review-stars">⭐⭐⭐⭐⭐</div><div class="review-text">«За 2 месяца ушло 8 см в талии!»</div><div class="review-author">Алия Н.</div><div class="review-date">Январь 2026</div></div>
+    <div class="review-card"><div class="review-stars">⭐⭐⭐⭐⭐</div><div class="review-text">«Хожу на LPG 3 месяца. Объёмы уходят стабильно!»</div><div class="review-author">Дана С.</div><div class="review-date">Март 2026</div></div>
+  </div>
+
+  <div class="section-header"><div class="section-title">FAQ</div></div>
+  <div class="faq-list">
+    <div class="faq-item" onclick="toggleFaq(this)"><div class="faq-question">С какого сеанса виден результат? <span class="faq-arrow">▼</span></div><div class="faq-answer">Первые изменения видны уже после 1 процедуры: уменьшается отёчность, тело становится более гладким.</div></div>
+    <div class="faq-item" onclick="toggleFaq(this)"><div class="faq-question">Больно ли проходить процедуры? <span class="faq-arrow">▼</span></div><div class="faq-answer">Процедуры комфортные! Приятное тепло, мягкое давление. Интенсивность подстраивается под вас.</div></div>
+    <div class="faq-item" onclick="toggleFaq(this)"><div class="faq-question">Есть ли рассрочка? <span class="faq-arrow">▼</span></div><div class="faq-answer">Да, абонементы и рассрочка доступны. Подробности — у менеджера по WhatsApp.</div></div>
+  </div>
+
+  <div class="section-header"><div class="section-title">Контакты</div></div>
+  <div class="contact-card">
+    <div class="contact-row" onclick="callPhone()"><div style="font-size:1.2rem;width:36px;text-align:center;">📞</div><div><div style="font-size:0.85rem;">+7 700 313 15 15</div><div style="font-size:0.7rem;color:var(--gray);">Позвонить</div></div></div>
+    <div class="contact-row"><div style="font-size:1.2rem;width:36px;text-align:center;">📍</div><div><div style="font-size:0.85rem;">ул. Ауэзова, 175б</div><div style="font-size:0.7rem;color:var(--gray);">Алматы</div></div></div>
+    <div class="contact-row"><div style="font-size:1.2rem;width:36px;text-align:center;">🕐</div><div><div style="font-size:0.85rem;">Пн-Вс: 09:00 — 21:00</div></div></div>
+  </div>
+  <div style="padding:0 20px 20px; display:flex; gap:8px;">
+    <button class="btn-whatsapp" style="flex:1" onclick="openWhatsApp()">💬 WhatsApp</button>
+    <button class="btn-secondary" style="flex:1" onclick="callPhone()">📞 Позвонить</button>
+  </div>
+  <div style="height:20px"></div>
+</div>
+
+<!-- ==================== PAGE: SERVICES ==================== -->
+<div class="page" id="page-services">
+  <div class="page-back-header"><button class="back-btn" onclick="showPage('home')">←</button><div class="page-title">Каталог услуг</div></div>
+  <div class="filter-tabs">
+    <button class="filter-tab active" onclick="filterServices('all',this)">Все</button>
+    <button class="filter-tab" onclick="filterServices('body',this)">Коррекция фигуры</button>
+    <button class="filter-tab" onclick="filterServices('cosmo',this)">Косметология</button>
+    <button class="filter-tab" onclick="filterServices('massage',this)">Массаж</button>
+  </div>
+  <div class="catalog-grid" id="catalogGrid">
+    <div class="catalog-card" data-cat="body"><div class="catalog-info"><span class="catalog-badge badge-hit">ХИТ</span><div class="catalog-name">Криолиполиз</div><div class="catalog-desc">Локальное уменьшение жировых отложений охлаждением.</div><div class="catalog-price">80 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Криолиполиз')">Записаться</button></div>
+    <div class="catalog-card" data-cat="body"><div class="catalog-info"><span class="catalog-badge badge-premium">PREMIUM</span><div class="catalog-name">Magnetic Pro</div><div class="catalog-desc">Магнитная стимуляция для мышц и жира.</div><div class="catalog-price">75 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Magnetic Pro')">Записаться</button></div>
+    <div class="catalog-card" data-cat="body"><div class="catalog-info"><span class="catalog-badge badge-exclusive">ЭКСКЛЮЗИВ</span><div class="catalog-name">Индиба</div><div class="catalog-desc">Радиочастотная терапия. Лифтинг + восстановление.</div><div class="catalog-price">50 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Индиба')">Записаться</button></div>
+    <div class="catalog-card" data-cat="body"><div class="catalog-info"><div class="catalog-name">Вакуумная кавитация</div><div class="catalog-desc">Разрушение жировых клеток ультразвуком.</div><div class="catalog-price">26 500 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Вакуумная кавитация')">Записаться</button></div>
+    <div class="catalog-card" data-cat="body"><div class="catalog-info"><div class="catalog-name">EMS-стимуляция</div><div class="catalog-desc">Электромиостимуляция для тонуса мышц.</div><div class="catalog-price">22 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('EMS')">Записаться</button></div>
+    <div class="catalog-card" data-cat="cosmo"><div class="catalog-info"><span class="catalog-badge badge-new">НОВИНКА</span><div class="catalog-name">Холодная плазма лица</div><div class="catalog-desc">Неинвазивное обновление кожи.</div><div class="catalog-price">72 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Холодная плазма')">Записаться</button></div>
+    <div class="catalog-card" data-cat="cosmo"><div class="catalog-info"><div class="catalog-name">Микроигольчатый RF</div><div class="catalog-desc">Стимуляция коллагена. Видимый лифтинг.</div><div class="catalog-price">72 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Микроигольчатый RF')">Записаться</button></div>
+    <div class="catalog-card" data-cat="massage"><div class="catalog-info"><span class="catalog-badge badge-hit">ТОП</span><div class="catalog-name">LPG массаж</div><div class="catalog-desc">Роликово-вакуумная методика.</div><div class="catalog-price">18 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('LPG массаж')">Записаться</button></div>
+    <div class="catalog-card" data-cat="massage"><div class="catalog-info"><div class="catalog-name">Slim массаж</div><div class="catalog-desc">Интенсивный ручной массаж.</div><div class="catalog-price">24 000 ₸</div></div><button class="catalog-book-btn" onclick="bookService('Slim массаж')">Записаться</button></div>
+  </div>
+  <div style="height:30px"></div>
+</div>
+
+<!-- ==================== PAGE: PROGRAMS ==================== -->
+<div class="page" id="page-programs">
+  <div class="page-back-header"><button class="back-btn" onclick="showPage('home')">←</button><div class="page-title">Программы</div></div>
+  <div style="padding:16px 20px;font-size:0.85rem;color:var(--gray);line-height:1.5;">Комплексные протоколы под ваши цели.</div>
+  <div style="padding:0 20px;display:flex;flex-direction:column;gap:16px;">
+    <div class="program-card vip" style="flex:none"><div class="program-letter">V</div><div class="program-name">Программа VIP</div><div class="program-desc">Премиальный формат. Сопровождение 24/7, индивидуальный протокол.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 2 часа</span></div><div class="program-price">360 000 ₸</div><button class="program-btn" onclick="bookService('VIP')">Записаться →</button></div>
+    <div class="program-card youth" style="flex:none"><div class="program-letter">К</div><div class="program-name">Код молодости</div><div class="program-desc">Комплексная программа для лица и шеи.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 2 часа</span></div><div class="program-price">480 000 ₸</div><button class="program-btn" onclick="bookService('Код молодости')">Записаться →</button></div>
+    <div class="program-card reforma" style="flex:none"><div class="program-letter">R</div><div class="program-name">Re:Forma</div><div class="program-desc">Послеродовое восстановление. После 40 дней.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 60 мин</span></div><div class="program-price">180 000 ₸</div><button class="program-btn" onclick="bookService('Re:Forma')">Записаться →</button></div>
+    <div class="program-card secret" style="flex:none"><div class="program-letter">С</div><div class="program-name">Секретное оружие</div><div class="program-desc">Точечная коррекция живота и боков.</div><div class="program-meta"><span class="program-meta-item">📅 15 сеансов</span><span class="program-meta-item">⏱ 90 мин</span></div><div class="program-price">255 000 ₸</div><button class="program-btn" onclick="bookService('Секретное оружие')">Записаться →</button></div>
+    <div class="program-card balance" style="flex:none"><div class="program-letter">B</div><div class="program-name">Balance</div><div class="program-desc">Гармонизация фигуры и пропорций.</div><div class="program-meta"><span class="program-meta-item">📅 10 сеансов</span><span class="program-meta-item">⏱ 3 часа</span></div><div class="program-price">325 000 ₸</div><button class="program-btn" onclick="bookService('Balance')">Записаться →</button></div>
+  </div>
+  <div style="height:30px"></div>
+</div>
+
+<!-- ==================== PAGE: PERSONAL CABINET ==================== -->
+<div class="page" id="page-cabinet">
+  <div class="profile-hero">
+    <button class="back-btn" onclick="showPage('home')" style="position:absolute;left:20px;top:16px;">←</button>
+    <button class="back-btn" onclick="openModal('settingsModal')" style="position:absolute;right:20px;top:16px;">⚙️</button>
+    <div class="profile-avatar-ring"><div class="profile-avatar-inner" id="cabAvatar">👩</div></div>
+    <div class="profile-user-name" id="cabName">Айгерим Касымова</div>
+    <div class="profile-user-phone" id="cabPhone">+7 700 *** ** 45</div>
+    <div class="profile-user-since">Клиент с марта 2025 • 14 месяцев</div>
+    <div class="profile-quick-stats">
+      <div class="pqs-item"><div class="pqs-num">24</div><div class="pqs-label">Визитов</div></div>
+      <div class="pqs-item"><div class="pqs-num">12 400</div><div class="pqs-label">Бонусов ₸</div></div>
+      <div class="pqs-item"><div class="pqs-num">-18 см</div><div class="pqs-label">Результат</div></div>
+    </div>
+  </div>
+
+  <!-- Cabinet Tabs -->
+  <div class="cab-tabs">
+    <div class="cab-tab active" onclick="switchCabTab('subscriptions',this)">Абонементы</div>
+    <div class="cab-tab" onclick="switchCabTab('anthro',this)">Замеры</div>
+    <div class="cab-tab" onclick="switchCabTab('motivation',this)">Мотивация</div>
+    <div class="cab-tab" onclick="switchCabTab('tips',this)">Советы</div>
+    <div class="cab-tab" onclick="switchCabTab('history',this)">Визиты</div>
+    <div class="cab-tab" onclick="switchCabTab('settings',this)">Ещё</div>
+  </div>
+
+  <!-- TAB: Subscriptions -->
+  <div class="cab-panel active" id="cab-subscriptions">
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:14px;">Активные абонементы</h3>
+
+    <div class="sub-card active-sub">
+      <div class="sub-card-badge">✓ Активен</div>
+      <div class="sub-card-name">Безлимит на тело — 3 мес</div>
+      <div class="sub-card-detail">Действует до: 15 июня 2026</div>
+      <div class="sub-card-detail">Использовано: 18 из ∞ посещений</div>
+      <div class="sub-card-detail" style="margin-top:6px;">Осталось дней: <strong>73</strong></div>
+      <div class="sub-progress"><div class="sub-progress-bar" style="width:65%"></div></div>
+      <div style="display:flex;gap:8px;margin-top:12px;">
+        <span class="sub-card-action" onclick="showPage('booking')">📅 Записаться</span>
+        <span class="sub-card-action" onclick="showToast('Заморозка: свяжитесь с менеджером')">❄️ Заморозить</span>
+      </div>
+    </div>
+
+    <div class="sub-card active-sub" style="background:linear-gradient(135deg,#8B5CF6,#6D28D9);">
+      <div class="sub-card-badge">✓ Активен</div>
+      <div class="sub-card-name">Код молодости — 15 сеансов</div>
+      <div class="sub-card-detail">Использовано сеансов: 9 из 15</div>
+      <div class="sub-card-detail">Следующий: 5 апреля, 14:00</div>
+      <div class="sub-progress"><div class="sub-progress-bar" style="width:60%"></div></div>
+      <span class="sub-card-action" style="margin-top:12px;" onclick="showPage('booking')">📅 Записаться</span>
+    </div>
+
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin:20px 0 14px;">Завершённые</h3>
+
+    <div class="sub-card expired-sub">
+      <div class="sub-card-badge">Завершён</div>
+      <div class="sub-card-name">Re:Forma — 15 сеансов</div>
+      <div class="sub-card-detail">Период: Сент 2025 — Дек 2025</div>
+      <div class="sub-card-detail">Все 15 сеансов пройдены ✓</div>
+      <div class="sub-progress"><div class="sub-progress-bar" style="width:100%"></div></div>
+      <span class="sub-card-action" style="margin-top:12px;" onclick="showPage('shop')">🔄 Повторить курс</span>
+    </div>
+
+    <div class="sub-card frozen-sub">
+      <div class="sub-card-badge">❄️ Заморожен</div>
+      <div class="sub-card-name">Секретное оружие — 15 сеансов</div>
+      <div class="sub-card-detail">Заморожен с 10 февраля 2026</div>
+      <div class="sub-card-detail">Осталось сеансов: 7</div>
+      <span class="sub-card-action" style="margin-top:12px;" onclick="showToast('Свяжитесь с менеджером для разморозки')">🔓 Разморозить</span>
+    </div>
+
+    <div style="margin-top:16px;">
+      <button class="btn-primary" onclick="showPage('shop')">🛒 Купить новый абонемент</button>
+    </div>
+  </div>
+
+  <!-- TAB: Anthropometry -->
+  <div class="cab-panel" id="cab-anthro">
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:6px;">Антропометрия</h3>
+    <p style="font-size:0.75rem;color:var(--gray);margin-bottom:16px;">Сравнение первого визита и последнего замера</p>
+
+    <div style="display:flex;gap:8px;margin-bottom:16px;">
+      <div style="flex:1;background:rgba(255,45,123,0.08);border-radius:12px;padding:12px;text-align:center;">
+        <div style="font-size:0.65rem;color:var(--gray);text-transform:uppercase;font-weight:600;">Первый визит</div>
+        <div style="font-family:Unbounded;font-size:0.8rem;font-weight:600;">12 марта 2025</div>
+      </div>
+      <div style="flex:1;background:rgba(16,185,129,0.08);border-radius:12px;padding:12px;text-align:center;">
+        <div style="font-size:0.65rem;color:var(--gray);text-transform:uppercase;font-weight:600;">Последний замер</div>
+        <div style="font-family:Unbounded;font-size:0.8rem;font-weight:600;">1 апреля 2026</div>
+      </div>
+    </div>
+
+    <div class="anthro-grid">
+      <div class="anthro-card">
+        <div class="anthro-label">Вес</div>
+        <div class="anthro-values"><span class="anthro-old">72.5 кг</span><span class="anthro-new">66.3 кг</span></div>
+        <div class="anthro-diff good">-6.2 кг ↓</div>
+      </div>
+      <div class="anthro-card">
+        <div class="anthro-label">Талия</div>
+        <div class="anthro-values"><span class="anthro-old">84 см</span><span class="anthro-new">72 см</span></div>
+        <div class="anthro-diff good">-12 см ↓</div>
+      </div>
+      <div class="anthro-card">
+        <div class="anthro-label">Бёдра</div>
+        <div class="anthro-values"><span class="anthro-old">106 см</span><span class="anthro-new">100 см</span></div>
+        <div class="anthro-diff good">-6 см ↓</div>
+      </div>
+      <div class="anthro-card">
+        <div class="anthro-label">% жира</div>
+        <div class="anthro-values"><span class="anthro-old">32%</span><span class="anthro-new">25%</span></div>
+        <div class="anthro-diff good">-7% ↓</div>
+      </div>
+      <div class="anthro-card">
+        <div class="anthro-label">Мышцы</div>
+        <div class="anthro-values"><span class="anthro-old">24.1 кг</span><span class="anthro-new">26.3 кг</span></div>
+        <div class="anthro-diff up">+2.2 кг ↑</div>
+      </div>
+      <div class="anthro-card">
+        <div class="anthro-label">Вода</div>
+        <div class="anthro-values"><span class="anthro-old">49%</span><span class="anthro-new">54%</span></div>
+        <div class="anthro-diff up">+5% ↑</div>
+      </div>
+    </div>
+
+    <div class="anthro-comparison">
+      <h4 style="font-family:Unbounded;font-size:0.8rem;font-weight:600;margin-bottom:14px;">Визуальное сравнение объёмов</h4>
+      <div class="anthro-bar-row">
+        <div class="anthro-bar-label">Талия</div>
+        <div class="anthro-bar-track"><div class="anthro-bar-first" style="width:84%"></div><div class="anthro-bar-last" style="width:72%"></div></div>
+      </div>
+      <div class="anthro-bar-vals" style="padding-left:70px;"><span>72 см (сейчас)</span><span style="color:var(--pink)">84 см (было)</span></div>
+      <div class="anthro-bar-row" style="margin-top:12px;">
+        <div class="anthro-bar-label">Бёдра</div>
+        <div class="anthro-bar-track"><div class="anthro-bar-first" style="width:92%"></div><div class="anthro-bar-last" style="width:86%"></div></div>
+      </div>
+      <div class="anthro-bar-vals" style="padding-left:70px;"><span>100 см (сейчас)</span><span style="color:var(--pink)">106 см (было)</span></div>
+      <div class="anthro-bar-row" style="margin-top:12px;">
+        <div class="anthro-bar-label">Руки</div>
+        <div class="anthro-bar-track"><div class="anthro-bar-first" style="width:78%"></div><div class="anthro-bar-last" style="width:72%"></div></div>
+      </div>
+      <div class="anthro-bar-vals" style="padding-left:70px;"><span>30 см (сейчас)</span><span style="color:var(--pink)">33 см (было)</span></div>
+    </div>
+
+    <div style="background:linear-gradient(135deg,#10B981,#059669);color:white;border-radius:var(--radius);padding:20px;text-align:center;">
+      <div style="font-size:2rem;margin-bottom:8px;">🏆</div>
+      <div style="font-family:Unbounded;font-size:1rem;font-weight:700;">Общий результат: -18 см</div>
+      <div style="font-size:0.8rem;opacity:0.9;margin-top:4px;">Вы потеряли 6.2 кг и уменьшили талию на 12 см!</div>
+    </div>
+  </div>
+
+  <!-- TAB: Motivation -->
+  <div class="cab-panel" id="cab-motivation">
+    <div class="gratitude-streak">
+      <div class="streak-fire">🔥</div>
+      <div class="streak-num">8</div>
+      <div class="streak-label">визитов подряд без пропусков!</div>
+    </div>
+
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:14px;">Благодарности за визиты</h3>
+
+    <div class="gratitude-card">
+      <div class="gratitude-emoji">🌟</div>
+      <div class="gratitude-title">Ты — звезда!</div>
+      <div class="gratitude-text">Сегодняшний сеанс LPG массажа — ещё один шаг к твоей мечте. Талия уменьшилась на 1.5 см с прошлого визита!</div>
+      <div class="gratitude-date">Сегодня, 3 апреля 2026</div>
+    </div>
+
+    <div class="gratitude-card" style="background:linear-gradient(135deg,#DBEAFE,#BFDBFE);">
+      <div class="gratitude-emoji">💪</div>
+      <div class="gratitude-title">Какая ты молодец!</div>
+      <div class="gratitude-text">8 визитов подряд без пропусков! Твоя дисциплина — залог результата. Продолжай в том же духе!</div>
+      <div class="gratitude-date" style="color:#3B82F6;">31 марта 2026</div>
+    </div>
+
+    <div class="gratitude-card" style="background:linear-gradient(135deg,#FCE7F3,#FBCFE8);">
+      <div class="gratitude-emoji">🎉</div>
+      <div class="gratitude-title">Полпути пройдено!</div>
+      <div class="gratitude-text">Ты прошла 9 из 15 сеансов программы «Код молодости». Кожа лица уже заметно свежее и подтянутее!</div>
+      <div class="gratitude-date" style="color:var(--pink);">28 марта 2026</div>
+    </div>
+
+    <div class="gratitude-card" style="background:linear-gradient(135deg,#D1FAE5,#A7F3D0);">
+      <div class="gratitude-emoji">🏆</div>
+      <div class="gratitude-title">Рекорд месяца!</div>
+      <div class="gratitude-text">В марте ты прошла 12 процедур — это твой лучший месяц! Тело скажет тебе спасибо 💚</div>
+      <div class="gratitude-date" style="color:#059669;">25 марта 2026</div>
+    </div>
+
+    <div class="gratitude-card">
+      <div class="gratitude-emoji">✨</div>
+      <div class="gratitude-title">Первые результаты!</div>
+      <div class="gratitude-text">После первого сеанса криолиполиза уже видны изменения. Ты на правильном пути к идеальной фигуре!</div>
+      <div class="gratitude-date">15 марта 2026</div>
+    </div>
+  </div>
+
+  <!-- TAB: Tips -->
+  <div class="cab-panel" id="cab-tips">
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:6px;">Персональные советы</h3>
+    <p style="font-size:0.75rem;color:var(--gray);margin-bottom:16px;">На основе ваших процедур и целей</p>
+
+    <div class="tip-card" style="border-left-color:var(--pink);">
+      <div class="tip-category">💧 Водный баланс</div>
+      <div class="tip-title">Пейте 2.5 литра воды в день</div>
+      <div class="tip-text">После процедур криолиполиза особенно важно поддерживать водный баланс. Вода помогает выводить разрушенные жировые клетки из организма быстрее.</div>
+    </div>
+
+    <div class="tip-card" style="border-left-color:#F59E0B;">
+      <div class="tip-category">🍎 Питание</div>
+      <div class="tip-title">Лёгкий ужин за 3 часа до сна</div>
+      <div class="tip-text">Для максимального эффекта от LPG-массажа старайтесь не есть тяжёлую пищу после 19:00. Овощи, белок, лёгкие салаты — ваши друзья.</div>
+    </div>
+
+    <div class="tip-card" style="border-left-color:#10B981;">
+      <div class="tip-category">🏃 Активность</div>
+      <div class="tip-title">10 000 шагов в дни между сеансами</div>
+      <div class="tip-text">Лёгкая ходьба улучшает лимфодренаж и усиливает эффект от аппаратных процедур. Не обязательно бегать — просто гуляйте!</div>
+    </div>
+
+    <div class="tip-card" style="border-left-color:#8B5CF6;">
+      <div class="tip-category">😴 Восстановление</div>
+      <div class="tip-title">Сон 7-8 часов — обязательно!</div>
+      <div class="tip-text">Во время сна организм восстанавливается и активно сжигает жир. Недосып замедляет метаболизм и снижает эффект процедур.</div>
+    </div>
+
+    <div class="tip-card" style="border-left-color:#3B82F6;">
+      <div class="tip-category">🧴 Уход за кожей</div>
+      <div class="tip-title">Увлажняйте кожу после каждой процедуры</div>
+      <div class="tip-text">Используйте крем или масло с антицеллюлитным эффектом. Это закрепит результат LPG и вакуумного массажа.</div>
+    </div>
+
+    <div class="tip-card" style="border-left-color:var(--green);">
+      <div class="tip-category">📅 Следующий шаг</div>
+      <div class="tip-title">Ваш следующий замер: 15 апреля</div>
+      <div class="tip-text">Через 12 дней мы проведём контрольный замер InBody. Продолжайте следовать рекомендациям — результат будет впечатляющим!</div>
+    </div>
+  </div>
+
+  <!-- TAB: Visit History -->
+  <div class="cab-panel" id="cab-history">
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:14px;">История визитов</h3>
+
+    <div style="font-size:0.75rem;font-weight:600;color:var(--gray);text-transform:uppercase;margin-bottom:10px;">Апрель 2026</div>
+    <div class="visit-item"><div class="visit-date-box"><div class="visit-day">3</div><div class="visit-month">Апр</div></div><div class="visit-info"><div class="visit-service">LPG массаж</div><div class="visit-time">10:00 — 10:45 • Мастер: Диана</div></div><div style="color:var(--green);font-size:1.1rem;">✓</div></div>
+    <div class="visit-item"><div class="visit-date-box"><div class="visit-day">1</div><div class="visit-month">Апр</div></div><div class="visit-info"><div class="visit-service">Код молодости (сеанс 9)</div><div class="visit-time">14:00 — 16:00 • Мастер: Алия</div></div><div style="color:var(--green);font-size:1.1rem;">✓</div></div>
+
+    <div style="font-size:0.75rem;font-weight:600;color:var(--gray);text-transform:uppercase;margin:16px 0 10px;">Март 2026</div>
+    <div class="visit-item"><div class="visit-date-box"><div class="visit-day">31</div><div class="visit-month">Мар</div></div><div class="visit-info"><div class="visit-service">Криолиполиз — живот</div><div class="visit-time">11:00 — 12:00 • Мастер: Камила</div></div><div style="color:var(--green);font-size:1.1rem;">✓</div></div>
+    <div class="visit-item"><div class="visit-date-box"><div class="visit-day">28</div><div class="visit-month">Мар</div></div><div class="visit-info"><div class="visit-service">Код молодости (сеанс 8)</div><div class="visit-time">14:00 — 16:00 • Мастер: Алия</div></div><div style="color:var(--green);font-size:1.1rem;">✓</div></div>
+    <div class="visit-item"><div class="visit-date-box"><div class="visit-day">25</div><div class="visit-month">Мар</div></div><div class="visit-info"><div class="visit-service">LPG массаж</div><div class="visit-time">10:00 — 10:45 • Мастер: Диана</div></div><div style="color:var(--green);font-size:1.1rem;">✓</div></div>
+    <div class="visit-item"><div class="visit-date-box"><div class="visit-day">22</div><div class="visit-month">Мар</div></div><div class="visit-info"><div class="visit-service">Вакуумная кавитация</div><div class="visit-time">15:00 — 15:45 • Мастер: Камила</div></div><div style="color:var(--green);font-size:1.1rem;">✓</div></div>
+
+    <div style="text-align:center;padding:16px 0;">
+      <button class="btn-outline" onclick="showToast('Загрузка...')">Показать все визиты</button>
+    </div>
+  </div>
+
+  <!-- TAB: Settings / More -->
+  <div class="cab-panel" id="cab-settings">
+    <div style="padding:0;">
+      <div class="profile-menu-item" onclick="openModal('editProfileModal')"><div class="profile-menu-icon" style="background:rgba(255,45,123,0.1)">✏️</div><div style="flex:1"><div class="profile-menu-label">Редактировать профиль</div><div class="profile-menu-sub">Имя, телефон, фото</div></div><div style="color:#ccc">›</div></div>
+      <div class="profile-menu-item" onclick="showPage('shop')"><div class="profile-menu-icon" style="background:rgba(255,230,0,0.2)">🛒</div><div style="flex:1"><div class="profile-menu-label">Купить абонемент</div><div class="profile-menu-sub">Программы и безлимиты</div></div><div style="color:#ccc">›</div></div>
+      <div class="profile-menu-item" onclick="showToast('12 400 бонусов')"><div class="profile-menu-icon" style="background:rgba(16,185,129,0.1)">🎁</div><div style="flex:1"><div class="profile-menu-label">Бонусы: 12 400 ₸</div><div class="profile-menu-sub">Копите и оплачивайте бонусами</div></div><div style="color:#ccc">›</div></div>
+      <div class="profile-menu-item" onclick="showToast('Промокод принят!')"><div class="profile-menu-icon" style="background:rgba(139,92,246,0.1)">🏷️</div><div style="flex:1"><div class="profile-menu-label">Промокод</div><div class="profile-menu-sub">Активировать скидочный код</div></div><div style="color:#ccc">›</div></div>
+      <div class="profile-menu-item" onclick="showPage('notifications')"><div class="profile-menu-icon" style="background:rgba(59,130,246,0.1)">🔔</div><div style="flex:1"><div class="profile-menu-label">Уведомления</div><div class="profile-menu-sub">Напоминания о визитах</div></div><div style="color:#ccc">›</div></div>
+      <div class="profile-menu-item" onclick="openWhatsApp()"><div class="profile-menu-icon" style="background:rgba(37,211,102,0.15)">💬</div><div style="flex:1"><div class="profile-menu-label">Написать нам</div><div class="profile-menu-sub">Связаться через WhatsApp</div></div><div style="color:#ccc">›</div></div>
+      <div class="profile-menu-item" onclick="showToast('Вы вышли из аккаунта')"><div class="profile-menu-icon" style="background:rgba(239,68,68,0.1)">🚪</div><div style="flex:1"><div class="profile-menu-label">Выйти</div><div class="profile-menu-sub">Выход из аккаунта</div></div><div style="color:#ccc">›</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== PAGE: SHOP (Buy Subscription) ==================== -->
+<div class="page" id="page-shop">
+  <div class="page-back-header"><button class="back-btn" onclick="showPage('cabinet')">←</button><div class="page-title">Купить абонемент</div></div>
+
+  <div style="padding:16px 20px 0;">
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:6px;">Безлимитные абонементы</h3>
+    <p style="font-size:0.75rem;color:var(--gray);margin-bottom:14px;">Неограниченное количество процедур</p>
+  </div>
+  <div style="padding:0 20px;" id="shopList">
+    <div class="purchase-card" onclick="selectPurchase(this,'bezlimit3')">
+      <div class="purchase-popular">⭐ Популярное</div>
+      <div class="purchase-name">Безлимит на тело — 3 мес</div>
+      <div class="purchase-desc">Неограниченное количество аппаратных процедур на 3 месяца.</div>
+      <div class="purchase-price-row"><div class="purchase-price">830 000 ₸</div></div>
+    </div>
+    <div class="purchase-card" onclick="selectPurchase(this,'bezlimit6')">
+      <div class="purchase-name">Безлимит на тело — 6 мес</div>
+      <div class="purchase-desc">Полгода безлимитных процедур. Самый выгодный вариант!</div>
+      <div class="purchase-price-row"><div class="purchase-price">1 190 000 ₸</div><div class="purchase-old-price">1 660 000 ₸</div></div>
+    </div>
+    <div class="purchase-card" onclick="selectPurchase(this,'bezlimit12')">
+      <div class="purchase-name">Безлимит на тело — 1 год</div>
+      <div class="purchase-desc">Максимальная экономия. Год безлимитных процедур.</div>
+      <div class="purchase-price-row"><div class="purchase-price">1 720 000 ₸</div><div class="purchase-old-price">3 320 000 ₸</div></div>
+    </div>
+
+    <h3 style="font-family:Unbounded;font-size:0.9rem;margin:20px 0 6px;">Программы</h3>
+    <p style="font-size:0.75rem;color:var(--gray);margin-bottom:14px;">Курсы с фиксированным количеством сеансов</p>
+
+    <div class="purchase-card" onclick="selectPurchase(this,'vip')">
+      <div class="purchase-popular">👑 VIP</div>
+      <div class="purchase-name">Программа VIP — 15 сеансов</div>
+      <div class="purchase-desc">Премиальная работа со всем телом. Сопровождение 24/7.</div>
+      <div class="purchase-price-row"><div class="purchase-price">360 000 ₸</div></div>
+    </div>
+    <div class="purchase-card" onclick="selectPurchase(this,'youth')">
+      <div class="purchase-name">Код молодости — 15 сеансов</div>
+      <div class="purchase-desc">Комплексная программа для лица и шеи.</div>
+      <div class="purchase-price-row"><div class="purchase-price">480 000 ₸</div></div>
+    </div>
+    <div class="purchase-card" onclick="selectPurchase(this,'reforma')">
+      <div class="purchase-name">Re:Forma — 15 сеансов</div>
+      <div class="purchase-desc">Послеродовое восстановление.</div>
+      <div class="purchase-price-row"><div class="purchase-price">180 000 ₸</div></div>
+    </div>
+    <div class="purchase-card" onclick="selectPurchase(this,'secret')">
+      <div class="purchase-name">Секретное оружие — 15 сеансов</div>
+      <div class="purchase-desc">Точечная коррекция живота и боков.</div>
+      <div class="purchase-price-row"><div class="purchase-price">255 000 ₸</div></div>
+    </div>
+    <div class="purchase-card" onclick="selectPurchase(this,'balance')">
+      <div class="purchase-name">Balance — 10 сеансов</div>
+      <div class="purchase-desc">Гармонизация фигуры и пропорций.</div>
+      <div class="purchase-price-row"><div class="purchase-price">325 000 ₸</div></div>
+    </div>
+  </div>
+  <div style="padding:16px 20px;position:sticky;bottom:80px;background:var(--light);">
+    <button class="btn-primary" id="purchaseBtn" onclick="processPurchase()" style="opacity:0.5;pointer-events:none;">Оплатить абонемент</button>
+    <p style="text-align:center;font-size:0.7rem;color:var(--gray);margin-top:8px;">Оплата через Kaspi / перевод / рассрочка</p>
+  </div>
+  <div style="height:30px"></div>
+</div>
+
+<!-- ==================== PAGE: PURCHASE SUCCESS ==================== -->
+<div class="page" id="page-purchaseSuccess">
+  <div style="text-align:center;padding:40px 20px;">
+    <div class="success-check">🎉</div>
+    <h2 style="font-family:Unbounded;font-size:1.2rem;margin-bottom:8px;">Заявка оформлена!</h2>
+    <p style="font-size:0.85rem;color:var(--gray);line-height:1.5;margin-bottom:30px;">
+      Менеджер свяжется с вами для подтверждения оплаты.<br>Абонемент активируется после оплаты.
+    </p>
+    <div id="purchaseDetails" style="background:white;border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);text-align:left;margin-bottom:20px;font-size:0.85rem;color:var(--gray);line-height:1.8;"></div>
+    <button class="btn-primary" onclick="showPage('cabinet')" style="margin-bottom:10px;">В личный кабинет</button>
+    <button class="btn-whatsapp" onclick="openWhatsApp()">💬 Написать менеджеру</button>
+  </div>
+</div>
+
+<!-- ==================== PAGE: BOOKING ==================== -->
+<div class="page" id="page-booking">
+  <div class="page-back-header"><button class="back-btn" onclick="showPage('home')">←</button><div class="page-title">Запись на сеанс</div></div>
+  <div class="booking-steps">
+    <div class="booking-step active" id="bstep1">1</div><div class="step-line" id="bline1"></div>
+    <div class="booking-step" id="bstep2">2</div><div class="step-line" id="bline2"></div>
+    <div class="booking-step" id="bstep3">3</div>
+  </div>
+  <div style="padding:0 20px;">
+    <div class="booking-section active" id="bsection1">
+      <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:14px;">Выберите услугу</h3>
+      <div class="service-select-item" onclick="selectBookingService(this,'Криолиполиз','80 000 ₸')"><div class="service-select-icon" style="background:rgba(255,45,123,0.1)">❄️</div><div><div class="service-select-name">Криолиполиз</div><div class="service-select-price">80 000 ₸</div></div></div>
+      <div class="service-select-item" onclick="selectBookingService(this,'Magnetic Pro','75 000 ₸')"><div class="service-select-icon" style="background:rgba(139,92,246,0.1)">🧲</div><div><div class="service-select-name">Magnetic Pro</div><div class="service-select-price">75 000 ₸</div></div></div>
+      <div class="service-select-item" onclick="selectBookingService(this,'LPG массаж','18 000 ₸')"><div class="service-select-icon" style="background:rgba(255,230,0,0.2)">💆</div><div><div class="service-select-name">LPG массаж</div><div class="service-select-price">18 000 ₸</div></div></div>
+      <div class="service-select-item" onclick="selectBookingService(this,'Slim массаж','24 000 ₸')"><div class="service-select-icon" style="background:rgba(16,185,129,0.1)">✋</div><div><div class="service-select-name">Slim массаж</div><div class="service-select-price">24 000 ₸</div></div></div>
+      <div class="service-select-item" onclick="selectBookingService(this,'Индиба','50 000 ₸')"><div class="service-select-icon" style="background:rgba(245,158,11,0.1)">🔥</div><div><div class="service-select-name">Индиба</div><div class="service-select-price">50 000 ₸</div></div></div>
+      <div class="service-select-item" onclick="selectBookingService(this,'Холодная плазма','72 000 ₸')"><div class="service-select-icon" style="background:rgba(59,130,246,0.1)">✨</div><div><div class="service-select-name">Холодная плазма</div><div class="service-select-price">72 000 ₸</div></div></div>
+      <div style="margin-top:16px;"><button class="btn-primary" onclick="nextBookingStep(2)" id="toStep2Btn" style="opacity:0.5;pointer-events:none;">Далее →</button></div>
+    </div>
+    <div class="booking-section" id="bsection2">
+      <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:14px;">Выберите дату и время</h3>
+      <div class="calendar-wrapper" id="calendarWrapper"></div>
+      <h4 style="font-size:0.85rem;font-weight:600;margin-bottom:10px;">Доступное время</h4>
+      <div class="time-slots" id="timeSlots"></div>
+      <div style="margin-top:20px;display:flex;gap:8px;"><button class="btn-outline" onclick="nextBookingStep(1)" style="flex:1">← Назад</button><button class="btn-primary" onclick="nextBookingStep(3)" id="toStep3Btn" style="flex:2;opacity:0.5;pointer-events:none;">Далее →</button></div>
+    </div>
+    <div class="booking-section" id="bsection3">
+      <h3 style="font-family:Unbounded;font-size:0.9rem;margin-bottom:14px;">Ваши данные</h3>
+      <div class="form-group"><label class="form-label">Имя</label><input type="text" class="form-input" id="bookName" placeholder="Как вас зовут?"></div>
+      <div class="form-group"><label class="form-label">Телефон</label><input type="tel" class="form-input" id="bookPhone" placeholder="+7 (___) ___-__-__"></div>
+      <div class="form-group"><label class="form-label">Комментарий</label><textarea class="form-input" id="bookComment" placeholder="Пожелания..."></textarea></div>
+      <div style="background:var(--light);border-radius:var(--radius-sm);padding:16px;margin-bottom:16px;"><div style="font-weight:600;font-size:0.85rem;margin-bottom:8px;">Ваша запись:</div><div style="font-size:0.8rem;color:var(--gray);" id="bookingSummary"></div></div>
+      <div style="display:flex;gap:8px;"><button class="btn-outline" onclick="nextBookingStep(2)" style="flex:1">← Назад</button><button class="btn-primary" onclick="submitBooking()" style="flex:2">Записаться ★</button></div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== PAGE: BOOKING SUCCESS ==================== -->
+<div class="page" id="page-success">
+  <div style="text-align:center;padding:40px 20px;">
+    <div class="success-check">✓</div>
+    <h2 style="font-family:Unbounded;font-size:1.2rem;margin-bottom:8px;">Запись оформлена!</h2>
+    <p style="font-size:0.85rem;color:var(--gray);line-height:1.5;margin-bottom:30px;">Мы свяжемся для подтверждения.</p>
+    <div id="successDetails" style="background:white;border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);text-align:left;margin-bottom:20px;font-size:0.85rem;color:var(--gray);line-height:1.8;"></div>
+    <button class="btn-primary" onclick="showPage('home')" style="margin-bottom:10px;">На главную</button>
+    <button class="btn-whatsapp" onclick="openWhatsApp()">💬 WhatsApp</button>
+  </div>
+</div>
+
+<!-- ==================== PAGE: NOTIFICATIONS ==================== -->
+<div class="page" id="page-notifications">
+  <div class="page-back-header"><button class="back-btn" onclick="showPage('home')">←</button><div class="page-title">Уведомления</div></div>
+  <div style="padding:16px 20px;">
+    <div class="notif-item notif-unread"><div class="notif-icon" style="background:rgba(255,45,123,0.1)">🔥</div><div><div style="font-weight:600;font-size:0.85rem;">Специальное предложение!</div><div style="font-size:0.75rem;color:var(--gray);">Бесплатная InBody-диагностика при записи до конца недели.</div><div style="font-size:0.65rem;color:#bbb;margin-top:4px;">Сегодня, 10:00</div></div></div>
+    <div class="notif-item notif-unread"><div class="notif-icon" style="background:rgba(255,230,0,0.2)">⭐</div><div><div style="font-weight:600;font-size:0.85rem;">Новая услуга: Холодная плазма</div><div style="font-size:0.75rem;color:var(--gray);">Попробуйте со скидкой 15%!</div><div style="font-size:0.65rem;color:#bbb;margin-top:4px;">Вчера</div></div></div>
+    <div class="notif-item notif-unread"><div class="notif-icon" style="background:rgba(16,185,129,0.15)">🏆</div><div><div style="font-weight:600;font-size:0.85rem;">Вы молодец!</div><div style="font-size:0.75rem;color:var(--gray);">8 визитов подряд! Так держать!</div><div style="font-size:0.65rem;color:#bbb;margin-top:4px;">2 дня назад</div></div></div>
+    <div class="notif-item"><div class="notif-icon" style="background:rgba(139,92,246,0.1)">📅</div><div><div style="font-weight:600;font-size:0.85rem;">Напоминание</div><div style="font-size:0.75rem;color:var(--gray);">Ваш сеанс 5 апреля в 14:00.</div><div style="font-size:0.65rem;color:#bbb;margin-top:4px;">3 дня назад</div></div></div>
+  </div>
+</div>
+
+<!-- ==================== MODALS ==================== -->
+<div class="modal-overlay" id="serviceModal" onclick="closeModal('serviceModal')"><div class="modal" onclick="event.stopPropagation()"><div class="modal-handle"></div><div id="serviceModalContent"></div></div></div>
+<div class="modal-overlay" id="settingsModal" onclick="closeModal('settingsModal')"><div class="modal" onclick="event.stopPropagation()"><div class="modal-handle"></div><div class="modal-title">Настройки</div><div class="form-group"><label class="form-label">Имя</label><input type="text" class="form-input" value="Айгерим Касымова"></div><div class="form-group"><label class="form-label">Телефон</label><input type="tel" class="form-input" value="+7 700 123 45 67"></div><div class="form-group"><label class="form-label">Email</label><input type="email" class="form-input" placeholder="email@example.com"></div><div class="form-group"><label class="form-label">Дата рождения</label><input type="date" class="form-input"></div><button class="btn-primary" onclick="showToast('Сохранено!');closeModal('settingsModal');">Сохранить</button></div></div>
+<div class="modal-overlay" id="editProfileModal" onclick="closeModal('editProfileModal')"><div class="modal" onclick="event.stopPropagation()"><div class="modal-handle"></div><div class="modal-title">Редактировать профиль</div><div style="text-align:center;margin-bottom:16px;"><div class="profile-avatar-ring" style="width:80px;height:80px;margin:0 auto;"><div class="profile-avatar-inner" style="font-size:2rem;">👩</div></div><button class="btn-sm" style="background:var(--light);color:var(--dark);margin-top:8px;">📷 Сменить фото</button></div><div class="form-group"><label class="form-label">Имя</label><input type="text" class="form-input" value="Айгерим Касымова"></div><div class="form-group"><label class="form-label">Телефон</label><input type="tel" class="form-input" value="+7 700 123 45 67"></div><button class="btn-primary" onclick="showToast('Профиль обновлён!');closeModal('editProfileModal');">Сохранить</button></div></div>
+
+<!-- FLOATING WHATSAPP -->
+<div class="fab-whatsapp" onclick="openWhatsApp()">💬</div>
+
+<!-- ==================== BOTTOM NAV ==================== -->
+<div class="bottom-nav">
+  <div class="nav-item active" onclick="showPage('home')" id="nav-home"><div class="nav-icon">🏠</div><div class="nav-label">Главная</div></div>
+  <div class="nav-item" onclick="showPage('services')" id="nav-services"><div class="nav-icon">💆</div><div class="nav-label">Услуги</div></div>
+  <div class="nav-item" onclick="showPage('booking')"><div class="nav-center">+</div></div>
+  <div class="nav-item" onclick="showPage('shop')" id="nav-shop"><div class="nav-icon">🛒</div><div class="nav-label">Купить</div></div>
+  <div class="nav-item" onclick="showPage('cabinet')" id="nav-cabinet"><div class="nav-icon">👤</div><div class="nav-label">Кабинет</div></div>
+</div>
+
+<script>
+// ===== SPLASH =====
+setTimeout(() => document.getElementById('splash').classList.add('hidden'), 1800);
+
+// ===== NAVIGATION =====
+function showPage(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const map = { home:'nav-home', services:'nav-services', shop:'nav-shop', cabinet:'nav-cabinet' };
+  if (map[page]) document.getElementById(map[page])?.classList.add('active');
+  window.scrollTo({ top:0, behavior:'smooth' });
+  if (page === 'booking') initCalendar();
+}
+
+// ===== TOAST =====
+function showToast(msg) { const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2500); }
+
+// ===== FAQ =====
+function toggleFaq(item) { const was=item.classList.contains('open'); document.querySelectorAll('.faq-item').forEach(i=>i.classList.remove('open')); if(!was) item.classList.add('open'); }
+
+// ===== FILTER =====
+function filterServices(cat,btn) { document.querySelectorAll('.filter-tab').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); document.querySelectorAll('.catalog-card').forEach(c=>{ if(cat==='all'||c.dataset.cat===cat){c.style.display='';c.style.animation='popIn 0.3s ease';}else{c.style.display='none';}}); }
+
+// ===== CABINET TABS =====
+function switchCabTab(tab,btn) { document.querySelectorAll('.cab-tab').forEach(t=>t.classList.remove('active')); btn.classList.add('active'); document.querySelectorAll('.cab-panel').forEach(p=>p.classList.remove('active')); document.getElementById('cab-'+tab).classList.add('active'); }
+
+// ===== SERVICE MODAL =====
+const servicesData = {
+  cryo:{name:'Криолиполиз',badge:'ХИТ',cls:'badge-hit',price:'80 000 ₸',desc:'Локальное уменьшение жировых отложений за счёт контролируемого охлаждения. Без боли, без реабилитации.',dur:'60 мин',res:'Уменьшение складки на 20-40%',ses:'1-4 сеанса'},
+  magnetic:{name:'Magnetic Pro',badge:'PREMIUM',cls:'badge-premium',price:'75 000 ₸',desc:'Магнитная стимуляция для разрушения жировых клеток и укрепления мышц. Аналог 20 000 скручиваний за 30 мин.',dur:'30 мин',res:'Укрепление мышц + уменьшение жира',ses:'4-6 сеансов'},
+  indiba:{name:'Индиба',badge:'ЭКСКЛЮЗИВ',cls:'badge-exclusive',price:'50 000 ₸',desc:'Радиочастотная терапия для глубокого прогрева тканей. Лифтинг + восстановление.',dur:'60 мин',res:'Лифтинг, уменьшение отёков',ses:'5-10 сеансов'},
+};
+function openServiceModal(id) {
+  const s=servicesData[id]; if(!s) return;
+  document.getElementById('serviceModalContent').innerHTML=`<span class="service-mini-badge ${s.cls}">${s.badge}</span><h2 style="font-family:Unbounded;font-size:1.2rem;font-weight:700;margin:12px 0;">${s.name}</h2><p style="font-size:0.85rem;color:var(--gray);line-height:1.6;margin-bottom:20px;">${s.desc}</p><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;"><div style="background:var(--light);border-radius:12px;padding:14px;text-align:center;"><div style="font-size:1.2rem;">⏱</div><div style="font-size:0.7rem;color:var(--gray);">Длительность</div><div style="font-weight:600;font-size:0.8rem;">${s.dur}</div></div><div style="background:var(--light);border-radius:12px;padding:14px;text-align:center;"><div style="font-size:1.2rem;">📅</div><div style="font-size:0.7rem;color:var(--gray);">Курс</div><div style="font-weight:600;font-size:0.8rem;">${s.ses}</div></div></div><div style="text-align:center;margin-bottom:16px;"><div style="font-family:Unbounded;font-size:1.5rem;font-weight:800;color:var(--pink);">${s.price}</div><div style="font-size:0.75rem;color:var(--gray);">за 1 сеанс</div></div><button class="btn-primary" onclick="bookService('${s.name}');closeModal('serviceModal');" style="margin-bottom:8px;">Записаться</button><button class="btn-whatsapp" onclick="openWhatsApp()">💬 Узнать подробнее</button>`;
+  openModal('serviceModal');
+}
+
+// ===== MODALS =====
+function openModal(id){document.getElementById(id).classList.add('active');document.body.style.overflow='hidden';}
+function closeModal(id){document.getElementById(id).classList.remove('active');document.body.style.overflow='';}
+
+// ===== BOOKING =====
+let bookingData={service:'',price:'',date:'',time:''};
+function bookService(name){showPage('booking');document.querySelectorAll('.service-select-item').forEach(i=>{i.classList.remove('selected');if(i.querySelector('.service-select-name')?.textContent===name){i.classList.add('selected');bookingData.service=name;bookingData.price=i.querySelector('.service-select-price')?.textContent||'';document.getElementById('toStep2Btn').style.opacity='1';document.getElementById('toStep2Btn').style.pointerEvents='auto';}});}
+function selectBookingService(el,name,price){document.querySelectorAll('.service-select-item').forEach(i=>i.classList.remove('selected'));el.classList.add('selected');bookingData.service=name;bookingData.price=price;document.getElementById('toStep2Btn').style.opacity='1';document.getElementById('toStep2Btn').style.pointerEvents='auto';}
+function nextBookingStep(step){document.querySelectorAll('.booking-section').forEach(s=>s.classList.remove('active'));document.getElementById('bsection'+step).classList.add('active');for(let i=1;i<=3;i++){const s=document.getElementById('bstep'+i),l=document.getElementById('bline'+(i-1));s.classList.remove('active','done');if(l)l.classList.remove('done');if(i<step){s.classList.add('done');if(l)l.classList.add('done');}if(i===step)s.classList.add('active');}if(step===2)initCalendar();if(step===3){document.getElementById('bookingSummary').innerHTML=`<strong>Услуга:</strong> ${bookingData.service}<br><strong>Стоимость:</strong> ${bookingData.price}<br><strong>Дата:</strong> ${bookingData.date||'—'}<br><strong>Время:</strong> ${bookingData.time||'—'}`;}window.scrollTo({top:0,behavior:'smooth'});}
+function submitBooking(){const n=document.getElementById('bookName').value,p=document.getElementById('bookPhone').value;if(!n||!p){showToast('Заполните имя и телефон!');return;}document.getElementById('successDetails').innerHTML=`<strong>Услуга:</strong> ${bookingData.service}<br><strong>Дата:</strong> ${bookingData.date}<br><strong>Время:</strong> ${bookingData.time}<br><strong>Имя:</strong> ${n}<br><strong>Телефон:</strong> ${p}`;showPage('success');launchConfetti();}
+
+// ===== CALENDAR =====
+let calYear=2026,calMonth=3;
+function initCalendar(){const w=document.getElementById('calendarWrapper');const m=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];const dn=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];const fd=(new Date(calYear,calMonth,1).getDay()+6)%7;const dm=new Date(calYear,calMonth+1,0).getDate();const td=new Date();let h=`<div class="calendar-header"><button onclick="chM(-1)" style="width:32px;height:32px;border-radius:50%;background:var(--light);display:flex;align-items:center;justify-content:center;font-size:1rem;">‹</button><div class="calendar-month">${m[calMonth]} ${calYear}</div><button onclick="chM(1)" style="width:32px;height:32px;border-radius:50%;background:var(--light);display:flex;align-items:center;justify-content:center;font-size:1rem;">›</button></div><div class="calendar-days">`;dn.forEach(d=>h+=`<div class="calendar-day-name">${d}</div>`);for(let i=0;i<fd;i++)h+=`<div class="calendar-day disabled"></div>`;for(let d=1;d<=dm;d++){const dt=new Date(calYear,calMonth,d);const ip=dt<new Date(td.getFullYear(),td.getMonth(),td.getDate());const it=d===td.getDate()&&calMonth===td.getMonth()&&calYear===td.getFullYear();h+=`<div class="calendar-day ${ip?'disabled':it?'today':''}" onclick="selDate(this,${d})">${d}</div>`;}h+=`</div>`;w.innerHTML=h;genTS();}
+function chM(d){calMonth+=d;if(calMonth>11){calMonth=0;calYear++;}if(calMonth<0){calMonth=11;calYear--;}initCalendar();}
+function selDate(el,d){document.querySelectorAll('.calendar-day').forEach(x=>x.classList.remove('selected'));el.classList.add('selected');const m=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];bookingData.date=`${d} ${m[calMonth]} ${calYear}`;chk2();}
+function genTS(){const s=['09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00'];document.getElementById('timeSlots').innerHTML=s.map(t=>`<div class="time-slot ${Math.random()<0.15?'disabled':''}" onclick="selTime(this,'${t}')">${t}</div>`).join('');}
+function selTime(el,t){if(el.classList.contains('disabled'))return;document.querySelectorAll('.time-slot').forEach(x=>x.classList.remove('selected'));el.classList.add('selected');bookingData.time=t;chk2();}
+function chk2(){if(bookingData.date&&bookingData.time){document.getElementById('toStep3Btn').style.opacity='1';document.getElementById('toStep3Btn').style.pointerEvents='auto';}}
+
+// ===== SHOP =====
+let selectedPurchase=null;
+function selectPurchase(el,id){document.querySelectorAll('.purchase-card').forEach(c=>c.classList.remove('selected-purchase'));el.classList.add('selected-purchase');selectedPurchase={id,name:el.querySelector('.purchase-name').textContent,price:el.querySelector('.purchase-price').textContent};const btn=document.getElementById('purchaseBtn');btn.style.opacity='1';btn.style.pointerEvents='auto';btn.textContent=`Оплатить ${selectedPurchase.price}`;}
+function processPurchase(){if(!selectedPurchase)return;document.getElementById('purchaseDetails').innerHTML=`<strong>Абонемент:</strong> ${selectedPurchase.name}<br><strong>Стоимость:</strong> ${selectedPurchase.price}<br><strong>Способ оплаты:</strong> Kaspi / Перевод`;showPage('purchaseSuccess');launchConfetti();}
+
+// ===== CONFETTI =====
+function launchConfetti(){const c=document.getElementById('confettiContainer');c.innerHTML='';const colors=['#FFE600','#FF2D7B','#25D366','#8B5CF6','#3B82F6','#F59E0B'];for(let i=0;i<40;i++){const p=document.createElement('div');p.className='confetti-piece';p.style.left=Math.random()*100+'%';p.style.background=colors[Math.floor(Math.random()*colors.length)];p.style.animationDelay=Math.random()*1+'s';p.style.borderRadius=Math.random()>0.5?'50%':'2px';p.style.width=(Math.random()*8+6)+'px';p.style.height=(Math.random()*8+6)+'px';c.appendChild(p);}setTimeout(()=>c.innerHTML='',3000);}
+
+// ===== EXTERNAL =====
+function openWhatsApp(){window.open('https://wa.me/77003131515?text=Здравствуйте! Хочу записаться на процедуру.','_blank');}
+function callPhone(){window.open('tel:+77003131515');}
+</script>
+</body>
+</html>
