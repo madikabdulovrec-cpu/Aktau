@@ -152,6 +152,38 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
 .photo-readonly img { width:100%; height:100%; object-fit:cover; }
 .photo-readonly .cap { position:absolute; left:0; right:0; bottom:0; padding:6px 10px; background:linear-gradient(transparent, rgba(0,0,0,.7)); color:#fff; font-size:11px; font-weight:600; }
 
+/* === MEASUREMENTS === */
+.measurement-list { display:flex; flex-direction:column; gap:14px; }
+.m-entry { background:var(--white); border:2px solid rgba(0,0,0,.08); border-radius:var(--radius); padding:16px 18px; transition:.2s; }
+.m-entry:hover { border-color:var(--black); }
+.m-entry.is-baseline { border-color:var(--yellow); background:linear-gradient(to right, #FFFBEC, var(--white)); }
+.m-entry-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:8px; }
+.m-entry-date { font-family:'Unbounded',sans-serif; font-size:14px; font-weight:700; display:flex; align-items:center; gap:8px; }
+.m-baseline-tag { padding:3px 10px; background:var(--yellow); color:var(--black); border-radius:var(--radius-pill); font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; font-family:'Space Grotesk',sans-serif; }
+.m-items { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:8px; }
+.m-item { background:var(--gray); border-radius:10px; padding:8px 12px; }
+.m-item .nm { font-size:11px; color:#888; text-transform:uppercase; letter-spacing:.05em; font-weight:600; margin-bottom:2px; }
+.m-item .val { font-family:'Unbounded',sans-serif; font-size:16px; font-weight:700; }
+.m-item .val small { font-family:'Space Grotesk',sans-serif; font-size:11px; font-weight:500; color:#888; margin-left:3px; }
+.m-item .diff { display:inline-block; margin-left:6px; font-size:11px; font-weight:700; padding:2px 7px; border-radius:8px; vertical-align:middle; }
+.m-item .diff.minus { background:#E6FFEA; color:#00A653; }
+.m-item .diff.plus { background:#FFE5EC; color:var(--pink); }
+.m-item .diff.zero { background:var(--gray); color:#888; }
+.m-notes { margin-top:10px; padding:10px 12px; background:var(--gray); border-radius:10px; font-size:13px; line-height:1.5; color:#444; }
+.m-actions { display:flex; gap:6px; }
+
+/* модаль замера */
+.m-rows { display:flex; flex-direction:column; gap:8px; margin-bottom:12px; }
+.m-row { display:grid; grid-template-columns:1fr 110px 38px; gap:8px; align-items:center; }
+.m-row input { padding:11px 14px; background:var(--gray); border:2px solid rgba(0,0,0,.06); border-radius:10px; font-size:14px; font-family:'Space Grotesk',sans-serif; outline:none; }
+.m-row input:focus { border-color:var(--pink); box-shadow:0 0 0 3px rgba(255,45,123,.08); }
+.m-row .rm { width:36px; height:36px; border:none; background:#FFE5EC; color:var(--pink); border-radius:10px; cursor:pointer; font-size:16px; }
+.m-row .rm:hover { background:var(--pink); color:#fff; }
+.m-presets { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+.m-preset { padding:6px 12px; background:var(--gray); border:1.5px solid rgba(0,0,0,.06); border-radius:var(--radius-pill); font-size:12px; font-weight:600; cursor:pointer; transition:.2s; font-family:'Space Grotesk',sans-serif; }
+.m-preset:hover { background:var(--yellow); border-color:var(--black); }
+.m-preset.used { opacity:.4; pointer-events:none; }
+
 /* ===== CARD VIEW ===== */
 .card-grid { display:grid; grid-template-columns:1fr 360px; gap:24px; }
 @media (max-width:900px) { .card-grid { grid-template-columns:1fr; } }
@@ -443,6 +475,18 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
             <p>Сессий ещё нет</p>
           </div>
         </div>
+
+        <div class="info-block">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+            <h4 style="margin-bottom:0;">📏 История замеров</h4>
+            <button class="btn btn-primary" style="padding:8px 14px; font-size:12px;" onclick="openMeasurementForm()">+ Новый замер</button>
+          </div>
+          <div id="measurementList" class="measurement-list"></div>
+          <div id="measurementEmpty" class="empty-state" style="display:none; padding:40px 10px;">
+            <div class="ic">📐</div>
+            <p>Замеров ещё нет — добавьте первый, чтобы зафиксировать стартовые значения</p>
+          </div>
+        </div>
       </div>
 
       <div>
@@ -562,6 +606,45 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
     <div class="modal-actions">
       <button class="btn btn-light" onclick="closeSessionForm()">Отмена</button>
       <button class="btn btn-primary" onclick="saveSession()">Сохранить</button>
+    </div>
+  </div>
+</div>
+
+<!-- ====================================================================== -->
+<!-- MODAL: новый/редакт. замер                                              -->
+<!-- ====================================================================== -->
+<div class="modal-bg" id="measurementModal">
+  <div class="modal" style="max-width:600px;">
+    <h3 id="measurementModalTitle">Новый замер</h3>
+    <div class="form-row">
+      <div class="form-field">
+        <label>Дата</label>
+        <input type="date" id="meas_date">
+      </div>
+      <div class="form-field">
+        <label>Специалист</label>
+        <input type="text" id="meas_specialist" placeholder="ФИО мастера">
+      </div>
+    </div>
+
+    <div class="form-field">
+      <label>Точки замеров (см)</label>
+      <div id="measRows" class="m-rows"></div>
+      <div style="display:flex; gap:8px; margin-bottom:8px;">
+        <button type="button" class="btn btn-light" style="padding:8px 16px; font-size:13px;" onclick="addMeasRow()">+ Добавить точку</button>
+      </div>
+      <div style="font-size:11px; color:#888; margin-bottom:6px;">Быстрый выбор:</div>
+      <div id="measPresets" class="m-presets"></div>
+    </div>
+
+    <div class="form-field">
+      <label>Заметка</label>
+      <textarea id="meas_notes" placeholder="Самочувствие, наблюдения, рекомендации..."></textarea>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-light" onclick="closeMeasurementForm()">Отмена</button>
+      <button class="btn btn-primary" onclick="saveMeasurement()">Сохранить</button>
     </div>
   </div>
 </div>
@@ -1269,6 +1352,9 @@ function openClientCard(id) {
     `).join('');
   }
 
+  // measurements
+  renderMeasurements(c);
+
   // altegio
   document.getElementById('altegioId').textContent = c.altegioId||'—';
   const link = c.altegioLink||'';
@@ -1437,6 +1523,204 @@ function viewPhoto(url) {
   document.getElementById('viewerImg').src = url;
   document.getElementById('viewer').classList.add('active');
 }
+
+/* ============================================================
+   ЗАМЕРЫ
+   ============================================================ */
+const MEAS_PRESETS = ['Грудь','Под грудью','Талия','Над пупком','Под пупком','Бёдра','Ягодицы','Бедро Л','Бедро П','Икра Л','Икра П','Колено Л','Колено П','Бицепс Л','Бицепс П','Запястье Л','Запястье П','Шея','Плечо Л','Плечо П'];
+
+let editingMeasurement = null; // {id, date, specialist, specialistId, items:[{name,value}], notes}
+
+function normMeasName(s) { return String(s||'').trim().toLowerCase(); }
+
+function openMeasurementForm(mid) {
+  if(!viewingClientId) return;
+  const c = STATE.clients.find(x => x.id===viewingClientId);
+  if(!c) return;
+  if(mid) {
+    const m = (c.measurements||[]).find(x => x.id===mid);
+    if(!m) return;
+    editingMeasurement = JSON.parse(JSON.stringify(m));
+    document.getElementById('measurementModalTitle').textContent = 'Редактировать замер';
+  } else {
+    editingMeasurement = {
+      id: uid(),
+      date: todayStr(),
+      specialist: STATE.session?.name||'',
+      specialistId: STATE.session?.staffId||'',
+      items: [],
+      notes: '',
+      createdAt: Date.now(),
+    };
+    document.getElementById('measurementModalTitle').textContent = 'Новый замер';
+    // Если есть базовый замер — подставим точки оттуда (но без значений), чтобы мастеру было удобно
+    const baseline = (c.measurements||[]).slice().sort((a,b) => (a.date||'').localeCompare(b.date||''))[0];
+    if(baseline?.items?.length) {
+      editingMeasurement.items = baseline.items.map(it => ({ name:it.name, value:'' }));
+    }
+  }
+  document.getElementById('meas_date').value = editingMeasurement.date;
+  document.getElementById('meas_specialist').value = editingMeasurement.specialist;
+  document.getElementById('meas_notes').value = editingMeasurement.notes||'';
+  renderMeasRows();
+  renderMeasPresets();
+  document.getElementById('measurementModal').classList.add('active');
+}
+function closeMeasurementForm() {
+  document.getElementById('measurementModal').classList.remove('active');
+  editingMeasurement = null;
+}
+function renderMeasRows() {
+  const wrap = document.getElementById('measRows');
+  if(!editingMeasurement.items.length) {
+    wrap.innerHTML = '<p style="color:#aaa; font-size:13px; padding:8px 0;">Точек ещё нет — добавьте через быстрый выбор ниже или вручную</p>';
+    return;
+  }
+  wrap.innerHTML = editingMeasurement.items.map((it,i) => `
+    <div class="m-row" data-idx="${i}">
+      <input type="text" placeholder="Название (Талия, Бёдра…)" value="${escapeHtml(it.name||'')}" data-field="name">
+      <input type="number" inputmode="decimal" step="0.5" placeholder="см" value="${escapeHtml(it.value||'')}" data-field="value">
+      <button type="button" class="rm" data-action="rm-row" title="Удалить">×</button>
+    </div>
+  `).join('');
+}
+function renderMeasPresets() {
+  const used = new Set(editingMeasurement.items.map(it => normMeasName(it.name)).filter(Boolean));
+  document.getElementById('measPresets').innerHTML = MEAS_PRESETS.map(p => `
+    <button type="button" class="m-preset ${used.has(normMeasName(p))?'used':''}" data-preset="${escapeHtml(p)}">+ ${escapeHtml(p)}</button>
+  `).join('');
+}
+function addMeasRow(name) {
+  editingMeasurement.items.push({ name:name||'', value:'' });
+  renderMeasRows();
+  renderMeasPresets();
+  // фокус на новый ряд (на name-инпут если без preset, иначе на value)
+  setTimeout(() => {
+    const rows = document.querySelectorAll('#measRows .m-row');
+    const last = rows[rows.length-1];
+    if(!last) return;
+    const focusField = name ? 'value' : 'name';
+    last.querySelector(`[data-field="${focusField}"]`)?.focus();
+  }, 30);
+}
+
+// делегирование для модали замеров
+document.addEventListener('click', e => {
+  if(!editingMeasurement) return;
+  const presetBtn = e.target.closest('#measPresets .m-preset');
+  if(presetBtn && !presetBtn.classList.contains('used')) {
+    addMeasRow(presetBtn.dataset.preset);
+    return;
+  }
+  const rmBtn = e.target.closest('#measRows [data-action="rm-row"]');
+  if(rmBtn) {
+    const row = rmBtn.closest('.m-row');
+    const idx = +row.dataset.idx;
+    editingMeasurement.items.splice(idx,1);
+    renderMeasRows();
+    renderMeasPresets();
+  }
+});
+document.addEventListener('input', e => {
+  if(!editingMeasurement) return;
+  if(!e.target.matches('#measRows .m-row [data-field]')) return;
+  const row = e.target.closest('.m-row');
+  const idx = +row.dataset.idx;
+  const field = e.target.dataset.field;
+  if(editingMeasurement.items[idx]) {
+    editingMeasurement.items[idx][field] = e.target.value;
+    if(field==='name') renderMeasPresets();
+  }
+});
+
+function saveMeasurement() {
+  if(!viewingClientId || !editingMeasurement) return;
+  editingMeasurement.date = document.getElementById('meas_date').value;
+  editingMeasurement.specialist = document.getElementById('meas_specialist').value.trim();
+  editingMeasurement.notes = document.getElementById('meas_notes').value.trim();
+  // отфильтруем пустые точки
+  editingMeasurement.items = editingMeasurement.items
+    .map(it => ({ name:(it.name||'').trim(), value:(it.value||'').toString().trim() }))
+    .filter(it => it.name && it.value);
+  if(editingMeasurement.items.length===0) { toast('Заполните хотя бы одну точку','error'); return; }
+
+  const c = STATE.clients.find(x => x.id===viewingClientId);
+  if(!c) return;
+  c.measurements = c.measurements || [];
+  const i = c.measurements.findIndex(m => m.id===editingMeasurement.id);
+  if(i>=0) c.measurements[i] = editingMeasurement;
+  else c.measurements.push(editingMeasurement);
+  c.updatedAt = Date.now();
+  saveState();
+  closeMeasurementForm();
+  openClientCard(viewingClientId);
+  toast('Замер сохранён');
+}
+function deleteMeasurement(mid) {
+  if(!viewingClientId) return;
+  if(!confirm('Удалить этот замер?')) return;
+  const c = STATE.clients.find(x => x.id===viewingClientId);
+  c.measurements = (c.measurements||[]).filter(m => m.id!==mid);
+  c.updatedAt = Date.now();
+  saveState();
+  openClientCard(viewingClientId);
+}
+
+function renderMeasurements(c) {
+  const wrap = document.getElementById('measurementList');
+  const empty = document.getElementById('measurementEmpty');
+  const list = (c.measurements||[]).slice().sort((a,b) => (a.date||'').localeCompare(b.date||''));
+  if(list.length===0) { wrap.innerHTML=''; empty.style.display='block'; return; }
+  empty.style.display='none';
+
+  // baseline = самый ранний по дате
+  const baseline = list[0];
+  const baselineMap = {};
+  baseline.items.forEach(it => { baselineMap[normMeasName(it.name)] = parseFloat(String(it.value).replace(',','.')); });
+
+  // показываем от самого свежего вниз
+  const sortedDesc = list.slice().reverse();
+  wrap.innerHTML = sortedDesc.map(m => {
+    const isBaseline = m.id===baseline.id;
+    const items = (m.items||[]).map(it => {
+      const cur = parseFloat(String(it.value).replace(',','.'));
+      const base = baselineMap[normMeasName(it.name)];
+      let diffHtml = '';
+      if(!isBaseline && Number.isFinite(base) && Number.isFinite(cur)) {
+        const d = +(cur - base).toFixed(1);
+        if(d===0) diffHtml = `<span class="diff zero">±0</span>`;
+        else if(d<0) diffHtml = `<span class="diff minus">${d} см</span>`;
+        else diffHtml = `<span class="diff plus">+${d} см</span>`;
+      }
+      return `<div class="m-item"><div class="nm">${escapeHtml(it.name)}</div><div class="val">${escapeHtml(it.value)}<small>см</small>${diffHtml}</div></div>`;
+    }).join('');
+    return `
+      <div class="m-entry ${isBaseline?'is-baseline':''}" data-mid="${escapeHtml(m.id)}">
+        <div class="m-entry-head">
+          <div class="m-entry-date">
+            ${fmtDate(m.date)}
+            ${isBaseline?'<span class="m-baseline-tag">Старт</span>':''}
+          </div>
+          <div class="m-actions">
+            <button class="btn-ghost" style="padding:6px 10px; font-size:12px;" data-action="edit-meas">✎</button>
+            <button class="btn-ghost" style="padding:6px 10px; font-size:12px; color:var(--pink);" data-action="del-meas">×</button>
+          </div>
+        </div>
+        <div class="m-items">${items}</div>
+        ${m.notes?`<div class="m-notes">${escapeHtml(m.notes)}</div>`:''}
+      </div>
+    `;
+  }).join('');
+}
+
+// делегирование для карточки замеров (edit/delete)
+document.addEventListener('click', e => {
+  const entry = e.target.closest('#measurementList .m-entry');
+  if(!entry) return;
+  const mid = entry.dataset.mid;
+  if(e.target.closest('[data-action="edit-meas"]')) openMeasurementForm(mid);
+  else if(e.target.closest('[data-action="del-meas"]')) deleteMeasurement(mid);
+});
 
 /* ============================================================
    ADMIN
