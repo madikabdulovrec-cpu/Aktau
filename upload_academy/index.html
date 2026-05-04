@@ -451,6 +451,32 @@ body {
 .cat-access-btn.active.blocked { background: var(--pink); color: #fff; border-color: var(--pink); }
 .cat-card.locked .cat-card-cta { color: #999; }
 
+/* Lesson-by-lesson unlock control (admin-only) */
+.lesson-unlock-card {
+  background:#f8f9fa; border-radius:var(--radius); padding:16px 18px;
+  border-left:4px solid var(--blue); margin-bottom:24px;
+}
+.luc-head { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+.luc-title { font-family:'Unbounded',sans-serif; font-size:13px; font-weight:700; }
+.luc-count { font-size:12px; color:#666; }
+.luc-bar { height:6px; background:rgba(0,0,0,0.06); border-radius:3px; overflow:hidden; margin-bottom:12px; }
+.luc-bar-fill { height:100%; background:var(--blue); border-radius:3px; transition:width 0.4s; }
+.luc-current { font-size:13px; margin-bottom:4px; }
+.luc-next { font-size:12px; color:#777; margin-bottom:14px; }
+.luc-label { color:#999; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; font-weight:700; margin-right:6px; }
+.luc-lesson-name { font-weight:600; color:#1a1a1a; }
+.luc-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.luc-btn {
+  flex:1; min-width:140px; padding:10px 14px; border-radius:var(--radius-pill);
+  border:1.5px solid #ddd; background:#fff; cursor:pointer; transition:all 0.15s;
+  font-family:'Space Grotesk',sans-serif; font-size:12px; font-weight:700;
+}
+.luc-btn:hover:not(:disabled) { border-color:#999; transform:translateY(-1px); }
+.luc-btn:disabled { opacity:0.4; cursor:not-allowed; }
+.luc-btn-back { color:#666; }
+.luc-btn-next { background:var(--blue); color:#fff; border-color:var(--blue); }
+.luc-btn-next:hover:not(:disabled) { background:#1f4ee0; border-color:#1f4ee0; }
+
 /* Category Detail Screen */
 .cat-detail-overlay {
   position: fixed; inset: 0; background: rgba(10,10,20,0.92); z-index: 10002;
@@ -3274,6 +3300,11 @@ body {
             </div>
           </div>
           <div class="intern-detail-stats" id="idStats"></div>
+
+          <!-- Lesson-by-lesson unlock (admin-only manual control) -->
+          <h4 style="font-family:'Unbounded',sans-serif;font-size:14px;margin:24px 0 6px;">&#128274; Доступ к урокам</h4>
+          <div style="font-size:12px;color:#666;margin-bottom:14px;">Стажёр видит только открытые вами уроки. Открывайте по одному после проверки задания. Уроки сверх открытого диапазона показываются с замком.</div>
+          <div id="lessonUnlockControl"></div>
 
           <!-- Category access control -->
           <h4 style="font-family:'Unbounded',sans-serif;font-size:14px;margin:24px 0 6px;">&#128273; Доступ к категориям</h4>
@@ -10550,6 +10581,9 @@ function loadInternIntoState(internIdx) {
   state.rewardsRedeemed = intern.rewardsRedeemed || 0;
   state.redeemedList = Array.isArray(intern.redeemedList) ? intern.redeemedList.slice() : [];
   state.answers = (intern.answers && typeof intern.answers === 'object') ? Object.assign({}, intern.answers) : {};
+  // unlockedUntil — сколько уроков открыл админ. Стажёр сам не может это менять.
+  state.unlockedUntil = (typeof intern.unlockedUntil === 'number' && intern.unlockedUntil >= 0)
+    ? Math.min(intern.unlockedUntil, TOTAL_LESSONS - 1) : 0;
   state.startDate = intern.startDate || today.toLocaleDateString('ru-RU');
   var startParts = state.startDate.split('.');
   var startD = new Date(startParts[2], startParts[1]-1, startParts[0]);
@@ -10941,6 +10975,9 @@ function openCatDetail(catId) {
   // Lessons list — all lessons where CATEGORY_MAP[i] === catId
   var lessonsHtml = '';
   var num = 0;
+  // Per-lesson gate (для стажёра — админу всё открыто)
+  var unlockedUntil = state.isAdmin ? (TOTAL_LESSONS - 1)
+    : ((typeof state.unlockedUntil === 'number') ? state.unlockedUntil : 0);
   for (var i = 0; i < TOTAL_LESSONS; i++) {
     if (CATEGORY_MAP[i] !== catId) continue;
     num++;
@@ -10948,10 +10985,16 @@ function openCatDetail(catId) {
     var mod = MODULES[lesson.module];
     var score = state.scores[i];
     var isDone = score > 0;
-    // Lesson is locked if category is locked
-    var lessonLocked = isLocked;
+    // Урок заблокирован если: вся категория заблокирована, ИЛИ
+    // открытый диапазон уроков ещё не дошёл до этого индекса (и урок не пройден).
+    var lessonLockedByGate = !state.isAdmin && i > unlockedUntil && !isDone;
+    var lessonLocked = isLocked || lessonLockedByGate;
     var rowClass = 'cat-lesson-row' + (isDone ? ' done' : '') + (lessonLocked ? ' locked' : '');
-    var scoreText = isDone ? (score + '/5 &#9733;') : (lessonLocked ? '&#128274;' : 'Открыть &rarr;');
+    var scoreText;
+    if (isDone) scoreText = score + '/5 &#9733;';
+    else if (lessonLockedByGate) scoreText = '&#128274; Закрыт куратором';
+    else if (lessonLocked) scoreText = '&#128274;';
+    else scoreText = 'Открыть &rarr;';
     var clickHandler = lessonLocked ? '' : ' onclick="closeCatDetail();openLesson(' + i + ');"';
     lessonsHtml += '<div class="' + rowClass + '"' + clickHandler + '>' +
       '<div class="cat-lesson-num">' + (isDone ? '&#10003;' : num) + '</div>' +
@@ -11040,6 +11083,95 @@ function setCategoryAccess(internIdx, catId, mode) {
   persist();
   renderCategoryAccessControl(internIdx);
   showToast('&#128273;', 'Доступ обновлён', 'Кат. ' + catId + ' → ' + (mode === 'auto' ? 'Авто' : mode === 'open' ? 'Открыта' : 'Закрыта'));
+}
+
+// ===== LESSON-BY-LESSON UNLOCK (admin-only) =====
+// Каждый стажёр имеет intern.unlockedUntil — индекс последнего открытого урока.
+// Админ управляет этим строго пошагово: открыть следующий / закрыть последний.
+
+function getInternUnlockedUntil(intern) {
+  if (!intern) return 0;
+  if (typeof intern.unlockedUntil !== 'number' || intern.unlockedUntil < 0) {
+    intern.unlockedUntil = 0;
+  }
+  return Math.min(intern.unlockedUntil, TOTAL_LESSONS - 1);
+}
+
+function renderLessonUnlockControl(internIdx) {
+  var intern = INTERNS[internIdx];
+  if (!intern) return;
+  var host = document.getElementById('lessonUnlockControl');
+  if (!host) return; // если элемент не вставлен в HTML — пропускаем
+
+  var unlocked = getInternUnlockedUntil(intern);
+  var openedCount = unlocked + 1;       // 0..unlocked включительно
+  var pct = Math.round(openedCount / TOTAL_LESSONS * 100);
+  var currentLesson = LESSONS[unlocked] ? LESSONS[unlocked].title : '—';
+  var nextLesson = LESSONS[unlocked + 1] ? LESSONS[unlocked + 1].title : null;
+  var atStart = unlocked <= 0;
+  var atEnd = unlocked >= TOTAL_LESSONS - 1;
+
+  host.innerHTML =
+    '<div class="lesson-unlock-card">' +
+      '<div class="luc-head">' +
+        '<div class="luc-title">&#128274; Доступ к урокам</div>' +
+        '<div class="luc-count">Открыто: <strong>' + openedCount + '</strong> из ' + TOTAL_LESSONS + ' &nbsp;·&nbsp; ' + pct + '%</div>' +
+      '</div>' +
+      '<div class="luc-bar"><div class="luc-bar-fill" style="width:' + pct + '%;"></div></div>' +
+      '<div class="luc-current">' +
+        '<span class="luc-label">Текущий открытый:</span> ' +
+        '<span class="luc-lesson-name">№' + (unlocked + 1) + ' — ' + escapeHtml(currentLesson) + '</span>' +
+      '</div>' +
+      (nextLesson
+        ? '<div class="luc-next"><span class="luc-label">Следующий:</span> №' + (unlocked + 2) + ' — ' + escapeHtml(nextLesson) + '</div>'
+        : '<div class="luc-next" style="color:#00a854;"><strong>&#10003; Все уроки открыты</strong></div>'
+      ) +
+      '<div class="luc-actions">' +
+        '<button class="luc-btn luc-btn-back"' + (atStart ? ' disabled' : '') + ' onclick="lockOneLesson(' + internIdx + ')">&larr; Закрыть один</button>' +
+        '<button class="luc-btn luc-btn-next"' + (atEnd ? ' disabled' : '') + ' onclick="unlockNextLesson(' + internIdx + ')">Открыть следующий &rarr;</button>' +
+      '</div>' +
+    '</div>';
+}
+
+function unlockNextLesson(internIdx) {
+  var intern = INTERNS[internIdx];
+  if (!intern) return;
+  var cur = getInternUnlockedUntil(intern);
+  if (cur >= TOTAL_LESSONS - 1) {
+    showToast('&#9989;', 'Все уроки уже открыты', '');
+    return;
+  }
+  intern.unlockedUntil = cur + 1;
+  // Если открытый стажёр сейчас залогинен и это его запись — обновим state,
+  // чтобы новая разблокировка применилась без перелогина.
+  if (!state.isAdmin && state.internIdx === internIdx) {
+    state.unlockedUntil = intern.unlockedUntil;
+  }
+  persist();
+  renderLessonUnlockControl(internIdx);
+  var nextTitle = LESSONS[intern.unlockedUntil] ? LESSONS[intern.unlockedUntil].title : '';
+  showToast('&#128275;', 'Открыт следующий урок', '№' + (intern.unlockedUntil + 1) + ' — ' + nextTitle);
+}
+
+function lockOneLesson(internIdx) {
+  var intern = INTERNS[internIdx];
+  if (!intern) return;
+  var cur = getInternUnlockedUntil(intern);
+  if (cur <= 0) {
+    showToast('&#9888;', 'Уже на самом первом уроке', 'Дальше закрывать некуда');
+    return;
+  }
+  // Не закрываем уроки, которые стажёр уже сдал и которые имеют оценку
+  if (intern.scores && intern.scores[cur] > 0) {
+    if (!confirm('Этот урок уже пройден стажёром (оценка ' + intern.scores[cur] + '/5). Всё равно закрыть доступ?')) return;
+  }
+  intern.unlockedUntil = cur - 1;
+  if (!state.isAdmin && state.internIdx === internIdx) {
+    state.unlockedUntil = intern.unlockedUntil;
+  }
+  persist();
+  renderLessonUnlockControl(internIdx);
+  showToast('&#128274;', 'Урок закрыт', 'Текущий доступ: №' + (intern.unlockedUntil + 1));
 }
 
 // ===== CAREER TRACKER RENDERING =====
@@ -11425,7 +11557,9 @@ function addNewIntern() {
     lastActive: today.toLocaleDateString('ru-RU'),
     pendingDays: [],
     curatorComments: Array(TOTAL_LESSONS).fill(''),
-    welcomeShown: false
+    welcomeShown: false,
+    // Новый стажёр видит только первый урок. Дальше — только через админа.
+    unlockedUntil: 0
   });
 
   hideAddInternModal();
@@ -11460,6 +11594,14 @@ function openLesson(idx) {
     }
     if (access === 'locked') {
       showToast('\uD83D\uDD12', 'Категория ' + lessonCat + ' закрыта', 'Доступ ещё не открыт');
+      return;
+    }
+    // Per-lesson gate: открыто только до state.unlockedUntil включительно.
+    // Уже пройденные уроки (scores>0) можно перечитать всегда.
+    var unlocked = (typeof state.unlockedUntil === 'number') ? state.unlockedUntil : 0;
+    var alreadyPassed = state.scores && state.scores[idx] > 0;
+    if (idx > unlocked && !alreadyPassed) {
+      showToast('🔒', 'Урок ещё не открыт', 'Дождитесь, пока куратор разрешит следующий урок');
       return;
     }
   }
@@ -12531,6 +12673,22 @@ function normalizeIntern(d) {
   var videoMin = Array(TOTAL_LESSONS).fill(0);
   (d.videoMin || []).forEach(function(v, i) { if (i < TOTAL_LESSONS) videoMin[i] = +v || 0; });
   var safeProfile = (d.profile === 'manual') ? 'manual' : 'medical';
+
+  // ===== unlockedUntil — индекс последнего ОТКРЫТОГО урока (включительно) =====
+  // Только админ может увеличить это значение через панель или при выставлении оценки.
+  // Стажёр может зайти в урок idx если idx <= unlockedUntil ИЛИ scores[idx] > 0 (уже пройден).
+  // Миграция: если поле отсутствует у старой записи — выставляем
+  // max(индекс последнего пройденного, 0) + 1, чтобы стажёр не упёрся в стену сразу
+  // после обновления версии. Дальнейший прогресс — только через действия админа.
+  var unlockedUntil;
+  if (typeof d.unlockedUntil === 'number' && d.unlockedUntil >= 0) {
+    unlockedUntil = Math.min(d.unlockedUntil, TOTAL_LESSONS - 1);
+  } else {
+    var lastDone = -1;
+    for (var i = 0; i < scores.length; i++) if (scores[i] > 0) lastDone = i;
+    unlockedUntil = Math.max(0, Math.min(lastDone + 1, TOTAL_LESSONS - 1));
+  }
+
   return {
     name: String(d.name || '').replace(/[<>&"']/g, ''),
     surname: String(d.surname || '').replace(/[<>&"']/g, ''),
@@ -12552,7 +12710,8 @@ function normalizeIntern(d) {
     rewardsRedeemed: +d.rewardsRedeemed || 0,
     redeemedList: Array.isArray(d.redeemedList) ? d.redeemedList.slice() : [],
     answers: (d.answers && typeof d.answers === 'object') ? Object.assign({}, d.answers) : {},
-    welcomeShown: !!d.welcomeShown
+    welcomeShown: !!d.welcomeShown,
+    unlockedUntil: unlockedUntil
   };
 }
 
@@ -12579,6 +12738,12 @@ function syncStateToIntern() {
   // profile не меняется в процессе обучения стажёра — оставляем как есть,
   // но если вдруг потеряли — выставим тот что сейчас в state.
   if (!intern.profile) intern.profile = (state.profile === 'manual') ? 'manual' : 'medical';
+  // unlockedUntil управляется ТОЛЬКО админом — стажёр сам не может его поднять.
+  // Однако сохраняем актуальное значение из intern в state на случай, если
+  // другой админ через cloudSubscribe прислал апдейт.
+  if (typeof intern.unlockedUntil !== 'number' || intern.unlockedUntil < 0) {
+    intern.unlockedUntil = 0;
+  }
   intern.lastActive = new Date().toLocaleDateString('ru-RU');
 }
 
@@ -13008,6 +13173,11 @@ function showInternDetail(idx) {
   // Category access control
   renderCategoryAccessControl(idx);
 
+  // === Lesson-by-lesson unlock control ===
+  // Стажёр видит уроки только до intern.unlockedUntil включительно.
+  // Админ управляет двумя кнопками: открыть следующий / закрыть последний открытый.
+  renderLessonUnlockControl(idx);
+
   const pendingSet = new Set(intern.pendingDays || []);
   const internAnswers = intern.answers || {};
   const dpList = document.getElementById('dayProgressList');
@@ -13060,6 +13230,10 @@ function saveGrades() {
   const commentInputs = document.querySelectorAll('.dpi-comment-input');
   const intern = INTERNS[currentInternIdx];
 
+  // Снимок «было» — нужно для автоматического открытия следующего урока:
+  // если оценка СВЕЖАЯ (раньше 0, теперь >=4) — следующий урок открывается.
+  const prevScores = (intern.scores || []).slice();
+
   // Собираем оценки
   gradeInputs.forEach(inp => {
     const day = parseInt(inp.dataset.day);
@@ -13068,6 +13242,33 @@ function saveGrades() {
       intern.scores[day] = Math.min(5, Math.max(0, val));
     }
   });
+
+  // === Авто-разблокировка следующего урока ===
+  // Правило: если оценка только что выставлена (раньше было 0) и она >= 4,
+  // и стажёр уже на максимально открытом уроке — открываем следующий.
+  // Низкая оценка (0–3) предполагает пересдачу — не открываем.
+  // Если оценил несколько уроков сразу — берём максимальный newly-graded индекс.
+  var newlyHighGraded = -1;
+  for (var di = 0; di < TOTAL_LESSONS; di++) {
+    if ((prevScores[di] || 0) === 0 && (intern.scores[di] || 0) >= 4) {
+      if (di > newlyHighGraded) newlyHighGraded = di;
+    }
+  }
+  if (newlyHighGraded >= 0) {
+    var curUnlocked = getInternUnlockedUntil(intern);
+    var target = newlyHighGraded + 1;
+    if (target > curUnlocked && target <= TOTAL_LESSONS - 1) {
+      intern.unlockedUntil = target;
+      if (!state.isAdmin && state.internIdx === currentInternIdx) {
+        state.unlockedUntil = intern.unlockedUntil;
+      }
+      var nextTitle = LESSONS[target] ? LESSONS[target].title : '';
+      // Информируем админа отдельным toast'ом — но не дублируем «Оценки сохранены»
+      setTimeout(function(){
+        showToast('&#128275;', 'Авто-открыт следующий урок', '№' + (target + 1) + ' — ' + nextTitle);
+      }, 600);
+    }
+  }
 
   // Собираем комментарии куратора
   intern.curatorComments = intern.curatorComments || Array(TOTAL_LESSONS).fill('');
