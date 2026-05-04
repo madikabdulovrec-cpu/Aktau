@@ -108,6 +108,31 @@ body {
   transform:translate(-2px,-2px);
   box-shadow: 0 16px 40px rgba(0,0,0,0.12);
 }
+.login-box .btn-enter:disabled,
+.login-box .btn-enter[disabled] {
+  background:#bbb; cursor:not-allowed; opacity:0.7;
+  transform:none; box-shadow:var(--shadow);
+}
+.login-box .btn-enter:disabled:hover {
+  transform:none; box-shadow:var(--shadow);
+}
+/* Inline статус подключения к облаку — виден прямо в форме */
+.login-cloud-status {
+  margin-top:6px; padding:10px 14px; border-radius:var(--radius);
+  font-size:12px; font-weight:600; text-align:center;
+  background:rgba(255,160,0,0.12); color:#b26a00;
+  border:1px solid rgba(255,160,0,0.25);
+  transition: all 0.3s;
+}
+.login-cloud-status.synced {
+  background:rgba(0,200,83,0.12); color:#00a854;
+  border-color:rgba(0,200,83,0.25);
+}
+.login-cloud-status.error {
+  background:rgba(229,57,53,0.12); color:#c41e3a;
+  border-color:rgba(229,57,53,0.3);
+}
+.login-cloud-status.hidden { display:none; }
 /* Role toggle */
 .role-toggle {
   display:flex; gap:0; margin-bottom:24px;
@@ -2753,6 +2778,7 @@ body {
         <input type="password" id="adminPassword" placeholder="Пароль" onkeydown="if(event.key==='Enter'){event.preventDefault();doLogin();}" />
       </div>
 
+      <div id="loginCloudStatus" class="login-cloud-status">⏳ Подключение к облаку…</div>
       <button class="btn-enter" id="btnLogin" onclick="doLogin()">ВОЙТИ В ОБУЧЕНИЕ</button>
       <div class="login-error" id="loginError"></div>
       <div class="hint" id="loginHint">Введите код доступа от куратора</div>
@@ -10572,8 +10598,19 @@ function restoreSession() {
   return false;
 }
 
-function doLogin() {
+// Хелпер — ищет стажёра по коду (точное совпадение, потом case-insensitive)
+function findInternByCode(code) {
+  var idx = INTERNS.findIndex(function(i){ return i.accessCode === code; });
+  if (idx !== -1) return idx;
+  var lc = code.toLowerCase();
+  return INTERNS.findIndex(function(i){
+    return (i.accessCode || '').toLowerCase() === lc;
+  });
+}
+
+async function doLogin() {
   const err = document.getElementById('loginError');
+  const btn = document.getElementById('btnLogin');
 
   if (loginRole === 'admin') {
     const login = document.getElementById('adminLogin').value.trim();
@@ -10600,15 +10637,45 @@ function doLogin() {
     if (!name || !surname) { err.textContent = 'Введите имя и фамилию'; err.style.display='block'; return; }
     if (!code) { err.textContent = 'Введите код доступа'; err.style.display='block'; return; }
 
-    // Сначала ищем точное совпадение, потом case-insensitive (на случай разных раскладок)
-    var internIdx = INTERNS.findIndex(function(i){ return i.accessCode === code; });
-    if (internIdx === -1) {
-      var lc = code.toLowerCase();
-      internIdx = INTERNS.findIndex(function(i){
-        return (i.accessCode || '').toLowerCase() === lc;
-      });
+    // Поиск по коду в текущем INTERNS
+    var internIdx = findInternByCode(code);
+
+    // Если не нашли И облако ещё не отдало первый снимок — подождём до 8 секунд.
+    // Это спасает свежие телефоны: localStorage пустой, INTERNS=[], а cloudLoad
+    // ещё в процессе. Без этого юзер видит «Неверный код» через 0.1 сек после
+    // того, как на странице вообще ничего ещё не успело загрузиться.
+    if (internIdx === -1 && typeof cloudInitialLoadDone !== 'undefined' && !cloudInitialLoadDone) {
+      err.textContent = '⏳ Загружаем данные из облака…';
+      err.style.display = 'block';
+      err.style.color = '#b26a00';
+      if (btn) { btn.disabled = true; btn.textContent = 'ЗАГРУЗКА…'; }
+      var maxWaitMs = 8000;
+      var step = 250;
+      var waited = 0;
+      while (!cloudInitialLoadDone && waited < maxWaitMs) {
+        await new Promise(function(r){ setTimeout(r, step); });
+        waited += step;
+        internIdx = findInternByCode(code);
+        if (internIdx !== -1) break; // нашли — выходим из ожидания
+      }
+      // Если за 8 сек так и не подгрузилось — попробуем найти ещё раз
+      if (internIdx === -1) internIdx = findInternByCode(code);
+      if (btn) { btn.disabled = false; btn.textContent = 'ВОЙТИ В ОБУЧЕНИЕ'; }
+      err.style.color = ''; // вернём стандартный красный
     }
-    if (internIdx === -1) { err.textContent = 'Неверный код доступа'; err.style.display='block'; return; }
+
+    if (internIdx === -1) {
+      // Финальная диагностика: что реально могло пойти не так
+      if (typeof cloudReady !== 'undefined' && !cloudReady) {
+        err.textContent = 'Нет связи с облаком. Проверьте интернет и перезагрузите страницу.';
+      } else if (INTERNS.length === 0) {
+        err.textContent = 'Список стажёров не загрузился. Перезагрузите страницу.';
+      } else {
+        err.textContent = 'Неверный код доступа';
+      }
+      err.style.display='block';
+      return;
+    }
 
     if (!loadInternIntoState(internIdx)) { err.textContent = 'Ошибка загрузки профиля'; err.style.display='block'; return; }
 
@@ -12200,6 +12267,14 @@ function cloudInit() {
       firebase.initializeApp(FIREBASE_CONFIG);
     }
     cloudDb = firebase.firestore();
+    // На некоторых мобильных операторах (KZ Beeline/Kcell, корпоративные WiFi)
+    // режется HTTP long-polling > 30 сек. Auto-detect позволит SDK самому
+    // переключиться на long-polling если WebSocket/streaming не проходит.
+    try {
+      cloudDb.settings({ experimentalAutoDetectLongPolling: true, merge: true });
+    } catch (e) {
+      console.warn('[cloud] settings не применились:', e);
+    }
     cloudReady = true;
     console.log('[cloud] Firebase инициализирован');
     updateCloudStatus('connecting');
@@ -12379,7 +12454,59 @@ function updateCloudStatus(status) {
   el.style.background = lbl.bg;
   el.style.color = lbl.color;
   el.title = 'Статус синхронизации с облаком (Firebase Firestore)';
+
+  // Inline-статус прямо в форме логина + блокировка кнопки до готовности облака.
+  // Это спасает от ситуации «стажёр на свежем телефоне жмёт Войти раньше,
+  // чем cloudLoad подтянул INTERNS из облака».
+  try {
+    var inline = document.getElementById('loginCloudStatus');
+    var btn = document.getElementById('btnLogin');
+    if (inline) {
+      inline.classList.remove('synced', 'error', 'hidden');
+      var ready = (status === 'synced' || status === 'syncing');
+      if (status === 'connecting') {
+        inline.textContent = '⏳ Подключение к облаку…';
+      } else if (status === 'syncing') {
+        inline.textContent = '⏳ Синхронизация…';
+      } else if (status === 'synced') {
+        inline.textContent = '✅ Готово к входу';
+        inline.classList.add('synced');
+      } else if (status === 'error') {
+        inline.textContent = '⚠ Облако недоступно — попробуйте перезагрузить страницу';
+        inline.classList.add('error');
+      } else if (status === 'offline') {
+        inline.textContent = '⚫ Облако не настроено — работаем локально';
+        inline.classList.add('error');
+      }
+      // Если облако offline или error — всё равно даём войти (вдруг localStorage есть).
+      var allowLogin = ready || status === 'error' || status === 'offline';
+      if (btn) btn.disabled = !allowLogin;
+    }
+  } catch (e) { /* DOM ещё не готов на boot */ }
 }
+
+// Безопасный таймаут на случай, если cloudInit/cloudLoad зависнут (мобильный
+// оператор режет long-poll, ITP блокирует firestore.googleapis.com и т.п.).
+// Через 12 секунд после старта — если облако не подтвердило подключение,
+// разблокируем кнопку и покажем «Облако недоступно». Иначе стажёр на телефоне
+// не сможет войти вообще.
+setTimeout(function() {
+  if (!cloudInitialLoadDone && cloudReady) {
+    console.warn('[cloud] Таймаут первой загрузки — разблокируем UI');
+    updateCloudStatus('error');
+  }
+  // Если cloudInit вообще не отработал (нет интернета / SDK не загрузился) —
+  // тоже снимаем блок.
+  if (!cloudReady) {
+    var btn = document.getElementById('btnLogin');
+    if (btn) btn.disabled = false;
+    var inline = document.getElementById('loginCloudStatus');
+    if (inline) {
+      inline.textContent = '⚠ Нет связи с облаком — попробуйте перезагрузить';
+      inline.classList.add('error');
+    }
+  }
+}, 12000);
 
 // ============================================================
 // ===== PERSISTENCE LAYER (localStorage) — v2 bullet-proof ==
