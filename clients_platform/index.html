@@ -685,17 +685,19 @@ const CLOUDINARY = {
   uploadPreset: 'PASTE_UPLOAD_PRESET', // создать unsigned preset в настройках
 };
 
-// Altegio (фаза 2) — partner_token и company_id получены 2026-05-05.
-// User-token и URL Cloudflare Worker'а — TODO. enabled включим когда поднимем Worker.
-// ВНИМАНИЕ: partner_token нельзя класть в публичный фронт — он должен жить в env-переменных Worker'а.
-// Здесь — только для локальной отладки и документирования. Перед продакшеном УБРАТЬ.
+// Altegio (фаза 2) — все 4 идентификатора получены 2026-05-05.
+// Application "M&M Карточки клиентов" зарегистрировано как непубличное (app_id 1740).
+// User-токен — это токен системного пользователя приложения, выдаётся при регистрации app.
+// ВНИМАНИЕ: ТОКЕНЫ НЕ КЛАСТЬ В ПУБЛИЧНЫЙ ФРОНТ — только в env Cloudflare Worker.
+// Здесь — только для локальной отладки и документирования. Перед продакшеном УБРАТЬ значения.
 const ALTEGIO = {
   enabled: false,
   partnerId: '1957',
+  appId: '1740',
   partnerToken: '', // см. memory/project_clients_platform.md или Cloudflare env
+  userToken: '',    // см. memory/project_clients_platform.md или Cloudflare env
   companyId: '1330174',
-  userToken: '', // получим через POST /auth когда будут креды админа
-  workerUrl: '', // напр. https://mm-altegio.<account>.workers.dev
+  workerUrl: '',    // напр. https://mm-altegio.<account>.workers.dev
 };
 
 /* ============================================================
