@@ -685,11 +685,17 @@ const CLOUDINARY = {
   uploadPreset: 'PASTE_UPLOAD_PRESET', // создать unsigned preset в настройках
 };
 
-// Altegio (фаза 2) — заполнить когда получим токен
+// Altegio (фаза 2) — partner_token и company_id получены 2026-05-05.
+// User-token и URL Cloudflare Worker'а — TODO. enabled включим когда поднимем Worker.
+// ВНИМАНИЕ: partner_token нельзя класть в публичный фронт — он должен жить в env-переменных Worker'а.
+// Здесь — только для локальной отладки и документирования. Перед продакшеном УБРАТЬ.
 const ALTEGIO = {
   enabled: false,
-  partnerToken: '',
-  companyId: '',
+  partnerId: '1957',
+  partnerToken: '', // см. memory/project_clients_platform.md или Cloudflare env
+  companyId: '1330174',
+  userToken: '', // получим через POST /auth когда будут креды админа
+  workerUrl: '', // напр. https://mm-altegio.<account>.workers.dev
 };
 
 /* ============================================================
