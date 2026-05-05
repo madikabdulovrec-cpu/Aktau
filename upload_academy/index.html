@@ -10587,7 +10587,9 @@ function loadInternIntoState(internIdx) {
   state.startDate = intern.startDate || today.toLocaleDateString('ru-RU');
   var startParts = state.startDate.split('.');
   var startD = new Date(startParts[2], startParts[1]-1, startParts[0]);
-  var endD = new Date(startD); endD.setDate(endD.getDate() + 14);
+  // Срок обучения — 1 календарный месяц (раньше было 14 дней).
+  // setMonth даёт «то же число следующего месяца» — правильный смысл «через месяц».
+  var endD = new Date(startD); endD.setMonth(endD.getMonth() + 1);
   state.endDate = endD.toLocaleDateString('ru-RU');
   return true;
 }
