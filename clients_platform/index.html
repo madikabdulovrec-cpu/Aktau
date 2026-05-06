@@ -279,8 +279,7 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
     <button class="btn-enter" onclick="doLogin()">Войти</button>
     <div class="login-error" id="loginError">Неверный логин или пароль</div>
     <div class="hint">
-      Доступ выдаёт суперадмин<br>
-      Демо: <b>admin / mmclients2026</b>
+      Доступ выдаёт суперадмин
     </div>
   </div>
 </div>
@@ -667,7 +666,7 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
 /* ============================================================
    КОНФИГИ — заполнить перед заливкой на прод
    ============================================================ */
-const SUPER_ADMIN = { login:'admin', password:'mmclients2026' };
+const SUPER_ADMIN = { login:'admin', passwordHash:'6752bde3e75c1215546ea0cdf791a83c7d8a2a3c6fbb208368976441523e8bd8' };
 
 // Firebase config (mmclients project) — заполнить после регистрации Web App
 const FIREBASE_CONFIG = {
@@ -989,7 +988,7 @@ async function doLogin() {
   }
 
   if(activeRole==='admin') {
-    if(u===SUPER_ADMIN.login && p===SUPER_ADMIN.password) {
+    if(u===SUPER_ADMIN.login && (await hashPass(p))===SUPER_ADMIN.passwordHash) {
       STATE.session = { login:u, name:'Суперадмин', role:'super', staffId:'__super__' };
       sessionStorage.setItem('mmClients_session', JSON.stringify(STATE.session));
       enterApp();

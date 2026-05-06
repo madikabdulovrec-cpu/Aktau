@@ -2,36 +2,62 @@
  * M&M Altegio Webhook Receiver — Cloudflare Worker
  *
  * Принимает webhook от Altegio о событиях клиента и:
- *   1. Создаёт/обновляет карточку в нашей платформе (Firestore — TODO)
- *   2. Пишет ссылку обратно в кастомное поле клиента в Altegio
+ *   1. Создаёт/обновляет/удаляет (soft) карточку в Firestore (mmClients/data).
+ *   2. Записывает ссылку на карточку в кастомное поле `mm_card_url` клиента в Altegio.
  *
- * Env vars (Settings → Variables and Secrets в Cloudflare Dashboard):
- *   ALTEGIO_PARTNER_TOKEN — bearer токен партнёра
- *   ALTEGIO_USER_TOKEN    — user-токен системного пользователя приложения
- *   ALTEGIO_COMPANY_ID    — ID филиала (1330174)
- *   PLATFORM_BASE_URL     — базовый URL платформы (clients.mmfabrica.com)
- *   FIREBASE_PROJECT_ID   — TODO когда подключим Firebase
- *   FIREBASE_API_KEY      — TODO когда подключим Firebase
+ * SOURCE OF TRUTH: этот файл. Деплой через `wrangler deploy` или копированием
+ * в Cloudflare Dashboard → Workers & Pages → mm-altegio → Edit code.
+ *
+ * Env vars (Cloudflare Dashboard → Settings → Variables and Secrets):
+ *   ALTEGIO_PARTNER_TOKEN — bearer токен партнёра                  (Secret)
+ *   ALTEGIO_USER_TOKEN    — user-токен системного пользователя      (Secret)
+ *   ALTEGIO_COMPANY_ID    — ID филиала, напр. "1330174"            (Plaintext)
+ *   PLATFORM_BASE_URL     — напр. "https://clients.mmfabrica.com"  (Plaintext)
+ *   FIREBASE_PROJECT_ID   — напр. "mmclients-eea40"                (Plaintext)
+ *   FIREBASE_API_KEY      — Web API key из Firebase Console        (Secret)
+ *   WEBHOOK_SECRET        — общий секрет для верификации webhook   (Secret)
+ *
+ * URL для Altegio: https://mm-altegio.<account>.workers.dev/?secret=<WEBHOOK_SECRET>
  */
 
 const ALTEGIO_API = 'https://api.alteg.io/api/v1';
+const FIRESTORE_API = 'https://firestore.googleapis.com/v1';
 const CUSTOM_FIELD_NAME = 'mm_card_url';
+
+const REQUIRED_ENV = [
+  'ALTEGIO_PARTNER_TOKEN', 'ALTEGIO_USER_TOKEN', 'ALTEGIO_COMPANY_ID',
+  'PLATFORM_BASE_URL', 'FIREBASE_PROJECT_ID', 'FIREBASE_API_KEY', 'WEBHOOK_SECRET',
+];
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Healthcheck для Altegio при первичной настройке webhook
+    // Healthcheck — Altegio дёргает GET при первичной настройке webhook
     if (request.method === 'GET') {
       return jsonResponse({
         status: 'ok',
         service: 'mm-altegio-webhook',
+        firestore: env.FIREBASE_PROJECT_ID || null,
         time: new Date().toISOString(),
       });
     }
 
     if (request.method !== 'POST') {
-      return new Response('Method not allowed', { status: 405 });
+      return jsonResponse({ ok: false, error: 'method_not_allowed' }, 405);
+    }
+
+    // Конфигурация — проверяем явно, чтобы не было silent-fail
+    const missing = REQUIRED_ENV.filter(k => !env[k]);
+    if (missing.length) {
+      console.error('[config] missing env vars:', missing.join(','));
+      return jsonResponse({ ok: false, error: 'misconfigured' }, 500);
+    }
+
+    // Защита от спуфинга — без знания WEBHOOK_SECRET послать webhook нельзя
+    if (url.searchParams.get('secret') !== env.WEBHOOK_SECRET) {
+      console.warn('[auth] missing or invalid secret param');
+      return jsonResponse({ ok: false, error: 'unauthorized' }, 401);
     }
 
     let payload;
@@ -41,75 +67,256 @@ export default {
       return jsonResponse({ ok: false, error: 'invalid_json' }, 400);
     }
 
-    console.log('[altegio webhook]', JSON.stringify(payload));
-
-    // Формат webhook от Altegio:
-    // { company_id, resource: 'client', resource_id, status: 'create'|'update'|'delete', data: {...} }
     const { resource, status, resource_id, data, company_id } = payload;
 
-    // Реагируем только на события клиентов
+    // Логируем только метаданные. PII (ФИО, телефоны, дата рождения) НЕ ЛОГИРУЕМ —
+    // логи Cloudflare хранятся ~3 дня и доступны всем с правами на аккаунт.
+    console.log('[webhook]', { resource, status, resource_id, company_id });
+
     if (resource !== 'client') {
       return jsonResponse({ ok: true, skipped: 'not_a_client_event', resource });
     }
 
-    // На всякий случай проверим company_id — наш ли филиал
     if (String(company_id) !== String(env.ALTEGIO_COMPANY_ID)) {
-      return jsonResponse({ ok: true, skipped: 'wrong_company', got: company_id });
+      return jsonResponse({ ok: true, skipped: 'wrong_company' });
     }
 
     try {
       if (status === 'delete') {
-        // TODO: пометить карточку как удалённую в Firestore
-        return jsonResponse({ ok: true, action: 'delete_logged', resource_id });
+        const ourCardId = await markCardDeletedInFirestore({ env, altegioId: resource_id });
+        return jsonResponse({ ok: true, action: 'delete', ourCardId });
       }
 
-      // create / update — нужно создать или обновить нашу карточку
-      const ourCardId = await upsertCardInFirestore({ env, altegioClient: data || { id: resource_id } });
+      // create / update — апсёрт в Firestore + запись ссылки в Altegio
+      const altegioClient = data || { id: resource_id };
+      const ourCardId = await upsertCardInFirestore({ env, altegioClient });
 
-      // Записать ссылку обратно в кастомное поле клиента в Altegio
       const cardUrl = `${env.PLATFORM_BASE_URL.replace(/\/$/, '')}/?id=${ourCardId}`;
-      await writeCustomFieldToAltegioClient({ env, clientId: resource_id, cardUrl });
+      const altegioWriteResult = await writeCustomFieldToAltegioClient({
+        env,
+        clientId: resource_id,
+        cardUrl,
+      });
 
-      return jsonResponse({ ok: true, action: status, ourCardId, cardUrl });
+      return jsonResponse({ ok: true, action: status, ourCardId, cardUrl, altegioWriteResult });
     } catch (e) {
-      console.error('[altegio webhook] error', e);
-      return jsonResponse({ ok: false, error: e.message }, 500);
+      // Детали — только в логи Cloudflare. Наружу — generic, чтобы не утечь
+      // ни Altegio-токены, ни Firestore project ID через сообщение об ошибке.
+      console.error('[webhook] error:', e?.message || String(e), e?.stack || '');
+      return jsonResponse({ ok: false, error: 'internal_error' }, 500);
     }
   },
 };
 
 /* ============================================================
- * Firestore upsert (TODO: реализовать когда будет Firebase)
+ * FIRESTORE — upsert/delete карточки в документ mmClients/data
  * ============================================================ */
-async function upsertCardInFirestore({ env, altegioClient }) {
-  if (!env.FIREBASE_PROJECT_ID || !env.FIREBASE_API_KEY) {
-    // Заглушка пока Firebase не подключен
-    console.log('[firestore] STUB: would upsert', altegioClient);
-    return 'stub_' + (altegioClient.id || 'unknown');
+
+async function fetchFirestoreDoc(env) {
+  const url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/mmClients/data?key=${env.FIREBASE_API_KEY}`;
+  const resp = await fetch(url);
+  if (resp.status === 404) {
+    // Документ ещё не создавался — стартуем с пустого state.
+    return { staff: [], clients: [], _exists: false };
   }
-  // TODO: реальный Firestore REST upsert
-  // POST/PATCH https://firestore.googleapis.com/v1/projects/{projectId}/databases/(default)/documents/mmClients/data
-  return 'stub_' + altegioClient.id;
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`firestore GET failed: ${resp.status} ${txt.slice(0, 200)}`);
+  }
+  const json = await resp.json();
+  const decoded = decodeFirestoreFields(json.fields || {});
+  return {
+    staff: Array.isArray(decoded.staff) ? decoded.staff : [],
+    clients: Array.isArray(decoded.clients) ? decoded.clients : [],
+    _exists: true,
+  };
+}
+
+async function patchFirestoreDoc(env, state) {
+  const url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/mmClients/data?key=${env.FIREBASE_API_KEY}`;
+  const fields = encodeFirestoreFields({
+    staff: state.staff,
+    clients: state.clients,
+    ts: Date.now(),
+  });
+  const resp = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`firestore PATCH failed: ${resp.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+async function upsertCardInFirestore({ env, altegioClient }) {
+  const altegioIdStr = String(altegioClient.id || '');
+  if (!altegioIdStr) throw new Error('altegio client missing id');
+
+  const state = await fetchFirestoreDoc(env);
+  const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
+
+  let cardId;
+  if (idx >= 0) {
+    // Обновление существующей — синкаем только поля, которые приходят из Altegio.
+    // Поля, заполненные мастером (анамнез, фото, замеры, рекомендации) — НЕ ТРОГАЕМ.
+    const c = state.clients[idx];
+    cardId = c.id;
+    if (altegioClient.name) c.fio = altegioClient.name;
+    if (altegioClient.phone) c.phone = altegioClient.phone;
+    c.altegioId = altegioIdStr;
+    c.deleted = false;
+    c.updatedAt = Date.now();
+  } else {
+    // Новая карточка — заводим скелет, мастер дозаполнит при следующем визите клиента.
+    cardId = `alt_${altegioIdStr}_${shortRand()}`;
+    state.clients.push({
+      id: cardId,
+      date: new Date().toISOString().slice(0, 10),
+      specialist: '',
+      specialistId: '',
+      fio: altegioClient.name || '',
+      phone: altegioClient.phone || '',
+      age: '',
+      weight: '',
+      height: '',
+      source: [],
+      complaints: '',
+      anamnesis: [],
+      anamnesisOther: '',
+      recommendations: '',
+      initialPhotos: [],
+      altegioId: altegioIdStr,
+      altegioLink: '',
+      sessions: [],
+      measurements: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+
+  await patchFirestoreDoc(env, state);
+  return cardId;
+}
+
+async function markCardDeletedInFirestore({ env, altegioId }) {
+  const altegioIdStr = String(altegioId || '');
+  if (!altegioIdStr) return null;
+
+  const state = await fetchFirestoreDoc(env);
+  const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
+  if (idx < 0) return null;
+
+  // Soft-delete: помечаем флагом, реальные данные/фото сохраняем — мастер мог
+  // потратить часы на анамнез, нельзя потерять при случайном удалении в Altegio.
+  state.clients[idx].deleted = true;
+  state.clients[idx].updatedAt = Date.now();
+  await patchFirestoreDoc(env, state);
+  return state.clients[idx].id;
+}
+
+function shortRand() {
+  return Math.random().toString(36).slice(2, 10);
 }
 
 /* ============================================================
- * Запись ссылки в кастомное поле клиента в Altegio
+ * FIRESTORE — энкод/декод нативных полей (REST API)
  * ============================================================ */
+
+function encodeFirestoreValue(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number') {
+    return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  }
+  if (typeof v === 'string') return { stringValue: v };
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(encodeFirestoreValue) } };
+  if (typeof v === 'object') return { mapValue: { fields: encodeFirestoreFields(v) } };
+  return { stringValue: String(v) };
+}
+
+function encodeFirestoreFields(obj) {
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    out[k] = encodeFirestoreValue(obj[k]);
+  }
+  return out;
+}
+
+function decodeFirestoreValue(v) {
+  if (!v || typeof v !== 'object') return v;
+  if ('nullValue' in v) return null;
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('integerValue' in v) return parseInt(v.integerValue, 10);
+  if ('doubleValue' in v) return v.doubleValue;
+  if ('stringValue' in v) return v.stringValue;
+  if ('timestampValue' in v) return v.timestampValue;
+  if ('arrayValue' in v) return (v.arrayValue.values || []).map(decodeFirestoreValue);
+  if ('mapValue' in v) return decodeFirestoreFields(v.mapValue.fields || {});
+  return null;
+}
+
+function decodeFirestoreFields(fields) {
+  const out = {};
+  for (const k of Object.keys(fields)) {
+    out[k] = decodeFirestoreValue(fields[k]);
+  }
+  return out;
+}
+
+/* ============================================================
+ * ALTEGIO — запись ссылки в кастомное поле клиента
+ *   API /client/{company}/{id} требует name и phone в PUT всегда. Поэтому
+ *   GET-им клиента, мерджим custom_fields, PUT-им с обязательными полями.
+ * ============================================================ */
+
 async function writeCustomFieldToAltegioClient({ env, clientId, cardUrl }) {
-  const url = `${ALTEGIO_API}/client/${env.ALTEGIO_COMPANY_ID}/${clientId}`;
-  const body = {
-    custom_fields: { [CUSTOM_FIELD_NAME]: cardUrl },
+  const clientUrl = `${ALTEGIO_API}/client/${env.ALTEGIO_COMPANY_ID}/${clientId}`;
+
+  // 1. GET — забираем актуальные name/phone и существующие custom_fields
+  const getResp = await fetch(clientUrl, { method: 'GET', headers: altegioHeaders(env) });
+  if (getResp.status === 404) {
+    // Клиент удалён в Altegio между webhook'ом и нашим GET — нечего обновлять.
+    return { success: false, reason: 'altegio_client_not_found' };
+  }
+  if (!getResp.ok) {
+    const txt = await getResp.text();
+    throw new Error(`altegio GET failed: ${getResp.status} ${txt.slice(0, 200)}`);
+  }
+  const getJson = await getResp.json();
+  const cur = (getJson && (getJson.data || getJson)) || {};
+
+  // 2. Мержим custom_fields — чужие поля сохраняем, наше mm_card_url добавляем/обновляем
+  const existingCustomFields = cur.custom_fields && typeof cur.custom_fields === 'object'
+    ? cur.custom_fields : {};
+  const mergedCustomFields = {
+    ...existingCustomFields,
+    [CUSTOM_FIELD_NAME]: cardUrl,
   };
-  const resp = await fetch(url, {
+
+  // 3. PUT — name+phone обязательны, иначе Altegio вернёт "The required parameter name was not passed"
+  const body = {
+    name: cur.name || '',
+    phone: cur.phone || '',
+    custom_fields: mergedCustomFields,
+  };
+
+  const putResp = await fetch(clientUrl, {
     method: 'PUT',
     headers: altegioHeaders(env),
     body: JSON.stringify(body),
   });
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`altegio PUT failed: ${resp.status} ${txt.slice(0, 200)}`);
+  if (!putResp.ok) {
+    const txt = await putResp.text();
+    throw new Error(`altegio PUT failed: ${putResp.status} ${txt.slice(0, 200)}`);
   }
-  return resp.json();
+  const putJson = await putResp.json();
+
+  return {
+    success: putJson?.success !== false,
+    data: putJson?.data ? { custom_fields: putJson.data.custom_fields } : null,
+  };
 }
 
 function altegioHeaders(env) {
@@ -119,6 +326,10 @@ function altegioHeaders(env) {
     'Content-Type': 'application/json',
   };
 }
+
+/* ============================================================
+ * UTIL
+ * ============================================================ */
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
