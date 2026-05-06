@@ -12391,8 +12391,9 @@ let cloudDb = null;
 let cloudUnsub = null;
 let cloudPushTimer = null;
 let cloudLastPushAt = 0;
-let cloudInitialLoadDone = false; // true после первого успешного cloudLoad — до него не пушим, чтобы не затереть облако пустотой
+let cloudInitialLoadDone = false; // true после первого успешного cloudLoad/cloudSubscribe/cloudPush
 let cloudLastPushedHash = '';     // хэш последнего отправленного payload — пропускаем дубли
+let cloudPushPending = false;     // есть несинхронизированные изменения — setInterval сделает retry
 
 function cloudConfigured() {
   return FIREBASE_CONFIG && FIREBASE_CONFIG.projectId &&
@@ -12411,11 +12412,15 @@ function cloudInit() {
       firebase.initializeApp(FIREBASE_CONFIG);
     }
     cloudDb = firebase.firestore();
-    // На некоторых мобильных операторах (KZ Beeline/Kcell, корпоративные WiFi)
-    // режется HTTP long-polling > 30 сек. Auto-detect позволит SDK самому
-    // переключиться на long-polling если WebSocket/streaming не проходит.
+    // Форсим long-polling вместо WebSocket/streaming. Это надёжнее на:
+    //   - мобильных операторах KZ (Beeline/Kcell/Tele2), которые режут долгие соединения
+    //   - корпоративных и публичных Wi-Fi с прокси
+    //   - iOS Safari, где WebSocket иногда конфликтует с ITP
+    // Цена — небольшое увеличение задержки (десятки мс), но соединение работает
+    // у всех. (Фикс E ревью.) settings() можно вызвать только один раз —
+    // оборачиваем в try на случай повторного cloudInit.
     try {
-      cloudDb.settings({ experimentalAutoDetectLongPolling: true, merge: true });
+      cloudDb.settings({ experimentalForceLongPolling: true, useFetchStreams: false });
     } catch (e) {
       console.warn('[cloud] settings не применились:', e);
     }
@@ -12470,18 +12475,16 @@ async function cloudLoad() {
 }
 
 // Пишет текущий INTERNS в Firestore. Дебаунсим — много мутаций подряд = одна запись.
+// При ошибке push'а флаг cloudPushPending остаётся true → setInterval будет
+// автоматически ретрайать когда сеть/Firestore восстановится.
 function cloudPush() {
   if (!cloudReady) return Promise.resolve(false);
-  // Не пушим до первого успешного cloudLoad — иначе можно затереть облако пустым списком,
-  // если на этом устройстве ещё нет локальных данных.
-  if (!cloudInitialLoadDone) {
-    console.log('[cloud] skip push — initial load ещё не завершён');
-    return Promise.resolve(false);
-  }
-  // Не пушим пустой список — это почти всегда ошибка, а не реальное состояние.
-  // Сброс делается через явное удаление документа в Firestore Console.
+  // ЕДИНСТВЕННАЯ настоящая защита от затирания облака: если у нас локально
+  // нет ни одного стажёра — не пишем пустой массив. Это покрывает оба ранее
+  // существовавших guard'а (cloudInitialLoadDone и empty INTERNS) одной проверкой
+  // и НЕ блокирует push после провала cloudLoad — баг #1 ревью.
   if (!Array.isArray(INTERNS) || INTERNS.length === 0) {
-    console.warn('[cloud] skip push — INTERNS пустой');
+    console.log('[cloud] skip push — INTERNS пустой (нечего записывать)');
     return Promise.resolve(false);
   }
   if (cloudPushTimer) clearTimeout(cloudPushTimer);
@@ -12494,6 +12497,7 @@ function cloudPush() {
         // Дедуп: если список не изменился с прошлой записи — не тратим квоту Firestore.
         if (payloadHash === cloudLastPushedHash) {
           console.log('[cloud] skip push — payload не изменился');
+          cloudPushPending = false;
           resolve(false);
           return;
         }
@@ -12506,15 +12510,19 @@ function cloudPush() {
         });
         cloudLastPushAt = Date.now();
         cloudLastPushedHash = payloadHash;
+        cloudInitialLoadDone = true; // успешный push тоже считается «связь есть»
+        cloudPushPending = false;
         console.log('[cloud] Записано', INTERNS.length, 'стажёров');
         updateCloudStatus('synced');
         resolve(true);
       } catch (e) {
         console.error('[cloud] Ошибка записи:', e);
+        // НЕ сбрасываем cloudPushPending — setInterval сделает retry.
         updateCloudStatus('error');
         resolve(false);
       }
-    }, 300); // debounce 300ms
+    }, 50); // debounce уменьшен с 300 до 50мс — почти моментальный flush, чтобы
+            // успеть записать данные при быстром закрытии вкладки (баг #3 ревью)
   });
 }
 
@@ -12546,6 +12554,10 @@ function cloudSubscribe() {
       data.list.forEach(function(d){ INTERNS.push(normalizeIntern(d)); });
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(INTERNS)); } catch(e) {}
       console.log('[cloud] Real-time апдейт:', INTERNS.length, 'стажёров');
+      // Подписка тоже считается «получили данные» — теперь push разрешён.
+      // (Раньше cloudInitialLoadDone ставился только в cloudLoad; если он
+      // упал по сети, push был заблокирован навечно — баг #2 ревью.)
+      cloudInitialLoadDone = true;
       updateCloudStatus('synced');
 
       // Перерисовываем активный экран
@@ -12574,6 +12586,16 @@ function cloudSubscribe() {
     }, function(err) {
       console.error('[cloud] Subscription error:', err);
       updateCloudStatus('error');
+      // Auto-reconnect: подписка часто рвётся когда вкладка ушла в фон в
+      // Safari iOS, или при смене сети. Пытаемся переподписаться через 5 сек.
+      // (Баг #7 ревью.)
+      if (cloudUnsub) { try { cloudUnsub(); } catch(_){} cloudUnsub = null; }
+      setTimeout(function() {
+        if (cloudReady) {
+          console.log('[cloud] Auto-reconnect подписки');
+          cloudSubscribe();
+        }
+      }, 5000);
     });
 }
 
@@ -12749,11 +12771,10 @@ function syncStateToIntern() {
   intern.lastActive = new Date().toLocaleDateString('ru-RU');
 }
 
-// Маркер «есть несохранённые изменения». Auto-persist каждые 30 секунд проверяет
-// этот флаг и не пишет, если ничего не менялось. Любая функция, которая мутирует
-// INTERNS или state, должна выставлять window.__mmAcademyDirty = true перед persist().
-window.__mmAcademyDirty = false;
-
+// persist() пишет в localStorage синхронно и запускает асинхронный cloudPush.
+// При мутации INTERNS выставляется cloudPushPending = true. Если cloudPush
+// упал (нет сети, Firestore offline, permission-denied) — флаг остаётся true,
+// и setInterval (см. ниже) автоматически делает retry каждые 30 сек.
 function persist() {
   try {
     syncStateToIntern();
@@ -12766,9 +12787,10 @@ function persist() {
       return false;
     }
     console.log('[academy] persist OK — interns:', INTERNS.length, 'bytes:', payload.length);
-    // Дублируем в облако (если настроено) — не блокируем, не ждём
+    // Помечаем что есть несинхронизированные изменения. cloudPush либо отправит
+    // их сейчас (если сеть есть), либо setInterval сделает retry позже.
+    cloudPushPending = true;
     if (cloudReady) { try { cloudPush(); } catch (e) {} }
-    window.__mmAcademyDirty = false;
     return true;
   } catch (e) {
     console.error('[academy] persist failed:', e);
@@ -12914,17 +12936,57 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 });
 
+// Force-flush для cloudPush: при закрытии/скрытии вкладки нельзя ждать
+// дебаунс таймера — отменяем его и сразу запускаем запись в Firestore.
+// Браузеры (Chrome, Safari) обычно допускают завершение запроса в течение
+// нескольких сотен миллисекунд после unload благодаря keepalive в SDK.
+function flushCloudPush() {
+  if (cloudPushTimer) {
+    clearTimeout(cloudPushTimer);
+    cloudPushTimer = null;
+  }
+  if (!cloudReady || !Array.isArray(INTERNS) || INTERNS.length === 0) return;
+  try {
+    var listClone = JSON.parse(JSON.stringify(INTERNS));
+    var payloadHash = JSON.stringify(listClone);
+    if (payloadHash === cloudLastPushedHash) return; // нечего слать
+    cloudDb.collection('mmAcademy').doc('interns').set({
+      list: listClone,
+      updatedAt: Date.now(),
+      updatedBy: state && state.isAdmin ? 'admin' :
+                 (state && state.name) ? (state.name + ' ' + (state.surname||'')).trim() : 'unknown'
+    });
+    cloudLastPushedHash = payloadHash;
+  } catch (e) { /* unload — ничего полезного нельзя сделать */ }
+}
+
 // Авто-сохранение при закрытии/скрытии вкладки
-window.addEventListener('beforeunload', function() { try { persist(); } catch(e) {} });
-window.addEventListener('pagehide', function() { try { persist(); } catch(e) {} });
-// Страховка от вылета вкладки: вместо безусловного persist() каждые 30с —
-// проверяем dirty-флаг (см. markDirty/persist). Если ничего не менялось —
-// не дёргаем localStorage и (главное) не пишем в Firestore. Spark Free tier
-// имеет лимит 20K writes/день на проект.
+window.addEventListener('beforeunload', function() {
+  try { persist(); } catch(e) {}
+  try { flushCloudPush(); } catch(e) {}
+});
+window.addEventListener('pagehide', function() {
+  try { persist(); } catch(e) {}
+  try { flushCloudPush(); } catch(e) {}
+});
+// На iOS Safari переход в фон закрывает соединения — пушим перед этим.
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'hidden') {
+    try { persist(); } catch(e) {}
+    try { flushCloudPush(); } catch(e) {}
+  }
+});
+// Страховка-ретраер: если cloudPush упал (нет сети, Firestore offline,
+// браузер в фоне) — флаг cloudPushPending остался true. Каждые 30 сек
+// пытаемся снова. Когда сеть вернётся, изменения автоматически уйдут в облако.
+// Это закрывает баг #1 ревью: «стажёр на iPhone застревает локально».
 setInterval(function() {
   try {
-    if (!window.__mmAcademyDirty) return;
-    persist();
+    if (!cloudPushPending) return;
+    if (!cloudReady) return;
+    if (!Array.isArray(INTERNS) || INTERNS.length === 0) return;
+    console.log('[cloud] Retry push — есть несинхронизированные изменения');
+    cloudPush();
   } catch(e) {}
 }, 30000);
 
