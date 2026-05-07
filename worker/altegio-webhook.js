@@ -24,6 +24,13 @@ const ALTEGIO_API = 'https://api.alteg.io/api/v1';
 const FIRESTORE_API = 'https://firestore.googleapis.com/v1';
 const CUSTOM_FIELD_NAME = 'mm_card_url';
 
+// Маркер строки в comment клиента — по нему мы находим и обновляем строку
+// со ссылкой при следующем webhook (чтобы не плодить дубликаты).
+// Эмодзи в маркер НЕ КЛАДЁМ — Altegio при сохранении заменяет '📋' на '?',
+// и идемпотентный матч ломается. Поиск через includes(MARKER), значит
+// покроет любые префиксы (включая legacy блоки с эмодзи или '?').
+const COMMENT_MARKER = 'Карточка M&M:';
+
 const REQUIRED_ENV = [
   'ALTEGIO_PARTNER_TOKEN', 'ALTEGIO_USER_TOKEN', 'ALTEGIO_COMPANY_ID',
   'PLATFORM_BASE_URL', 'FIREBASE_PROJECT_ID', 'FIREBASE_API_KEY', 'WEBHOOK_SECRET',
@@ -54,11 +61,26 @@ export default {
       return jsonResponse({ ok: false, error: 'misconfigured' }, 500);
     }
 
-    // Защита от спуфинга — без знания WEBHOOK_SECRET послать webhook нельзя
-    if (url.searchParams.get('secret') !== env.WEBHOOK_SECRET) {
+    // Authorization: принимаем два режима, потому что Altegio при сохранении
+    // webhook URL режет query string и шлёт со своим Authorization header.
+    //   1) ?secret=<WEBHOOK_SECRET> в URL  — для curl/manual triggers/тестов.
+    //   2) Authorization header + валидный payload — для реальных Altegio.
+    // Доп. фильтр company_id (env.ALTEGIO_COMPANY_ID) ниже отсекает левые
+    // запросы — заголовок Authorization есть у каждого второго бота, но
+    // правильный company_id знают только из настроек филиала.
+    const secretMatches = url.searchParams.get('secret') === env.WEBHOOK_SECRET;
+    const hasAuthHeader = !!request.headers.get('authorization');
+    if (!secretMatches && !hasAuthHeader) {
       console.warn('[auth] missing or invalid secret param');
       return jsonResponse({ ok: false, error: 'unauthorized' }, 401);
     }
+    // Метаданные авторизации — для аудита, без значений
+    const authHeader = request.headers.get('authorization') || '';
+    console.log('[auth]', {
+      via: secretMatches ? 'query' : 'header',
+      authHeaderLen: authHeader.length,
+      authHeaderPrefix: authHeader.slice(0, 8), // например "Bearer " — без токена
+    });
 
     let payload;
     try {
@@ -295,10 +317,19 @@ async function writeCustomFieldToAltegioClient({ env, clientId, cardUrl }) {
     [CUSTOM_FIELD_NAME]: cardUrl,
   };
 
-  // 3. PUT — name+phone обязательны, иначе Altegio вернёт "The required parameter name was not passed"
+  // 3. Дополняем comment ссылкой — стандартный UI Altegio показывает comment
+  // прямо в карточке клиента, в отличие от custom_fields. Идемпотентно:
+  // удаляем предыдущую нашу строку (если есть) и добавляем свежую в конец.
+  // Текст, который мастер сам написал в комментарии, сохраняется.
+  const newComment = mergeCommentWithCardUrl(cur.comment || '', cardUrl);
+
+  // 4. PUT — name+phone обязательны, иначе Altegio вернёт "The required parameter name was not passed"
+  // Приводим к строкам — Altegio может вернуть phone как число (77071234567),
+  // а API ожидает строку. Без cast PUT может сбойнуть.
   const body = {
-    name: cur.name || '',
-    phone: cur.phone || '',
+    name: cur.name == null ? '' : String(cur.name),
+    phone: cur.phone == null ? '' : String(cur.phone),
+    comment: newComment,
     custom_fields: mergedCustomFields,
   };
 
@@ -325,6 +356,39 @@ function altegioHeaders(env) {
     'Accept': 'application/vnd.api.v2+json',
     'Content-Type': 'application/json',
   };
+}
+
+/**
+ * Идемпотентно встраивает строку «Карточка M&M: <url>» в comment клиента.
+ * Удаляет ТОЛЬКО строки, которые однозначно являются нашим блоком — то есть:
+ *   - начинаются с маркера (опционально с префиксом-мусором: "📋 ", "? ", " " …),
+ *   - сразу после маркера идёт http(s)-URL.
+ * Это защищает от случайного съедания текста мастера, в котором маркер
+ * упомянут как обычная фраза, например "Не путать! Карточка M&M: внутреннее".
+ */
+function mergeCommentWithCardUrl(existingComment, cardUrl) {
+  const lines = String(existingComment || '').split('\n');
+  const cleanLines = lines.filter(l => !isOurMarkerLine(l));
+  // Убираем висячие пустые строки в конце, чтобы не накапливались между апдейтами
+  while (cleanLines.length && cleanLines[cleanLines.length - 1].trim() === '') {
+    cleanLines.pop();
+  }
+  const ourLine = `${COMMENT_MARKER} ${cardUrl}`;
+  return cleanLines.length ? `${cleanLines.join('\n')}\n\n${ourLine}` : ourLine;
+}
+
+function isOurMarkerLine(line) {
+  const idx = line.indexOf(COMMENT_MARKER);
+  if (idx < 0) return false;
+  // Перед маркером допускаем только пробелы и не-словесные символы (эмодзи "📋",
+  // подменённое Altegio "?", прочий мусор). Если есть буквы/цифры — это текст
+  // мастера, не наш блок.
+  const before = line.slice(0, idx);
+  if (/[\p{L}\p{N}]/u.test(before)) return false;
+  // Сразу после маркера должен быть URL (http://… или https://…). Иначе это
+  // не наш формат.
+  const after = line.slice(idx + COMMENT_MARKER.length).trim();
+  return /^https?:\/\//i.test(after);
 }
 
 /* ============================================================

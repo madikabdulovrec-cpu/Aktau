@@ -56,6 +56,9 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
 .login-box .btn-enter:hover { transform:translate(-2px,-2px); box-shadow:0 16px 40px rgba(0,0,0,.12); }
 .login-box .login-error { color:var(--pink); font-size:13px; font-weight:600; margin-top:10px; display:none; }
 .login-box .hint { color:#aaa; font-size:11px; margin-top:18px; line-height:1.5; }
+.login-box .remember-me { display:flex; align-items:center; gap:8px; margin:8px 0 4px; padding:6px 4px; font-size:13px; color:#555; cursor:pointer; user-select:none; }
+.login-box .remember-me input { width:16px; height:16px; cursor:pointer; accent-color:var(--pink); margin:0; }
+.login-box .remember-me:hover { color:var(--black); }
 
 /* ===== TOPBAR ===== */
 .topbar { background:var(--white); border-bottom:2px solid var(--black); padding:18px 32px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:50; }
@@ -275,6 +278,10 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
 
     <input type="text" id="loginUser" placeholder="Логин">
     <input type="password" id="loginPass" placeholder="Пароль">
+
+    <label class="remember-me">
+      <input type="checkbox" id="loginRemember"> Запомнить меня
+    </label>
 
     <button class="btn-enter" onclick="doLogin()">Войти</button>
     <div class="login-error" id="loginError">Неверный логин или пароль</div>
@@ -668,20 +675,22 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
    ============================================================ */
 const SUPER_ADMIN = { login:'admin', passwordHash:'6752bde3e75c1215546ea0cdf791a83c7d8a2a3c6fbb208368976441523e8bd8' };
 
-// Firebase config (mmclients project) — заполнить после регистрации Web App
+// Firebase config (Web App "mm-clients-web" в проекте mmclients-eea40).
+// Это публичные идентификаторы Firebase — не секреты. Защита через Firestore Rules.
 const FIREBASE_CONFIG = {
-  apiKey: 'PASTE_API_KEY',
-  authDomain: 'PASTE_AUTH_DOMAIN',
-  projectId: 'PASTE_PROJECT_ID',
-  storageBucket: 'PASTE_STORAGE_BUCKET',
-  messagingSenderId: 'PASTE_SENDER_ID',
-  appId: 'PASTE_APP_ID',
+  apiKey: 'AIzaSyBq5a1ACYjwzSW6XYbH8SOCoC5KTMSUoro',
+  authDomain: 'mmclients-eea40.firebaseapp.com',
+  projectId: 'mmclients-eea40',
+  storageBucket: 'mmclients-eea40.firebasestorage.app',
+  messagingSenderId: '1068877532451',
+  appId: '1:1068877532451:web:3295930be48bc9f2ced096',
 };
 
-// Cloudinary unsigned upload — заполнить из dashboard.cloudinary.com
+// Cloudinary unsigned upload (free tier 25 ГБ).
+// cloudName и preset — публичные значения, ограничения настроены в самом preset.
 const CLOUDINARY = {
-  cloudName: 'PASTE_CLOUD_NAME',
-  uploadPreset: 'PASTE_UPLOAD_PRESET', // создать unsigned preset в настройках
+  cloudName: 'dh38iu9fu',
+  uploadPreset: 'mm_clients_unsigned',
 };
 
 // Altegio (фаза 2) — все 4 идентификатора получены 2026-05-05.
@@ -746,6 +755,9 @@ async function hashPass(s) {
 }
 
 const SEED_FLAG = 'mmClients_seeded_v1';
+// "Запомнить меня": сессия в localStorage переживает закрытие вкладки.
+// Хранится только {login, name, role, staffId} — никакого пароля.
+const PERSIST_SESSION_KEY = 'mmClients_session_persist';
 
 async function loadState() {
   try {
@@ -761,7 +773,13 @@ async function loadState() {
     await seedDemo();
     localStorage.setItem(SEED_FLAG, '1');
   }
-  // восстановить сессию
+  // восстановить сессию: сначала "запомнить меня" (localStorage, переживает
+  // закрытие вкладки), потом текущая sessionStorage перезаписывает её —
+  // так свежий логин в этой вкладке всегда побеждает persist.
+  try {
+    const persisted = localStorage.getItem(PERSIST_SESSION_KEY);
+    if(persisted) STATE.session = JSON.parse(persisted);
+  } catch(e){}
   try {
     const s = sessionStorage.getItem('mmClients_session');
     if(s) STATE.session = JSON.parse(s);
@@ -886,6 +904,9 @@ function cloudLoad() {
     cloudInitialLoadDone = true;
     cloudSubscribe();
     setCloudBadge('on');
+    // Если у пользователя был persisted master-логин, но мастера в актуальном
+    // staff[] больше нет (или он деактивирован) — выкидываем из приложения.
+    validatePersistedSession();
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
     refreshLoginGate();
@@ -906,6 +927,9 @@ function cloudSubscribe() {
     if(data.clients) STATE.clients = data.clients;
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
+    // Real-time: если суперадмин деактивировал мастера прямо сейчас — выкидываем
+    // его текущую сессию даже если он уже работает в платформе.
+    validatePersistedSession();
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
   });
@@ -987,10 +1011,12 @@ async function doLogin() {
     return;
   }
 
+  const remember = !!document.getElementById('loginRemember')?.checked;
+
   if(activeRole==='admin') {
     if(u===SUPER_ADMIN.login && (await hashPass(p))===SUPER_ADMIN.passwordHash) {
       STATE.session = { login:u, name:'Суперадмин', role:'super', staffId:'__super__' };
-      sessionStorage.setItem('mmClients_session', JSON.stringify(STATE.session));
+      recordLoginSession(remember);
       enterApp();
       return;
     }
@@ -1005,8 +1031,48 @@ async function doLogin() {
     err.style.display='block'; return;
   }
   STATE.session = { login:staff.login, name:staff.name, role:'master', staffId:staff.id };
-  sessionStorage.setItem('mmClients_session', JSON.stringify(STATE.session));
+  recordLoginSession(remember);
   enterApp();
+}
+
+// Записать сессию: всегда в sessionStorage (живёт до закрытия вкладки),
+// и в localStorage если пользователь поставил "Запомнить меня".
+// Если remember=false — явно чистим localStorage, чтобы предыдущий persist
+// другого пользователя не подгрузился при следующем открытии.
+// Имя не saveSession() — оно занято другой функцией (сохранение визита клиента).
+function recordLoginSession(remember) {
+  const json = JSON.stringify(STATE.session);
+  sessionStorage.setItem('mmClients_session', json);
+  if(remember) {
+    localStorage.setItem(PERSIST_SESSION_KEY, json);
+  } else {
+    localStorage.removeItem(PERSIST_SESSION_KEY);
+  }
+}
+
+// Проверить, что текущая сессия (особенно persisted в localStorage) всё ещё
+// валидна с точки зрения актуального STATE.staff из облака. Сценарий:
+// мастер залогинился с "Запомнить меня" на своём телефоне → суперадмин его
+// уволил/деактивировал → без этой проверки мастер продолжал бы работать
+// через persist. Вызывается ПОСЛЕ применения cloud-state.
+// Суперадмин (role='super') в STATE.staff не хранится — для него no-op.
+function validatePersistedSession() {
+  if(!STATE.session) return;
+  if(STATE.session.role === 'super') return;
+  if(STATE.session.role === 'master') {
+    const staff = (STATE.staff || []).find(s => s.id === STATE.session.staffId && s.active);
+    if(!staff) {
+      console.warn('[auth] persisted master session invalid — staff deleted/deactivated');
+      STATE.session = null;
+      sessionStorage.removeItem('mmClients_session');
+      localStorage.removeItem(PERSIST_SESSION_KEY);
+      if(currentScreen !== 'loginScreen') {
+        try { document.getElementById('topbar').style.display = 'none'; } catch(e){}
+        showScreen('loginScreen');
+        if(typeof toast === 'function') toast('Доступ отозван — войдите снова','error');
+      }
+    }
+  }
 }
 
 // Дизейбл/энейбл кнопки логина пока облако грузится
@@ -1027,10 +1093,16 @@ function refreshLoginGate() {
 function doLogout() {
   STATE.session = null;
   sessionStorage.removeItem('mmClients_session');
+  // Явный logout = пользователь хочет, чтобы его "забыли", даже если был
+  // включён "Запомнить меня". Иначе при следующем открытии его бы автоматом
+  // вернуло обратно — это противоречит интенту кнопки.
+  localStorage.removeItem(PERSIST_SESSION_KEY);
   document.getElementById('topbar').style.display='none';
   showScreen('loginScreen');
   document.getElementById('loginUser').value='';
   document.getElementById('loginPass').value='';
+  const r = document.getElementById('loginRemember');
+  if(r) r.checked = false;
 }
 function enterApp() {
   document.getElementById('topbar').style.display='flex';
