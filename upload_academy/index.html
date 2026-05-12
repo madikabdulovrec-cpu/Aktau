@@ -11666,23 +11666,34 @@ function openLesson(idx) {
   retakeBtn.style.display = 'none';
   pending.style.display = 'none';
 
+  // Текущий ответ стажёра (черновик или отправленный) лежит в state.answers[idx].
+  // Показываем его всегда, чтобы стажёр видел что он написал, и при необходимости
+  // мог отредактировать (пока куратор не поставил оценку).
+  var savedAnswer = (state.answers && state.answers[idx]) ? state.answers[idx] : '';
+
   if (state.pendingReview[idx]) {
-    ta.value = '[Задание отправлено на проверку куратору]';
-    ta.disabled = true;
-    btn.disabled = true;
-    btn.innerHTML = '&#9203; На проверке';
+    // На проверке — НЕ блокируем редактирование. Стажёр может дополнить
+    // или переписать ответ, пока куратор не выставил оценку. Это снимает
+    // «всё заблокировано после первой отправки» — самая частая жалоба UX.
+    ta.value = savedAnswer;
+    ta.disabled = false;
+    btn.disabled = false;
+    btn.innerHTML = '&#128260; Обновить ответ';
     pending.style.display = 'flex';
   } else if (isDone) {
-    ta.value = '[Ваш ответ был принят. Оценка: ' + state.scores[idx] + '/5]';
+    // Оценка поставлена — задание принято, редактировать нельзя.
+    // Если оценка ≤3 — показываем кнопку «Пересдать», которая очищает scores[idx]
+    // и открывает форму заново.
+    ta.value = savedAnswer || ('[Ваш ответ был принят. Оценка: ' + state.scores[idx] + '/5]');
     ta.disabled = true;
     btn.disabled = true;
     btn.innerHTML = '&#9989; Задание принято';
-    // Retake if score <= 3
     if (state.scores[idx] <= 3) {
       retakeBtn.style.display = 'block';
     }
   } else {
-    ta.value = '';
+    // Ещё не отправлялся — пустое поле или черновик из state.answers.
+    ta.value = savedAnswer;
     ta.disabled = false;
     btn.disabled = false;
     btn.innerHTML = '&#128228; Отправить на проверку';
@@ -11749,7 +11760,11 @@ function submitAssignment() {
     showToast('&#9888;&#65039;', 'Напишите ответ', 'Поле задания не может быть пустым');
     return;
   }
-  if (state.scores[currentLessonIdx] > 0 || state.pendingReview[currentLessonIdx]) return;
+  // Если оценка уже стоит (куратор проверил) — повторно отправлять нельзя,
+  // только через «Пересдать». Однако пока задание на проверке (без оценки) —
+  // стажёр МОЖЕТ обновить свой ответ. Это позволяет дополнить/исправить
+  // отправку до того, как куратор её посмотрел.
+  if (state.scores[currentLessonIdx] > 0) return;
 
   // Check quiz first (only if quiz exists for this lesson)
   if (QUIZZES[currentLessonIdx] && !state.quizPassed[currentLessonIdx]) {
@@ -11758,15 +11773,18 @@ function submitAssignment() {
     return;
   }
 
+  // Различаем первую отправку и обновление ответа — для тоста
+  var isUpdate = state.pendingReview[currentLessonIdx];
+
   // Задание уходит на РЕАЛЬНУЮ проверку куратором (без авто-оценки).
   // Куратор ставит оценку из админ-панели → SaveGrades → score появляется у стажёра.
   state.pendingReview[currentLessonIdx] = true;
   state.answers = state.answers || {};
   state.answers[currentLessonIdx] = ta.value; // сохраняем ответ для куратора
   document.getElementById('pendingBanner').style.display = 'flex';
-  ta.disabled = true;
-  document.getElementById('btnSubmit').disabled = true;
-  document.getElementById('btnSubmit').innerHTML = '&#9203; На проверке';
+  // ta и кнопку оставляем активными — стажёр может ещё раз обновить ответ,
+  // пока куратор не выставил оценку. Меняем только подпись на кнопке.
+  document.getElementById('btnSubmit').innerHTML = '&#128260; Обновить ответ';
 
   // Записываем в INTERNS[idx].pendingDays чтобы куратор увидел
   if (!state.isAdmin && typeof state.internIdx === 'number' && state.internIdx >= 0) {
@@ -11781,15 +11799,20 @@ function submitAssignment() {
 
   persist();
 
-  // Показываем спокойный модальный экран "отправлено на проверку"
-  document.getElementById('modalContent').innerHTML =
-    '<div style="font-size:56px;margin-bottom:12px;">&#128228;</div>' +
-    '<h2>Задание отправлено</h2>' +
-    '<div class="result-msg">Ваш ответ получен куратором. Оценка появится после проверки — в рейтинге и в уроке.</div>' +
-    '<div style="margin:16px 0;padding:12px 16px;background:rgba(45,91,255,0.08);border-radius:12px;font-size:13px;color:#555;">&#128172; Вы получите уведомление, когда куратор проверит работу.</div>' +
-    '<button class="btn-continue" onclick="closeResultModal()">Продолжить обучение</button>';
-  document.getElementById('resultModal').classList.add('show');
-  showToast('&#128228;', 'Отправлено на проверку', 'Ждите оценку куратора');
+  if (isUpdate) {
+    // Обновление существующего ответа — без большой модалки, просто тост
+    showToast('&#128260;', 'Ответ обновлён', 'Куратор увидит новую версию');
+  } else {
+    // Первая отправка — показываем модальный экран "отправлено на проверку"
+    document.getElementById('modalContent').innerHTML =
+      '<div style="font-size:56px;margin-bottom:12px;">&#128228;</div>' +
+      '<h2>Задание отправлено</h2>' +
+      '<div class="result-msg">Ваш ответ получен куратором. Оценка появится после проверки — в рейтинге и в уроке.</div>' +
+      '<div style="margin:16px 0;padding:12px 16px;background:rgba(45,91,255,0.08);border-radius:12px;font-size:13px;color:#555;">&#128172; Вы получите уведомление, когда куратор проверит работу.</div>' +
+      '<button class="btn-continue" onclick="closeResultModal()">Продолжить обучение</button>';
+    document.getElementById('resultModal').classList.add('show');
+    showToast('&#128228;', 'Отправлено на проверку', 'Ждите оценку куратора');
+  }
 }
 
 function closeResultModal() {
