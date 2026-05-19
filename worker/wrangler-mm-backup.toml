@@ -1,0 +1,30 @@
+# Wrangler config для деплоя Worker'а mm-backup через CLI.
+# Если установлен wrangler (npm i -g wrangler), деплой одной командой:
+#   wrangler deploy --config worker/wrangler-mm-backup.toml
+#
+# Альтернативно — настроить вручную через Cloudflare Dashboard
+# (см. worker/BACKUP_SETUP.md).
+
+name = "mm-backup"
+main = "mm-backup.js"
+compatibility_date = "2025-05-01"
+account_id = "650cb2300c9e29301178d3e5998be3b4"
+
+# R2 bucket binding — должен существовать в Cloudflare R2 заранее.
+# Создать: dashboard.cloudflare.com → R2 → Create bucket → "mm-clients-backups".
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "mm-clients-backups"
+
+# Cron trigger — ежедневно в 03:00 UTC (= 08:00 GMT+5, утро в Алматы).
+[triggers]
+crons = ["0 3 * * *"]
+
+# Plaintext переменные (НЕ секреты — обычные значения).
+[vars]
+FIREBASE_PROJECT_ID = "mmclients-eea40"
+RETENTION_DAYS = "30"
+
+# Секреты (FIREBASE_API_KEY, BACKUP_SECRET) ставятся отдельной командой:
+#   wrangler secret put FIREBASE_API_KEY --config worker/wrangler-mm-backup.toml
+#   wrangler secret put BACKUP_SECRET    --config worker/wrangler-mm-backup.toml

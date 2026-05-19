@@ -33,3 +33,7 @@ __pycache__/
 .env
 .env.local
 secrets.json
+
+# Локальные бэкапы Firestore (содержат PII клиентов — НИ В КОЕМ СЛУЧАЕ в git)
+.local_backups/
+*.firestore.json
