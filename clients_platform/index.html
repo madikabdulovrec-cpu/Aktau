@@ -934,19 +934,70 @@ function cloudSubscribe() {
     if(currentScreen==='adminScreen') renderAdmin();
   });
 }
-function cloudPush() {
+// MERGE-ON-WRITE: cloudPush делает Firestore transaction вместо прямого set().
+// Сценарий, который мы лечим: Worker за миллисекунды до cloudPush добавил
+// карточку через REST PATCH (например, новый клиент из Altegio). Старый код
+// делал set() локального STATE — мы не видели свежую карточку и затирали её.
+// Теперь: внутри транзакции GET-им актуальный remote → мерджим по id с локальным
+// (для конфликтов берём свежий по updatedAt) → set. Если кто-то изменил
+// документ между read и write, Firestore сам retry-нёт транзакцию.
+async function cloudPush() {
   if(!db) return;
   if(!cloudInitialLoadDone) { console.log('[cloud] skip push — initial load not done'); return; }
   if(STATE.clients.length===0 && STATE.staff.length===0) { console.log('[cloud] skip push — empty state'); return; }
-  const payload = { staff:STATE.staff, clients:STATE.clients, ts:Date.now() };
-  const h = quickHash(JSON.stringify({s:payload.staff, c:payload.clients}));
+  const h = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
   if(h===cloudLastHash) return;
-  cloudLastHash = h;
-  db.collection('mmClients').doc('data').set(payload).catch(e => {
+
+  try {
+    const ref = db.collection('mmClients').doc('data');
+    let mergedClients = STATE.clients, mergedStaff = STATE.staff;
+    await db.runTransaction(async tx => {
+      const snap = await tx.get(ref);
+      const remote = snap.exists ? (snap.data() || {}) : {};
+      mergedClients = mergeArraysById(STATE.clients, remote.clients || []);
+      mergedStaff   = mergeArraysById(STATE.staff,   remote.staff   || []);
+      tx.set(ref, { staff: mergedStaff, clients: mergedClients, ts: Date.now() });
+    });
+    // Транзакция могла привести remote-only записи (от Worker'а) — подтягиваем
+    // их в локальный STATE, чтобы UI сразу их видел, и пересчитываем hash,
+    // чтобы дубли не пушили.
+    STATE.clients = mergedClients;
+    STATE.staff   = mergedStaff;
+    cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
+    saveLocalOnly();
+    if(currentScreen==='dashScreen') renderClientList();
+    if(currentScreen==='adminScreen') renderAdmin();
+  } catch(e) {
     console.error('[cloud] push fail', e);
     if(String(e.message||'').includes('exceeds')) toast('Документ слишком большой — настройте Cloudinary для фото','error');
-  });
+    // hash НЕ обновляем — пусть следующий push повторит попытку
+  }
 }
+
+// Merge двух массивов записей по id. Local имеет преимущество ТОЛЬКО если
+// его updatedAt новее remote — иначе побеждает remote (свежие изменения от
+// Worker'а или с другого устройства не теряются). Записи, существующие
+// только в одной стороне, попадают в результат как есть.
+// ВАЖНО: hard-delete на стороне платформы (записи нет в local, но есть в
+// remote) воспринимается как "remote свежее" → карточка "воскреснет". Чтобы
+// действительно удалить, ставь флаг deleted=true (soft-delete), он переживёт
+// merge и UI должен фильтровать таких.
+function mergeArraysById(localArr, remoteArr) {
+  const byId = new Map();
+  for(const r of (remoteArr || [])) {
+    if(r && r.id) byId.set(r.id, r);
+  }
+  for(const l of (localArr || [])) {
+    if(!l || !l.id) continue;
+    const existing = byId.get(l.id);
+    if(!existing) { byId.set(l.id, l); continue; }
+    const lTs = Number(l.updatedAt) || 0;
+    const rTs = Number(existing.updatedAt) || 0;
+    byId.set(l.id, lTs >= rTs ? l : existing);
+  }
+  return Array.from(byId.values());
+}
+
 function cloudPushDebounced() {
   if(cloudPushTimer) clearTimeout(cloudPushTimer);
   cloudPushTimer = setTimeout(cloudPush, 800);
