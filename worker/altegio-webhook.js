@@ -139,7 +139,7 @@ async function fetchFirestoreDoc(env) {
   const resp = await fetch(url);
   if (resp.status === 404) {
     // Документ ещё не создавался — стартуем с пустого state.
-    return { staff: [], clients: [], _exists: false };
+    return { staff: [], clients: [], _exists: false, _updateTime: null };
   }
   if (!resp.ok) {
     const txt = await resp.text();
@@ -151,11 +151,24 @@ async function fetchFirestoreDoc(env) {
     staff: Array.isArray(decoded.staff) ? decoded.staff : [],
     clients: Array.isArray(decoded.clients) ? decoded.clients : [],
     _exists: true,
+    // updateTime нужен для optimistic-locking: PATCH пройдёт только если
+    // документ не менялся с этого момента (см. patchFirestoreDoc).
+    _updateTime: json.updateTime || null,
   };
 }
 
 async function patchFirestoreDoc(env, state) {
-  const url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/mmClients/data?key=${env.FIREBASE_API_KEY}`;
+  let url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/mmClients/data?key=${env.FIREBASE_API_KEY}`;
+  // OPTIMISTIC CONCURRENCY: пишем документ только если он не изменился с
+  // момента нашего GET. Если другой webhook или платформа записали раньше —
+  // Firestore вернёт 400/409 FAILED_PRECONDITION, и withFirestoreRetry
+  // повторит весь цикл fetch→modify→patch со свежим снимком. Без этого два
+  // одновременных webhook'а теряли карточки (инциденты Лоры и Айнагуль).
+  if (state._exists && state._updateTime) {
+    url += `&currentDocument.updateTime=${encodeURIComponent(state._updateTime)}`;
+  } else if (!state._exists) {
+    url += `&currentDocument.exists=false`;
+  }
   const fields = encodeFirestoreFields({
     staff: state.staff,
     clients: state.clients,
@@ -166,76 +179,129 @@ async function patchFirestoreDoc(env, state) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ fields }),
   });
+  // Firestore REST на проваленный precondition отвечает 400 (с status
+  // FAILED_PRECONDITION в теле) либо 409. Распознаём оба и сигналим retry.
+  if (resp.status === 409 || resp.status === 412 || resp.status === 400) {
+    const txt = await resp.text();
+    if (resp.status !== 400 || /FAILED_PRECONDITION|exists|updateTime/i.test(txt)) {
+      const err = new Error('firestore precondition failed (concurrent write)');
+      err.code = 'PRECONDITION_FAILED';
+      throw err;
+    }
+    // 400 по другой причине — это реальная ошибка, не ретраим
+    throw new Error(`firestore PATCH failed: 400 ${txt.slice(0, 200)}`);
+  }
   if (!resp.ok) {
     const txt = await resp.text();
     throw new Error(`firestore PATCH failed: ${resp.status} ${txt.slice(0, 200)}`);
   }
 }
 
+// Optimistic-concurrency retry. fn() делает полный цикл fetch→modify→patch.
+// Если patchFirestoreDoc упал с PRECONDITION_FAILED (кто-то записал документ
+// параллельно) — повторяем весь цикл со свежим GET. Экспоненциальный backoff
+// с jitter разводит конкурентов во времени, чтобы они не толкались бесконечно.
+async function withFirestoreRetry(fn) {
+  const MAX_ATTEMPTS = 6;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e && e.code === 'PRECONDITION_FAILED' && attempt < MAX_ATTEMPTS) {
+        const delay = Math.min(80 * 2 ** (attempt - 1), 1200) + Math.random() * 150;
+        console.log(`[firestore] concurrent write, retry ${attempt}/${MAX_ATTEMPTS} in ${Math.round(delay)}ms`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw e;
+    }
+  }
+  // Сюда не доходим — последняя попытка либо вернёт значение, либо бросит.
+  throw new Error('firestore retry exhausted');
+}
+
 async function upsertCardInFirestore({ env, altegioClient }) {
   const altegioIdStr = String(altegioClient.id || '');
   if (!altegioIdStr) throw new Error('altegio client missing id');
 
-  const state = await fetchFirestoreDoc(env);
-  const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
+  // Весь цикл fetch→modify→patch — внутри retry с optimistic-locking.
+  return await withFirestoreRetry(async () => {
+    const state = await fetchFirestoreDoc(env);
+    const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
 
-  let cardId;
-  if (idx >= 0) {
-    // Обновление существующей — синкаем только поля, которые приходят из Altegio.
-    // Поля, заполненные мастером (анамнез, фото, замеры, рекомендации) — НЕ ТРОГАЕМ.
-    const c = state.clients[idx];
-    cardId = c.id;
-    if (altegioClient.name) c.fio = altegioClient.name;
-    if (altegioClient.phone) c.phone = altegioClient.phone;
-    c.altegioId = altegioIdStr;
-    c.deleted = false;
-    c.updatedAt = Date.now();
-  } else {
-    // Новая карточка — заводим скелет, мастер дозаполнит при следующем визите клиента.
-    cardId = `alt_${altegioIdStr}_${shortRand()}`;
-    state.clients.push({
-      id: cardId,
-      date: new Date().toISOString().slice(0, 10),
-      specialist: '',
-      specialistId: '',
-      fio: altegioClient.name || '',
-      phone: altegioClient.phone || '',
-      age: '',
-      weight: '',
-      height: '',
-      source: [],
-      complaints: '',
-      anamnesis: [],
-      anamnesisOther: '',
-      recommendations: '',
-      initialPhotos: [],
-      altegioId: altegioIdStr,
-      altegioLink: '',
-      sessions: [],
-      measurements: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-  }
+    let cardId;
+    if (idx >= 0) {
+      // Обновление существующей — синкаем только поля, которые приходят из Altegio.
+      // Поля, заполненные мастером (анамнез, фото, замеры, рекомендации) — НЕ ТРОГАЕМ.
+      // updatedAt бампаем ТОЛЬКО при реальном изменении: иначе remote-копия
+      // искусственно «свежеет» и merge на платформе может откатить правки мастера.
+      const c = state.clients[idx];
+      cardId = c.id;
+      let changed = false;
+      if (altegioClient.name && c.fio !== altegioClient.name) { c.fio = altegioClient.name; changed = true; }
+      if (altegioClient.phone && c.phone !== altegioClient.phone) { c.phone = altegioClient.phone; changed = true; }
+      if (String(c.altegioId || '') !== altegioIdStr) { c.altegioId = altegioIdStr; changed = true; }
+      if (c.deleted) { c.deleted = false; changed = true; }
+      if (changed) {
+        c.updatedAt = Date.now();
+      } else {
+        // Ничего не изменилось — выходим без записи, чтобы не дёргать Firestore
+        // и не плодить лишние ts-апдейты.
+        return cardId;
+      }
+    } else {
+      // Новая карточка — заводим скелет, мастер дозаполнит при следующем визите клиента.
+      cardId = `alt_${altegioIdStr}_${shortRand()}`;
+      state.clients.push({
+        id: cardId,
+        date: new Date().toISOString().slice(0, 10),
+        specialist: '',
+        specialistId: '',
+        fio: altegioClient.name || '',
+        phone: altegioClient.phone || '',
+        age: '',
+        weight: '',
+        height: '',
+        source: [],
+        complaints: '',
+        anamnesis: [],
+        anamnesisOther: '',
+        recommendations: '',
+        initialPhotos: [],
+        altegioId: altegioIdStr,
+        altegioLink: '',
+        sessions: [],
+        measurements: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
 
-  await patchFirestoreDoc(env, state);
-  return cardId;
+    await patchFirestoreDoc(env, state);
+    return cardId;
+  });
 }
 
 async function markCardDeletedInFirestore({ env, altegioId }) {
   const altegioIdStr = String(altegioId || '');
   if (!altegioIdStr) return null;
 
-  const state = await fetchFirestoreDoc(env);
-  const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
-  if (idx < 0) return null;
+  return await withFirestoreRetry(async () => {
+    const state = await fetchFirestoreDoc(env);
+    const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
+    if (idx < 0) return null;
 
-  // Soft-delete: помечаем флагом, реальные данные/фото сохраняем — мастер мог
-  // потратить часы на анамнез, нельзя потерять при случайном удалении в Altegio.
-  state.clients[idx].deleted = true;
-  state.clients[idx].updatedAt = Date.now();
-  await patchFirestoreDoc(env, state);
-  return state.clients[idx].id;
+    // Soft-delete: помечаем флагом, реальные данные/фото сохраняем — мастер мог
+    // потратить часы на анамнез, нельзя потерять при случайном удалении в Altegio.
+    if (state.clients[idx].deleted === true) {
+      // Уже помечена — не пишем повторно.
+      return state.clients[idx].id;
+    }
+    state.clients[idx].deleted = true;
+    state.clients[idx].updatedAt = Date.now();
+    await patchFirestoreDoc(env, state);
+    return state.clients[idx].id;
+  });
 }
 
 function shortRand() {

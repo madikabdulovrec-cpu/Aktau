@@ -1198,8 +1198,12 @@ function renderClientList() {
   const fSpec = document.getElementById('filterSpecialist').value;
   const sortBy = document.getElementById('sortBy').value;
 
+  // Скрываем soft-deleted карточки. Worker помечает deleted=true при удалении
+  // клиента в Altegio, deleteClient() — при удалении через UI. Физически
+  // запись остаётся (анамнез/фото мастера не теряются, и merge-by-id не
+  // воскрешает её обратно — иначе deleted-флаг просто проигнорировался бы).
   // если мастер — видит только свои карточки (по staffId, со fallback на имя для старых записей)
-  let list = STATE.clients.slice();
+  let list = STATE.clients.filter(c => !c.deleted);
   const totalForSession = (STATE.session && STATE.session.role==='master')
     ? list.filter(c => c.specialistId
         ? c.specialistId===STATE.session.staffId
@@ -1409,8 +1413,19 @@ function saveClient() {
 
 function deleteClient() {
   if(!editingClientId) return;
-  if(!confirm('Удалить карточку безвозвратно?')) return;
-  STATE.clients = STATE.clients.filter(c => c.id!==editingClientId);
+  if(!confirm('Удалить карточку? Данные сохранятся — карточку можно восстановить через суперадмина.')) return;
+  // SOFT-DELETE, не hard. Раньше делали STATE.clients.filter(...) — карточка
+  // выпиливалась из массива. Но при merge-on-write (mergeArraysById) удалённая
+  // запись «воскресала» из remote, если там она ещё была. Плюс hard-delete
+  // безвозвратно терял анамнез/фото. Теперь ставим флаг deleted=true:
+  //  - renderClientList фильтрует такие карточки (не показывает),
+  //  - merge видит запись с обеих сторон и сохраняет (флаг переживает merge),
+  //  - данные физически целы, восстановление = снять флаг.
+  const c = STATE.clients.find(x => x.id===editingClientId);
+  if(c) {
+    c.deleted = true;
+    c.updatedAt = Date.now();
+  }
   editingClientId = null;
   saveState();
   toast('Карточка удалена');
@@ -1879,8 +1894,10 @@ function renderAdmin() {
       </div>
     `).join('');
   }
-  document.getElementById('sysClientsCount').textContent = STATE.clients.length;
-  document.getElementById('sysSessionsCount').textContent = STATE.clients.reduce((a,c)=>a+(c.sessions?.length||0),0);
+  // Счётчики — без soft-deleted карточек, чтобы статистика совпадала со списком.
+  const liveClients = STATE.clients.filter(c => !c.deleted);
+  document.getElementById('sysClientsCount').textContent = liveClients.length;
+  document.getElementById('sysSessionsCount').textContent = liveClients.reduce((a,c)=>a+(c.sessions?.length||0),0);
   document.getElementById('sysCloudinary').textContent = cloudinaryConfigured()?CLOUDINARY.cloudName:'Не настроено';
 }
 
