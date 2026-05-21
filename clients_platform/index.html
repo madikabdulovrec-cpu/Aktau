@@ -1202,17 +1202,23 @@ function renderClientList() {
   // клиента в Altegio, deleteClient() — при удалении через UI. Физически
   // запись остаётся (анамнез/фото мастера не теряются, и merge-by-id не
   // воскрешает её обратно — иначе deleted-флаг просто проигнорировался бы).
-  // если мастер — видит только свои карточки (по staffId, со fallback на имя для старых записей)
   let list = STATE.clients.filter(c => !c.deleted);
+  // Видимость для мастера: свои карточки (по staffId, fallback на имя для
+  // старых записей) + «НИЧЬИ». Ничья = карточка без specialistId и без
+  // specialist — её создал Worker по webhook'у из Altegio и не знал, кому
+  // привязать. Такие карточки должны видеть ВСЕ мастера, иначе новый клиент
+  // из Altegio не появляется ни у кого. Как только мастер откроет и сохранит
+  // карточку — она закрепится за ним (см. saveClient) и пропадёт у других.
+  const visibleToMaster = c => {
+    if(c.specialistId) return c.specialistId===STATE.session.staffId;
+    if((c.specialist||'').trim()) return (c.specialist||'').toLowerCase().trim()===STATE.session.name.toLowerCase().trim();
+    return true; // ничья — видна всем мастерам
+  };
   const totalForSession = (STATE.session && STATE.session.role==='master')
-    ? list.filter(c => c.specialistId
-        ? c.specialistId===STATE.session.staffId
-        : (c.specialist||'').toLowerCase().trim()===STATE.session.name.toLowerCase().trim()).length
+    ? list.filter(visibleToMaster).length
     : list.length;
   if(STATE.session && STATE.session.role==='master') {
-    list = list.filter(c => c.specialistId
-      ? c.specialistId===STATE.session.staffId
-      : (c.specialist||'').toLowerCase().trim()===STATE.session.name.toLowerCase().trim());
+    list = list.filter(visibleToMaster);
   }
   const beforeSearch = list.length;
   if(q) list = list.filter(c => (c.fio+' '+(c.phone||'')+' '+(c.complaints||'')).toLowerCase().includes(q));
@@ -1285,7 +1291,14 @@ function openClientForm(id) {
     const c = STATE.clients.find(x => x.id===id);
     if(c) {
       document.getElementById('f_date').value = c.date||todayStr();
-      document.getElementById('f_specialist').value = c.specialist||'';
+      // Если карточка «ничья» (из Altegio, без мастера) и открыл её мастер —
+      // подставляем его имя: сохранение закрепит карточку за ним.
+      if(!c.specialist && !c.specialistId && STATE.session?.role==='master') {
+        document.getElementById('f_specialist').value = STATE.session.name;
+        document.getElementById('f_specialist').dataset.staffId = STATE.session.staffId;
+      } else {
+        document.getElementById('f_specialist').value = c.specialist||'';
+      }
       document.getElementById('f_fio').value = c.fio||'';
       document.getElementById('f_phone').value = c.phone||'';
       document.getElementById('f_age').value = c.age||'';
@@ -1377,10 +1390,17 @@ function saveClient() {
   const age = document.getElementById('f_age').value.trim();
   if(!fio || !age) { toast('Заполните ФИО и возраст','error'); return; }
 
-  const specName = document.getElementById('f_specialist').value.trim();
-  // ищем staffId по имени, либо берём из сессии (мастер сам у себя)
+  let specName = document.getElementById('f_specialist').value.trim();
+  // ищем staffId по имени
   let specId = STATE.staff.find(s => s.name.toLowerCase()===specName.toLowerCase())?.id || '';
-  if(!specId && STATE.session?.role==='master' && specName.toLowerCase()===STATE.session.name.toLowerCase()) specId = STATE.session.staffId;
+  // Мастер, сохраняя карточку, ВСЕГДА закрепляет её за собой. Это закрывает
+  // «ничьи» карточки из Altegio: мастер открыл, заполнил, сохранил — карточка
+  // получила его specialistId и теперь видна только ему. Мастер не может
+  // приписать карточку другому (для суперадмина — поле остаётся свободным).
+  if(STATE.session?.role==='master') {
+    specId = STATE.session.staffId;
+    specName = STATE.session.name;
+  }
 
   const data = {
     date: document.getElementById('f_date').value,
