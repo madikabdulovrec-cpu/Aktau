@@ -13,6 +13,26 @@
 | 01 | [01_analysis_may_2026.md](01_analysis_may_2026.md) | Диагностика мая: цифры из Altegio + плана, локализация узкого горла |
 | 02 | [02_platform_concept.md](02_platform_concept.md) | Концепция платформы аналитики продаж (Wazzup24 + Cloudflare Worker + Firestore + AI-разбор) |
 | 03 | [03_cjm.md](03_cjm.md) | Customer Journey Map: 16 этапов пути клиента + 4 персоны |
+| 04 | [04_sales_lead_ai_persona.md](04_sales_lead_ai_persona.md) | AI-персона «Руководитель отдела продаж» — системный промпт для AI-разбора диалогов и аналитики воронки (Слой 3 платформы) |
+| — | [Для бота.md](Для%20бота.md) | Бриф и база знаний для бота первичной обработки заявок (источник правды по фактам) |
+| — | [audit.html](audit.html) | Аудит отдела продаж: воронка, экономика рекламы, проблемы, стратегия |
+| 05 | [05_bot_system_prompt.md](05_bot_system_prompt.md) | Готовый системный промпт бота-собеседника (WhatsApp/Instagram → запись на консультацию) + план интеграции |
+| — | [Тест-кейсы для бота.md](Тест-кейсы%20для%20бота.md) | 20 тест-кейсов на реальных диалогах аудита (приёмочный тест бота + источник для A/B) |
+| 06 | [06_ab_test_cases.md](06_ab_test_cases.md) | Методология A/B теста Claude vs GPT: слепое сравнение, рубрика 0-2, скоринг |
+| — | [ab_test_scoring.xlsx](ab_test_scoring.xlsx) | Рабочая тетрадь для слепого скоринга A/B теста (20 кейсов, формулы) |
+| — | [ab_run_claude.md](ab_run_claude.md) | Прогон стороны Claude: 20 ответов бота по промпту 05. Ждёт парный прогон GPT |
+| — | [BUILD_LOG.md](BUILD_LOG.md) | Журнал сборки бота — пошаговый лог разработки |
+| — | [DATA_REQUEST.md](DATA_REQUEST.md) | Форма-запрос данных для запуска бота (контент от Марии + тех. доступы) |
+
+## Код бота
+
+Реализация бота первичной обработки заявок (платформа — Wazzup24):
+
+| Файл | Что внутри |
+|---|---|
+| [`/worker/mm-bot.js`](../../worker/mm-bot.js) | Cloudflare Worker: Wazzup24 webhook → Claude API (prompt caching) → ответ. История диалогов в KV, теги `[[BOOKING]]`/`[[HANDOFF]]`, handoff менеджеру |
+| [`/worker/wrangler-mm-bot.toml`](../../worker/wrangler-mm-bot.toml) | Конфиг деплоя Worker |
+| [`/worker/BOT_SETUP.md`](../../worker/BOT_SETUP.md) | Пошаговая инструкция развёртывания |
 
 ## Открытые вопросы к пользователю
 

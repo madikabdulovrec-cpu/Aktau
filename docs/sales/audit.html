@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Аудит отдела продаж — M&M Fabrica</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --yellow:#FFE600;
+    --pink:#FF2D7B;
+    --dark:#1A1A1A;
+    --bg:#EDF4FC;
+    --card:#FFFFFF;
+    --muted:#6B7280;
+    --line:#E5E9F0;
+    --red:#E11D48;
+    --green:#00B368;
+    --amber:#F59E0B;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{
+    font-family:'Inter',-apple-system,Segoe UI,Roboto,sans-serif;
+    background:var(--bg);
+    color:var(--dark);
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 24px 80px;}
+  h1,h2,h3{font-family:'Unbounded',sans-serif;line-height:1.2;}
+
+  /* HEADER */
+  .header{
+    background:var(--dark);
+    border-radius:24px;
+    padding:48px 44px;
+    color:#fff;
+    position:relative;
+    overflow:hidden;
+  }
+  .header::after{
+    content:"";position:absolute;right:-60px;top:-60px;
+    width:240px;height:240px;border-radius:50%;
+    background:radial-gradient(circle,var(--pink),transparent 70%);
+    opacity:.55;
+  }
+  .header .kicker{
+    display:inline-block;background:var(--yellow);color:var(--dark);
+    font-weight:700;font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    padding:6px 14px;border-radius:999px;
+  }
+  .header h1{font-size:38px;font-weight:800;margin:18px 0 10px;}
+  .header h1 span{color:var(--yellow);}
+  .header p{color:#C7CDD6;font-size:15px;max-width:620px;}
+  .header .meta{
+    margin-top:22px;display:flex;gap:10px;flex-wrap:wrap;
+  }
+  .header .meta span{
+    background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);
+    padding:6px 13px;border-radius:999px;font-size:12.5px;color:#E7EAEF;
+  }
+
+  /* SECTION */
+  .section{margin-top:46px;}
+  .section-tag{
+    display:flex;align-items:center;gap:12px;margin-bottom:20px;
+  }
+  .section-tag .num{
+    font-family:'Unbounded',sans-serif;font-weight:700;font-size:14px;
+    background:var(--pink);color:#fff;width:34px;height:34px;border-radius:10px;
+    display:flex;align-items:center;justify-content:center;flex:none;
+  }
+  .section-tag h2{font-size:23px;font-weight:700;}
+
+  /* VERDICT */
+  .verdict{
+    background:var(--card);border-radius:20px;padding:28px 30px;
+    border-left:6px solid var(--pink);
+    box-shadow:0 6px 24px rgba(26,26,26,.05);
+  }
+  .verdict p{font-size:16px;}
+  .verdict strong{color:var(--pink);}
+  .verdict .big{
+    font-family:'Unbounded',sans-serif;font-size:18px;font-weight:600;
+    margin-bottom:12px;display:block;
+  }
+
+  /* METRIC CARDS */
+  .cards{
+    display:grid;grid-template-columns:repeat(3,1fr);gap:16px;
+  }
+  .card{
+    background:var(--card);border-radius:18px;padding:22px;
+    box-shadow:0 6px 24px rgba(26,26,26,.05);
+    border:1px solid var(--line);
+  }
+  .card .val{
+    font-family:'Unbounded',sans-serif;font-size:34px;font-weight:800;line-height:1;
+  }
+  .card .label{font-size:13.5px;color:var(--muted);margin-top:8px;}
+  .card.danger .val{color:var(--red);}
+  .card.warn .val{color:var(--amber);}
+  .card.ok .val{color:var(--green);}
+  .card.neutral .val{color:var(--dark);}
+
+  /* PANEL */
+  .panel{
+    background:var(--card);border-radius:20px;padding:26px 28px;
+    box-shadow:0 6px 24px rgba(26,26,26,.05);border:1px solid var(--line);
+  }
+  .panel h3{font-size:16px;font-weight:700;margin-bottom:6px;}
+  .panel .sub{color:var(--muted);font-size:13.5px;margin-bottom:18px;}
+  .splitbar{
+    display:flex;height:46px;border-radius:12px;overflow:hidden;font-size:13px;font-weight:600;
+  }
+  .splitbar .junk{
+    background:repeating-linear-gradient(45deg,#D1D5DB,#D1D5DB 10px,#C4C9D2 10px,#C4C9D2 20px);
+    color:#4B5563;display:flex;align-items:center;justify-content:center;
+  }
+  .splitbar .real{
+    background:var(--pink);color:#fff;display:flex;align-items:center;justify-content:center;
+  }
+  .legend{display:flex;gap:22px;margin-top:14px;font-size:13px;color:var(--muted);}
+  .legend i{width:12px;height:12px;border-radius:3px;display:inline-block;margin-right:6px;vertical-align:middle;}
+
+  /* FUNNEL */
+  .funnel{display:flex;flex-direction:column;gap:0;}
+  .fstep{
+    background:var(--card);border:1px solid var(--line);
+    border-radius:14px;padding:18px 24px;display:flex;align-items:center;
+    justify-content:space-between;box-shadow:0 4px 16px rgba(26,26,26,.04);
+  }
+  .fstep .ftitle{font-weight:600;font-size:15px;}
+  .fstep .fnum{
+    font-family:'Unbounded',sans-serif;font-weight:800;font-size:26px;
+  }
+  .fstep .fpct{font-size:13px;color:var(--muted);margin-left:10px;}
+  .fstep.s1{margin:0 0;}
+  .fstep.s2{margin:0 7%;}
+  .fstep.s3{margin:0 16%;}
+  .fstep.s4{margin:0 25%;}
+  .fstep.s1 .fnum{color:var(--dark);}
+  .fstep.s2 .fnum{color:var(--amber);}
+  .fstep.s3 .fnum{color:var(--red);}
+  .fstep.s4 .fnum{color:var(--red);}
+  .leak{
+    text-align:center;font-size:12.5px;color:var(--red);font-weight:600;
+    padding:7px 0;position:relative;
+  }
+  .leak::before{content:"▼  ";}
+
+  /* COST LADDER */
+  .ladder{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
+  .lstep{
+    flex:1;min-width:116px;background:var(--card);border:1px solid var(--line);
+    border-radius:14px;padding:16px 12px;text-align:center;
+  }
+  .lstep.accent{background:var(--dark);border-color:var(--dark);}
+  .lstep.accent .lval{color:var(--yellow);}
+  .lstep.accent .llabel{color:#C7CDD6;}
+  .lstep .lval{font-family:'Unbounded',sans-serif;font-weight:800;font-size:24px;}
+  .lstep .llabel{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.35;}
+  .larrow{color:var(--pink);font-weight:700;font-size:17px;flex:none;}
+
+  /* STAGE BARS */
+  .stagebar{display:flex;flex-direction:column;gap:11px;margin-top:6px;}
+  .srow{display:flex;align-items:center;gap:14px;}
+  .srow .sname{width:210px;font-size:13.5px;flex:none;}
+  .srow .strack{flex:1;background:#F1F3F7;border-radius:7px;height:26px;overflow:hidden;}
+  .srow .sfill{height:100%;border-radius:7px;display:flex;align-items:center;
+    padding-left:10px;color:#fff;font-size:12.5px;font-weight:700;}
+  .srow .scount{width:46px;text-align:right;font-weight:700;font-size:14px;flex:none;}
+  .tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;margin-left:8px;}
+  .tag.bad{background:#FEE2E2;color:var(--red);}
+  .tag.dead{background:#1A1A1A;color:var(--yellow);}
+  .tag.key{background:#D1FAE5;color:#047857;}
+
+  /* DIALOG ANATOMY */
+  .statline{display:flex;gap:14px;flex-wrap:wrap;margin-top:6px;}
+  .statline .si{flex:1;min-width:158px;background:var(--card);border:1px solid var(--line);
+    border-radius:14px;padding:16px 18px;}
+  .statline .si .sv{font-family:'Unbounded',sans-serif;font-weight:800;font-size:25px;color:var(--green);}
+  .statline .si .sl{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.4;}
+  .chat{display:flex;flex-direction:column;gap:7px;margin-top:14px;
+    background:var(--bg);border-radius:12px;padding:14px 15px;}
+  .bub{max-width:82%;padding:9px 13px;border-radius:13px;font-size:12.5px;line-height:1.46;}
+  .bub .bt{display:block;font-size:9.5px;font-weight:700;text-transform:uppercase;
+    letter-spacing:.05em;margin-bottom:3px;opacity:.65;}
+  .bub.cl{background:#fff;border:1px solid var(--line);align-self:flex-start;
+    border-bottom-left-radius:4px;}
+  .bub.st{background:var(--pink);color:#fff;align-self:flex-end;
+    border-bottom-right-radius:4px;}
+  .bub.st .bt{color:#fff;opacity:.8;}
+  .chat .gap{align-self:center;font-size:11px;color:var(--red);font-weight:700;
+    background:#FEE2E2;padding:3px 12px;border-radius:999px;}
+  .chat .dead{align-self:center;font-size:11px;color:var(--muted);font-style:italic;text-align:center;}
+  .bp{background:var(--card);border:1px solid var(--line);border-radius:18px;
+    padding:22px 24px;margin-bottom:16px;box-shadow:0 6px 24px rgba(26,26,26,.05);}
+  .bp .bphead{display:flex;align-items:center;gap:13px;margin-bottom:8px;}
+  .bp .bpnum{font-family:'Unbounded',sans-serif;font-weight:800;font-size:16px;color:#fff;
+    background:var(--red);width:36px;height:36px;border-radius:10px;
+    display:flex;align-items:center;justify-content:center;flex:none;}
+  .bp h3{font-size:16px;font-weight:700;}
+  .bp p{font-size:14px;color:#374151;}
+  .bp.win{border-color:#A7F3D0;}
+  .bp.win .bpnum{background:var(--green);}
+
+  /* PROBLEM CARDS */
+  .problem{
+    background:var(--card);border-radius:18px;padding:24px 26px;
+    border:1px solid var(--line);box-shadow:0 6px 24px rgba(26,26,26,.05);
+    margin-bottom:16px;
+  }
+  .problem.crit{border-left:6px solid var(--red);}
+  .problem.minor{border-left:6px solid var(--amber);}
+  .problem .phead{display:flex;align-items:center;gap:12px;margin-bottom:10px;}
+  .problem .badge{
+    font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+    padding:4px 10px;border-radius:6px;flex:none;
+  }
+  .badge.r{background:#FEE2E2;color:var(--red);}
+  .badge.a{background:#FEF3C7;color:#B45309;}
+  .problem h3{font-size:16.5px;font-weight:700;}
+  .problem p{font-size:14.5px;color:#374151;}
+  .problem .ev{
+    margin-top:12px;background:var(--bg);border-radius:10px;padding:12px 14px;
+    font-size:13px;color:#4B5563;
+  }
+  .problem .ev b{color:var(--dark);}
+
+  /* STRATEGY */
+  .strat{
+    background:var(--card);border-radius:20px;padding:26px 28px;margin-bottom:16px;
+    border:1px solid var(--line);box-shadow:0 6px 24px rgba(26,26,26,.05);
+  }
+  .strat .shead{display:flex;align-items:center;gap:14px;margin-bottom:16px;}
+  .strat .pri{
+    font-family:'Unbounded',sans-serif;font-weight:700;font-size:13px;
+    color:#fff;padding:7px 13px;border-radius:9px;flex:none;
+  }
+  .pri.p1{background:var(--red);}
+  .pri.p2{background:var(--pink);}
+  .pri.p3{background:#7C3AED;}
+  .pri.p4{background:var(--dark);}
+  .strat h3{font-size:17px;font-weight:700;}
+  .strat .saim{font-size:13px;color:var(--muted);}
+  .steps{list-style:none;display:flex;flex-direction:column;gap:11px;}
+  .steps li{
+    display:flex;gap:12px;font-size:14.5px;color:#374151;
+    padding-bottom:11px;border-bottom:1px dashed var(--line);
+  }
+  .steps li:last-child{border-bottom:none;padding-bottom:0;}
+  .steps li::before{
+    content:"";width:9px;height:9px;border-radius:50%;background:var(--yellow);
+    border:2px solid var(--dark);flex:none;margin-top:7px;
+  }
+  .steps li b{color:var(--dark);}
+
+  /* PRIZE */
+  .prize{
+    background:linear-gradient(120deg,var(--dark),#2A2A35);
+    border-radius:22px;padding:36px 40px;color:#fff;margin-top:30px;
+    position:relative;overflow:hidden;
+  }
+  .prize::after{
+    content:"";position:absolute;right:-40px;bottom:-60px;width:220px;height:220px;
+    border-radius:50%;background:radial-gradient(circle,var(--yellow),transparent 70%);opacity:.5;
+  }
+  .prize .ptag{
+    color:var(--yellow);font-weight:700;font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase;
+  }
+  .prize h3{font-size:24px;font-weight:800;margin:10px 0 12px;max-width:640px;}
+  .prize p{color:#C7CDD6;font-size:15px;max-width:660px;}
+  .prize .nums{display:flex;gap:34px;margin-top:24px;flex-wrap:wrap;}
+  .prize .nums div .n{font-family:'Unbounded',sans-serif;font-size:30px;font-weight:800;color:var(--yellow);}
+  .prize .nums div .c{font-size:13px;color:#9CA3AF;}
+
+  .foot{
+    text-align:center;color:var(--muted);font-size:12.5px;margin-top:46px;
+    padding-top:22px;border-top:1px solid var(--line);
+  }
+  @media(max-width:720px){
+    .cards{grid-template-columns:repeat(2,1fr);}
+    .header h1{font-size:28px;}
+    .header,.prize{padding:32px 24px;}
+    .fstep.s2,.fstep.s3,.fstep.s4{margin:0;}
+    .srow .sname{width:130px;}
+    .wrap{padding:20px 14px 60px;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- HEADER -->
+  <div class="header">
+    <span class="kicker">Внутренний аудит · конфиденциально</span>
+    <h1>Аудит отдела продаж<br><span>M&M Fabrica</span></h1>
+    <p>Аналитика воронки, экономика рекламы, диагностика проблем и стратегия роста продаж. Подготовлено на основе выгрузки CRM Message, разбора более 230 переписок и отчёта по рекламе.</p>
+    <div class="meta">
+      <span>План периода: 25–30 млн ₸</span>
+      <span>Факт: ~5 млн ₸</span>
+      <span>Выполнение: ~17–20%</span>
+      <span>Расход на рекламу: $1 273</span>
+    </div>
+  </div>
+
+  <!-- VERDICT -->
+  <div class="section">
+    <div class="section-tag"><div class="num">!</div><h2>Главный вывод</h2></div>
+    <div class="verdict">
+      <span class="big">Проблема не в рекламе, не в количестве заявок и не в «плохом закрытии». Заявок достаточно, трафик дешёвый — бизнес теряет клиентов в середине воронки.</span>
+      <p>Реклама стоит копейки и своё отрабатывает: расход за период — всего <strong>$1 273</strong>. Но до консультации доходит лишь <strong>7% реальных заявок</strong>. Две трети обращений получают один ответ менеджера и бросаются без дальнейшей работы. Реальные заявки тонут в потоке автоподхваченных комментариев, а руководитель не видит картину, потому что воронка в CRM не ведётся. Это не дефицит лидов — это управляемая и обратимая потеря денег на уже оплаченном трафике.</p>
+    </div>
+  </div>
+
+  <!-- ANALYTICS -->
+  <div class="section">
+    <div class="section-tag"><div class="num">1</div><h2>Аналитика воронки</h2></div>
+
+    <div class="cards">
+      <div class="card neutral">
+        <div class="val">609</div>
+        <div class="label">Реальных заявок за период (живые обращения в директ и мессенджер)</div>
+      </div>
+      <div class="card danger">
+        <div class="val">53%</div>
+        <div class="label">«Лидов» в CRM — это автоподхваченные комментарии, а не заявки</div>
+      </div>
+      <div class="card danger">
+        <div class="val">7%</div>
+        <div class="label">Реальных заявок доходит до консультации в студии</div>
+      </div>
+      <div class="card warn">
+        <div class="val">52%</div>
+        <div class="label">Неявка: половина записавшихся не доходит до студии</div>
+      </div>
+      <div class="card danger">
+        <div class="val">0</div>
+        <div class="label">Продаж зафиксировано в CRM — выручка системе не видна</div>
+      </div>
+      <div class="card warn">
+        <div class="val">2</div>
+        <div class="label">Менеджера продаж в отделе — малая команда; поток комментариев съедает её время</div>
+      </div>
+    </div>
+
+    <!-- LEAD QUALITY -->
+    <div class="panel" style="margin-top:18px;">
+      <h3>Качество потока: «много заявок» — это иллюзия</h3>
+      <div class="sub">Из 1 287 записей «лид» в CRM больше половины — комментарии под постами, которые система подхватывает автоматически. Это не обращения и не интерес к покупке.</div>
+      <div class="splitbar">
+        <div class="junk" style="width:53%;">678 — комментарии (мусор)</div>
+        <div class="real" style="width:47%;">609 — реальные заявки</div>
+      </div>
+      <div class="legend">
+        <span><i style="background:#C4C9D2;"></i>Комментарии — автоподхват, не заявки</span>
+        <span><i style="background:var(--pink);"></i>Реальные обращения с интересом</span>
+      </div>
+    </div>
+
+    <!-- FUNNEL -->
+    <div class="panel" style="margin-top:18px;">
+      <h3>Воронка реальных заявок: течёт сверху</h3>
+      <div class="sub">Путь 609 живых обращений — и где они исчезают.</div>
+      <div class="funnel">
+        <div class="fstep s1">
+          <span class="ftitle">Поступило реальных заявок</span>
+          <span><span class="fnum">609</span><span class="fpct">100%</span></span>
+        </div>
+        <div class="leak">потеряно 460 — брошены в работе или закрыты без результата</div>
+        <div class="fstep s2">
+          <span class="ftitle">Записались на консультацию</span>
+          <span><span class="fnum">149</span><span class="fpct">24%</span></span>
+        </div>
+        <div class="leak">потеряно 106 — не подтвердили запись или не пришли</div>
+        <div class="fstep s3">
+          <span class="ftitle">Дошли до консультации в студии</span>
+          <span><span class="fnum">43</span><span class="fpct">7%</span></span>
+        </div>
+        <div class="leak">продажи в CRM не фиксируются</div>
+        <div class="fstep s4">
+          <span class="ftitle">Продажа отмечена в CRM</span>
+          <span><span class="fnum">0</span><span class="fpct">0%</span></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- STAGE DETAIL -->
+    <div class="panel" style="margin-top:18px;">
+      <h3>Где именно стоят заявки (этапы CRM)</h3>
+      <div class="sub">Распределение 609 реальных заявок по этапам воронки на момент аудита.</div>
+      <div class="stagebar">
+        <div class="srow">
+          <div class="sname">Новый этап <span class="tag bad">не открыт</span></div>
+          <div class="strack"><div class="sfill" style="width:47%;background:#9CA3AF;">126</div></div>
+          <div class="scount">126</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Прогрев <span class="tag bad">застряли</span></div>
+          <div class="strack"><div class="sfill" style="width:100%;background:var(--red);">268 — «кладбище» заявок</div></div>
+          <div class="scount">268</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Ожидание клиента</div>
+          <div class="strack"><div class="sfill" style="width:19%;background:var(--amber);">50</div></div>
+          <div class="scount">50</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Подтвердил</div>
+          <div class="strack"><div class="sfill" style="width:8%;background:var(--amber);">10</div></div>
+          <div class="scount">10</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Пришёл на консультацию</div>
+          <div class="strack"><div class="sfill" style="width:16%;background:var(--green);">43</div></div>
+          <div class="scount">43</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Не пришёл</div>
+          <div class="strack"><div class="sfill" style="width:17%;background:#9CA3AF;">46</div></div>
+          <div class="scount">46</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Закрыто без результата</div>
+          <div class="strack"><div class="sfill" style="width:25%;background:#9CA3AF;">66</div></div>
+          <div class="scount">66</div>
+        </div>
+        <div class="srow">
+          <div class="sname">Успешно реализовано <span class="tag dead">не ведётся</span></div>
+          <div class="strack"><div class="sfill" style="width:2%;background:var(--dark);"></div></div>
+          <div class="scount">0</div>
+        </div>
+      </div>
+      <div class="ev" style="margin-top:18px;background:var(--bg);border-radius:10px;padding:14px 16px;font-size:13.5px;color:#374151;">
+        <b>Читается так:</b> 394 заявки (65%) стоят в «Новом этапе» и «Прогреве» — то есть либо вообще не открыты, либо получили один ответ и брошены. До этапов записи и визита доходят единицы. Этап «Успешно реализовано» пуст — продажи в систему не вносятся.
+      </div>
+    </div>
+  </div>
+
+  <!-- MARKETING -->
+  <div class="section">
+    <div class="section-tag"><div class="num">2</div><h2>Экономика рекламы</h2></div>
+
+    <div class="verdict" style="border-left-color:var(--green);">
+      <span class="big">Реклама — не узкое место. Она дешёвая и своё отрабатывает.</span>
+      <p>Расход на рекламу за период — <strong>$1 273</strong>, по отчёту таргетолога это <strong>778 заявок</strong> по <strong>$1.6</strong>. Бюджет крошечный, трафик дешёвый. Деньги теряются не на привлечении клиента, а после того, как он уже написал.</p>
+    </div>
+
+    <div class="cards" style="margin-top:18px;">
+      <div class="card neutral"><div class="val">$1 273</div><div class="label">Расход на рекламу за период</div></div>
+      <div class="card neutral"><div class="val">778</div><div class="label">«Заявок» по отчёту таргетолога</div></div>
+      <div class="card warn"><div class="val">$1.6</div><div class="label">Цена «заявки» — метрика, по которой отчитывается реклама</div></div>
+    </div>
+
+    <!-- COST LADDER -->
+    <div class="panel" style="margin-top:18px;">
+      <h3>Как дешёвая «заявка» превращается в реальную цену клиента</h3>
+      <div class="sub">Реклама одна и та же — но цена результата растёт по мере движения по воронке.</div>
+      <div class="ladder">
+        <div class="lstep"><div class="lval">$1.6</div><div class="llabel">за «заявку»<br>(метрика рекламы)</div></div>
+        <div class="larrow">&rarr;</div>
+        <div class="lstep"><div class="lval">$8.5</div><div class="llabel">за запись<br>на консультацию</div></div>
+        <div class="larrow">&rarr;</div>
+        <div class="lstep"><div class="lval">~$30</div><div class="llabel">за дошедшую<br>консультацию</div></div>
+        <div class="larrow">&rarr;</div>
+        <div class="lstep accent"><div class="lval">~$64</div><div class="llabel">за реальную<br>продажу курса</div></div>
+      </div>
+      <div class="ev" style="margin-top:16px;background:var(--bg);border-radius:10px;padding:13px 15px;font-size:13.5px;color:#374151;">
+        Даже конечная цифра — <b>около $64 за продажу курса</b> (~250 000 ₸) — это отличная экономика привлечения. Юнит-экономика работает. Значит, ограничение — пропускная способность отдела продаж, а не реклама. Расход на рекламу несопоставимо меньше выручки, которую теряет отдел продаж.
+      </div>
+    </div>
+
+    <!-- RECONCILIATION -->
+    <div class="problem minor" style="margin-top:18px;">
+      <div class="phead">
+        <span class="badge a">Сверить</span>
+        <h3>«778 заявок» и «$1.6» — цифры нужно перепроверить</h3>
+      </div>
+      <p>За тот же период в CRM — 1 287 записей, из них 53% это автоподхваченные комментарии. «$1.6 за заявку» меряет самый дешёвый результат (переход, комментарий), а не реальную возможность продажи. Маркетинг и отдел продаж считают разные вещи, и никто не сводит их между собой. Реальные ориентиры стоимости — около <b>$30</b> за клиента, дошедшего до студии, и около <b>$64</b> за продажу.</p>
+    </div>
+
+    <!-- OFFER MIX -->
+    <div class="panel" style="margin-top:18px;">
+      <h3>На что идёт трафик: структура заявок по офферам</h3>
+      <div class="sub">12 рекламных связок, распределение 778 заявок.</div>
+      <div class="stagebar">
+        <div class="srow"><div class="sname">Торнадо</div><div class="strack"><div class="sfill" style="width:100%;background:var(--pink);">133</div></div><div class="scount">133</div></div>
+        <div class="srow"><div class="sname">Индиба</div><div class="strack"><div class="sfill" style="width:80%;background:var(--pink);">107</div></div><div class="scount">107</div></div>
+        <div class="srow"><div class="sname">Торнадо по лицу</div><div class="strack"><div class="sfill" style="width:78%;background:var(--pink);">104</div></div><div class="scount">104</div></div>
+        <div class="srow"><div class="sname">Арзу</div><div class="strack"><div class="sfill" style="width:70%;background:var(--pink);">93</div></div><div class="scount">93</div></div>
+        <div class="srow"><div class="sname">Импульс</div><div class="strack"><div class="sfill" style="width:68%;background:var(--pink);">91</div></div><div class="scount">91</div></div>
+        <div class="srow"><div class="sname">ХП на голову</div><div class="strack"><div class="sfill" style="width:59%;background:var(--pink);">79</div></div><div class="scount">79</div></div>
+        <div class="srow"><div class="sname">Аргоновая плазма</div><div class="strack"><div class="sfill" style="width:45%;background:var(--pink);">60</div></div><div class="scount">60</div></div>
+        <div class="srow"><div class="sname">Кейс &minus;5 кг <span class="tag key">курс</span></div><div class="strack"><div class="sfill" style="width:30%;background:var(--amber);">40</div></div><div class="scount">40</div></div>
+        <div class="srow"><div class="sname">Медовый массаж</div><div class="strack"><div class="sfill" style="width:24%;background:var(--pink);">32</div></div><div class="scount">32</div></div>
+        <div class="srow"><div class="sname">Чистка лица</div><div class="strack"><div class="sfill" style="width:22%;background:var(--pink);">29</div></div><div class="scount">29</div></div>
+        <div class="srow"><div class="sname">Отзыв «Кристина»</div><div class="strack"><div class="sfill" style="width:6%;background:#9CA3AF;">6</div></div><div class="scount">6</div></div>
+        <div class="srow"><div class="sname">Крио <span class="tag dead">отключён</span></div><div class="strack"><div class="sfill" style="width:4%;background:#9CA3AF;">4</div></div><div class="scount">4</div></div>
+      </div>
+      <div class="ev" style="margin-top:16px;background:var(--bg);border-radius:10px;padding:13px 15px;font-size:13.5px;color:#374151;">
+        Трафик идёт на отдельные процедуры — это вход в воронку. Заработок студии — на курсах, и продажа курса целиком ложится на консультацию. Прямо про коррекцию фигуры — только оффер «Кейс &minus;5 кг» (40 из 778, 5%). Пока консультация не конвертирует, связка «дешёвая процедура &rarr; курс» не приносит денег — сколько бы дешёвых заявок ни привёл таргетолог.
+      </div>
+    </div>
+  </div>
+
+  <!-- PROBLEMS -->
+  <div class="section">
+    <div class="section-tag"><div class="num">3</div><h2>Проблемы</h2></div>
+
+    <div class="problem crit">
+      <div class="phead">
+        <span class="badge r">Критично</span>
+        <h3>1. Заявки умирают в середине воронки</h3>
+      </div>
+      <p>Главная дыра. 65% реальных заявок застревают в этапах «Новый» и «Прогрев»: менеджер отвечает один раз и не возвращается. Нет дожима, нет повторных касаний, нет цели довести клиента до записи. «Прогрев» работает не как прогрев, а как кладбище заявок.</p>
+      <div class="ev"><b>Подтверждение:</b> 268 живых заявок зависли в «Прогреве» без движения; многие из них — давно, что исключает версию «ещё в работе».</div>
+    </div>
+
+    <div class="problem crit">
+      <div class="phead">
+        <span class="badge r">Критично</span>
+        <h3>2. Реальные заявки тонут в потоке комментариев</h3>
+      </div>
+      <p>Больше половины «лидов» в CRM — автоподхваченные комментарии под постами. Они попадают в ту же папку, что и живые обращения. Менеджеры реагируют на шум, а горячая заявка ждёт ответа. Скорость первого ответа нестабильна: когда входящие чистые — ответ за считанные минуты и клиент записывается; когда папку забивает поток комментариев — ответ растягивается на часы, и такие заявки почти всегда теряются.</p>
+      <div class="ev"><b>Подтверждение:</b> заявки с прямым намерением купить получали первый ответ спустя много часов — и не возвращались в диалог.</div>
+    </div>
+
+    <div class="problem crit">
+      <div class="phead">
+        <span class="badge r">Критично</span>
+        <h3>3. Управление вслепую</h3>
+      </div>
+      <p>Воронка в CRM не ведётся: этап «Успешно реализовано» давно не заполняется, суммы сделок не вносятся — система показывает ноль продаж и ноль выручки. При этом общее число «лидов» растёт за счёт комментариев и создаёт ложное ощущение, что «заявок много, всё хорошо». Растущая цифра маскирует реальный обвал. Руководитель физически не видит, где утекают деньги.</p>
+      <div class="ev"><b>Подтверждение:</b> в воронке «Успешно реализовано» — 0 сделок за период, поле суммы пустое во всех карточках.</div>
+    </div>
+
+    <div class="problem crit">
+      <div class="phead">
+        <span class="badge r">Критично</span>
+        <h3>4. Реклама и продажи не сведены между собой</h3>
+      </div>
+      <p>Таргетолог отчитывается за «778 заявок по $1.6» и по своей метрике выглядит успешно. Но эта метрика оторвана от денег: она меряет дешёвый клик, а не продажу. Никто не считает цену консультации и цену сделки, никто не сверяет отчёт рекламы с CRM. В итоге на рекламу тратятся деньги, трафик дешёвый — а сквозной картины «реклама → выручка» нет ни у кого.</p>
+      <div class="ev"><b>Подтверждение:</b> 778 заявок по отчёту против 1 287 записей в CRM (53% из них — комментарии); единой системы учёта источников нет.</div>
+    </div>
+
+    <div class="problem minor">
+      <div class="phead">
+        <span class="badge a">Усугубляет</span>
+        <h3>Сопутствующие проблемы</h3>
+      </div>
+      <p style="margin-bottom:10px;"><b>Обработка поверхностная.</b> В директе курс предлагают примерно в 7% диалогов, рассрочку — в 8%. Менеджеры принимают заказ, а не продают: отвечают на вопрос о цене и, получив «нет», прекращают диалог без отработки возражения.</p>
+      <p style="margin-bottom:10px;"><b>Неявка 52%.</b> Половина записавшихся не доходит до студии. Нет системы подтверждения и напоминаний, которая удерживала бы запись.</p>
+      <p style="margin-bottom:10px;"><b>Нет ответственности за заявку.</b> Все каналы открыты всем менеджерам — за скорость ответа и за конкретную заявку не отвечает никто персонально.</p>
+      <p><b>Перепутаны каналы.</b> Один канал фактически обслуживает действующих клиентов и автоматические напоминания, а новые заявки идут другим путём и не мониторятся в реальном времени.</p>
+    </div>
+  </div>
+
+  <!-- DIALOG ANATOMY -->
+  <div class="section">
+    <div class="section-tag"><div class="num">4</div><h2>Разбор переписок: почему лид умирает</h2></div>
+
+    <div class="verdict">
+      <span class="big">Цифры показывают, ЧТО 65% не доходят. Переписки показывают ПОЧЕМУ.</span>
+      <p>Прочитаны десятки диалогов из этапа «Прогрев» и классифицирован 91 разговор. Вывод оказался неожиданным: отдел продаж <strong>не игнорирует</strong> заявки — он пишет много. Но пишет так, что тёплый клиент остывает.</p>
+    </div>
+
+    <div class="panel" style="margin-top:18px;">
+      <h3>Сначала — чего НЕ происходит</h3>
+      <div class="sub">Версия «менеджеры ленятся и не отвечают» данными опровергнута.</div>
+      <div class="statline">
+        <div class="si"><div class="sv">1 / 91</div><div class="sl">Диалогов осталось вообще без ответа — отвечают почти всем</div></div>
+        <div class="si"><div class="sv">65%</div><div class="sl">Диалогов с дожимом — 2+ касания после того, как клиент замолчал</div></div>
+        <div class="si"><div class="sv">78%</div><div class="sl">Диалогов, где студия предлагает записаться</div></div>
+        <div class="si"><div class="sv">80%</div><div class="sl">Спросивших цену получили конкретное число</div></div>
+      </div>
+      <div class="ev" style="margin-top:16px;background:var(--bg);border-radius:10px;padding:13px 15px;font-size:13.5px;color:#374151;">
+        Отдел не бездействует — он отвечает, называет цену, делает дожим. Значит, нанять «руки» или просто «заставить отвечать» проблему не решит. Дело в <b>качестве разговора</b>.
+      </div>
+    </div>
+
+    <h3 style="font-family:'Unbounded',sans-serif;font-size:17px;margin:28px 0 14px;">Четыре точки, где обрывается диалог</h3>
+
+    <div class="bp">
+      <div class="bphead"><div class="bpnum">1</div><h3>Медленный первый ответ</h3></div>
+      <p>Клиент пишет вечером, горячий — а ответ получает только на следующее утро. К этому моменту интерес остыл, а часто человек уже ушёл к конкуренту.</p>
+      <div class="chat">
+        <div class="bub cl"><span class="bt">Клиент · вечер</span>Здравствуйте! Хочу записаться на процедуру аргоновая плазма. Можно подробнее?</div>
+        <div class="gap">первый ответ через 14 часов</div>
+        <div class="bub st"><span class="bt">Студия · утром</span>Добрый день 💐 Меня зовут [имя], я ваш персональный менеджер…</div>
+        <div class="dead">клиент больше не ответил</div>
+      </div>
+    </div>
+
+    <div class="bp">
+      <div class="bphead"><div class="bpnum">2</div><h3>Скрипт не слышит, что сказал клиент</h3></div>
+      <p>Человек пишет конкретно и уже готов записаться. В ответ — шаблонный допрос, как для холодного лида. Готового клиента заставляют проходить онбординг с нуля — и теряют.</p>
+      <div class="chat">
+        <div class="bub cl"><span class="bt">Клиент</span>Здравствуйте! Хочу записаться на процедуру индиба.</div>
+        <div class="bub st"><span class="bt">Студия</span>Подскажите, что вы хотите улучшить в своём теле? 🤗</div>
+        <div class="bub st"><span class="bt">Студия</span>Мы в городе Алматы, а вы? 🤗</div>
+        <div class="dead">клиент больше не ответил — хотя ответ студии пришёл за 12 минут</div>
+      </div>
+    </div>
+
+    <div class="bp">
+      <div class="bphead"><div class="bpnum">3</div><h3>Сомнения не отрабатывают — просто переспрашивают про дату</h3></div>
+      <p>Это ядро проблемы. Клиент подаёт сигнал сомнения — менеджер его не замечает и снова спрашивает «когда вас записать?». Реальный блокер клиента так и остаётся нетронутым.</p>
+      <div class="chat">
+        <div class="bub cl"><span class="bt">Клиент</span>12 000 — это только первое посещение?</div>
+        <div class="bub st"><span class="bt">Студия</span>Да, всё верно. Далее сможете зайти в комплексную программу по вашему запросу 🙏</div>
+        <div class="bub st"><span class="bt">Студия</span>Подскажите, в какой день запишем вас? 😇</div>
+        <div class="dead">тревога клиента про итоговую стоимость не снята — клиент замолчал</div>
+      </div>
+    </div>
+
+    <div class="bp">
+      <div class="bphead"><div class="bpnum">4</div><h3>Дожим пустой</h3></div>
+      <p>Follow-up формально есть, но это «вы ещё актуальны?» без единого нового аргумента — ни результата, ни оффера, ни ответа на сомнение. На такое сообщение легко ответить отказом.</p>
+      <div class="chat">
+        <div class="bub st"><span class="bt">Студия</span>Возможно, наш диалог затерялся 😇 Подскажите, актуальна ли запись?</div>
+        <div class="bub st"><span class="bt">Студия · позже</span>Мы с вами немного потерялись в диалоге. Актуален ли вопрос записи?</div>
+        <div class="bub cl"><span class="bt">Клиент</span>Не актуально</div>
+      </div>
+    </div>
+
+    <div class="bp win">
+      <div class="bphead"><div class="bpnum">&#10003;</div><h3>А как выглядит то, что работает</h3></div>
+      <p>Единственная конверсия из детально разобранных: быстрый ответ, живой разговор по сути вопросов клиента и — главное — конкретные окна времени вместо размытого «когда вам удобно?».</p>
+      <div class="chat">
+        <div class="bub cl"><span class="bt">Клиент</span>Добрый день! Мне 75 лет, можно такую процедуру получить?</div>
+        <div class="bub st"><span class="bt">Студия · через 4 минуты</span>Добрый день, [имя] 💐 Меня зовут [имя], я ваш персональный менеджер. Прекрасный выбор 😊</div>
+        <div class="bub st"><span class="bt">Студия</span>На ближайшую дату есть свободное время: 15:00, 16:00, 17:00, 20:00. Какое запишем за вами? 🤗</div>
+        <div class="bub cl"><span class="bt">Клиент</span>На 17:00. Спасибо, до встречи!</div>
+      </div>
+    </div>
+
+    <div class="verdict" style="border-left-color:var(--dark);margin-top:20px;">
+      <span class="big">Вывод: отдел продаж не продаёт — он обрабатывает заявки по скрипту.</span>
+      <p>Тёплый человек, который сам написал «хочу записаться», умирает не потому, что передумал, — а потому что с ним не случилось быстрого, живого, убедительного разговора, который отвечает на заданный вопрос, снимает одно конкретное сомнение и фиксирует точные дату и время. Лиды нормальные — ломается разговор.</p>
+    </div>
+  </div>
+
+  <!-- STRATEGY -->
+  <div class="section">
+    <div class="section-tag"><div class="num">5</div><h2>Стратегия</h2></div>
+
+    <div class="strat">
+      <div class="shead">
+        <span class="pri p1">Приоритет 1</span>
+        <div><h3>Остановить потери</h3><div class="saim">Быстрые шаги с наибольшей отдачей — внедрять первыми</div></div>
+      </div>
+      <ul class="steps">
+        <li><span><b>Отделить комментарии от реальных заявок.</b> Настроить фильтр или отдельный тег, чтобы менеджеры видели живые обращения, а не общую кучу из шума.</span></li>
+        <li><span><b>Разобрать накопленный завал.</b> Поднять каждую заявку из «Нового этапа» и «Прогрева», написать или позвонить — часть тёплых клиентов ещё можно вернуть. Распределить пул между менеджерами.</span></li>
+        <li><span><b>Назначить дежурного на быстрый ответ</b> — в том числе в вечерние часы, когда приходит много заявок. Ни одно новое обращение не должно ждать.</span></li>
+        <li><span><b>Не наращивать рекламный бюджет,</b> пока не починен отдел продаж. Сейчас больше трафика = больше брошенных заявок. Деньги на рекламу — только после того, как воронка начнёт конвертировать.</span></li>
+      </ul>
+    </div>
+
+    <div class="strat">
+      <div class="shead">
+        <span class="pri p2">Приоритет 2</span>
+        <div><h3>Починить процесс</h3><div class="saim">Правила, которые не дадут проблеме вернуться</div></div>
+      </div>
+      <ul class="steps">
+        <li><span><b>SLA на скорость ответа.</b> Норматив: первый ответ новой заявке — за считанные минуты. Замерять ежедневно.</span></li>
+        <li><span><b>Правило работы с «Прогревом».</b> Заявка не может лежать без касания. Чёткий алгоритм: серия касаний — и либо запись на консультацию, либо закрытие с указанием причины. «Тихие» зависшие заявки запрещены.</span></li>
+        <li><span><b>Цель каждого диалога — запись на бесплатную консультацию,</b> а не просто ответ на вопрос. Менеджер обязан предложить конкретные дату и время.</span></li>
+        <li><span><b>Вернуть ведение воронки.</b> Каждая заявка двигается по этапам; при продаже заполняются этап «Успешно реализовано» и сумма сделки. Без этого управление невозможно.</span></li>
+        <li><span><b>Подтверждение и напоминание о записи</b> (автоматическое) — чтобы убрать неявку с её текущих 52%.</span></li>
+      </ul>
+    </div>
+
+    <div class="strat">
+      <div class="shead">
+        <span class="pri p3">Приоритет 3</span>
+        <div><h3>Сделать управляемым</h3><div class="saim">Прозрачность, личная ответственность, связка реклама–продажи</div></div>
+      </div>
+      <ul class="steps">
+        <li><span><b>Регулярный отчёт для руководителя:</b> реальные заявки (без комментариев), скорость ответа, конверсия «заявка → запись → визит → продажа» — отдельно по каждому менеджеру.</span></li>
+        <li><span><b>Закрепление заявки за ответственным менеджером.</b> Уйти от модели «видят все — не отвечает никто».</span></li>
+        <li><span><b>Скрипт продаж вместо приёма заказов:</b> квалификация запроса → предложение курса → цена и рассрочка → отработка возражений → запись.</span></li>
+        <li><span><b>Сменить KPI таргетолога.</b> Оценивать не по «цене заявки», а по цене записи на консультацию и цене продажи. Отчёт рекламы обязательно сверять с CRM — сейчас они считают разные вещи.</span></li>
+        <li><span><b>Сквозная аналитика по источникам.</b> Каждая заявка помечается кампанией и оффером, чтобы видеть, какая реклама приносит деньги, а не клики.</span></li>
+        <li><span><b>Конвертация комментаторов в директ.</b> Поток комментариев — это тёплая аудитория; на каждый комментарий — приглашение продолжить в личных сообщениях.</span></li>
+      </ul>
+    </div>
+
+    <div class="strat">
+      <div class="shead">
+        <span class="pri p4">Приоритет 4</span>
+        <div><h3>Закрепить системно и масштабировать</h3><div class="saim">Чтобы провал не повторился, а рост стал управляемым</div></div>
+      </div>
+      <ul class="steps">
+        <li><span><b>Еженедельный разбор воронки руководителем</b> — по цифрам, а не по ощущениям.</span></li>
+        <li><span><b>Автоматический контроль</b> скорости ответа и качества диалогов; разбор переписок и подсветка слабых мест.</span></li>
+        <li><span><b>Тестировать офферы под курс,</b> а не только разовые процедуры — чтобы привлекать клиентов, изначально готовых к коррекции фигуры.</span></li>
+        <li><span><b>Только после починки продаж — масштабировать рекламу.</b> При цене заявки $1.6 дешёвый трафик станет главным рычагом роста — но лишь когда отдел продаж сможет его переварить.</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- PRIZE -->
+  <div class="prize">
+    <span class="ptag">Потенциал</span>
+    <h3>Деньги уже в воронке. Их нужно не привлечь, а перестать терять.</h3>
+    <p>Поток заявок достаточный и уже оплачен — реклама свою работу сделала за $1 273. Если поднять конверсию «заявка → консультация» с текущих 7% до нормальных для индустрии красоты 20–25%, число консультаций вырастет в 3–4 раза — а вместе с ним и продажи. Без единого дополнительного тенге на рекламу.</p>
+    <div class="nums">
+      <div><div class="n">×3–4</div><div class="c">рост консультаций при той же рекламе</div></div>
+      <div><div class="n">7% → 25%</div><div class="c">целевая конверсия в консультацию</div></div>
+      <div><div class="n">~5 → 15–20 млн</div><div class="c">реалистичный ориентир по выручке</div></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    Аудит подготовлен на основе данных CRM Message, анализа переписок отдела продаж и отчёта по рекламе M&M Fabrica.<br>
+    Документ предназначен для внутреннего использования.
+  </div>
+
+</div>
+</body>
+</html>

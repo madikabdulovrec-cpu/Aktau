@@ -1,0 +1,32 @@
+# Wrangler config для деплоя Worker'а mm-bot через CLI.
+# Если установлен wrangler (npm i -g wrangler), деплой одной командой:
+#   wrangler deploy --config worker/wrangler-mm-bot.toml
+#
+# Альтернативно — создать Worker вручную через Cloudflare Dashboard и
+# вставить содержимое mm-bot.js (большой файл — вставлять через clipboard целиком).
+
+name = "mm-bot"
+main = "mm-bot.js"
+compatibility_date = "2025-05-01"
+account_id = "650cb2300c9e29301178d3e5998be3b4"
+
+# KV namespace — история диалогов, дедуп webhook, карточки лидов.
+# Создать заранее: dashboard.cloudflare.com → Workers & Pages → KV → Create namespace "mm-bot-kv".
+# Затем подставить сюда его id (показывается после создания).
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "729a6c1778f24eaf82b875a8bfea9987"
+
+# Plaintext переменные (НЕ секреты).
+[vars]
+ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
+MANAGER_CHAT_ID = "77003131515"         # номер менеджера для handoff-уведомлений
+MANAGER_CHAT_TYPE = "whatsapp"
+
+# Секреты ставятся отдельными командами (не хранятся в этом файле):
+#   wrangler secret put ANTHROPIC_API_KEY --config worker/wrangler-mm-bot.toml
+#   wrangler secret put WAZZUP_API_KEY    --config worker/wrangler-mm-bot.toml
+#   wrangler secret put WEBHOOK_SECRET    --config worker/wrangler-mm-bot.toml
+#
+# После деплоя webhook-URL для Wazzup24:
+#   https://mm-bot.<your-subdomain>.workers.dev/?secret=<WEBHOOK_SECRET>

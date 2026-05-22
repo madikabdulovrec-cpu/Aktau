@@ -1,0 +1,37 @@
+# Wrangler config для деплоя Worker'а mh-bot — бот первичной обработки заявок
+# M&M Fabrica, интеграция с message.help.
+#
+# Деплой:  wrangler deploy --config worker/wrangler-mh-bot.toml
+# Полная инструкция:  worker/MH_BOT_SETUP.md
+
+name = "mh-bot"
+main = "mh-bot.js"
+compatibility_date = "2025-05-01"
+account_id = "650cb2300c9e29301178d3e5998be3b4"
+
+# KV namespace — история диалогов, дедуп, кэш токена/слотов, карточки лидов.
+# Ниже — id существующего mm-bot-kv: его можно переиспользовать (прототип Wazzup
+# отключён). Либо создать новый:  wrangler kv namespace create mh-bot-kv
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "729a6c1778f24eaf82b875a8bfea9987"
+
+# Plaintext-переменные (НЕ секреты). Заполнить перед деплоем.
+[vars]
+ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
+MH_PROJECT_ID = "220763"                # id проекта message.help — ПОДТВЕРДИТЬ
+MH_CHANNEL_UUID = ""                    # uuid WhatsApp-канала message.help — ЗАПОЛНИТЬ
+MANAGER_OPERATOR_ID = ""                # id оператора-менеджера message.help (опц.)
+ALTEGIO_COMPANY_ID = ""                 # id филиала Altegio (опц. — гейт и слоты)
+ALTEGIO_CONSULT_SERVICE_ID = ""         # id услуги-консультации Altegio (опц. — слоты)
+
+# Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
+#   wrangler secret put ANTHROPIC_API_KEY     --config worker/wrangler-mh-bot.toml
+#   wrangler secret put MH_LOGIN              --config worker/wrangler-mh-bot.toml
+#   wrangler secret put MH_PASSWORD           --config worker/wrangler-mh-bot.toml
+#   wrangler secret put WEBHOOK_SECRET        --config worker/wrangler-mh-bot.toml
+#   wrangler secret put ALTEGIO_PARTNER_TOKEN --config worker/wrangler-mh-bot.toml  (опц.)
+#   wrangler secret put ALTEGIO_USER_TOKEN    --config worker/wrangler-mh-bot.toml  (опц.)
+#
+# После деплоя URL вебхука для message.help:
+#   https://mh-bot.<account>.workers.dev/?secret=<WEBHOOK_SECRET>
