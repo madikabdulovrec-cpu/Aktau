@@ -1,0 +1,41 @@
+# Wrangler config — Worker «Пульс продаж» M&M Fabrica.
+# Cron-дайджест «как идут продажи» в рабочий чат отдела + приём вебхука message.help.
+#
+# Деплой:  wrangler deploy --config worker/wrangler-mm-pulse-bot.toml
+# Полная инструкция:  worker/MM_PULSE_BOT_SETUP.md
+
+name = "mm-pulse-bot"
+main = "mm-pulse-bot.js"
+compatibility_date = "2025-05-01"
+account_id = "650cb2300c9e29301178d3e5998be3b4"
+
+# Cron — Cloudflare использует UTC. Алматы = UTC+5, перевода часов в Казахстане нет.
+# 3,6,9,12,15 UTC = 08:00 / 11:00 / 14:00 / 17:00 / 20:00 Алматы. Студия работает 7 дней.
+[triggers]
+crons = ["0 3,6,9,12,15 * * *"]
+
+# KV namespace — бакеты событий дня (events:YYYY-MM-DD) + кэш токена message.help.
+# ЗАПОЛНИТЬ id перед деплоем:  wrangler kv namespace create mm-pulse-kv
+[[kv_namespaces]]
+binding = "PULSE_KV"
+id = ""
+
+# Plaintext-переменные (НЕ секреты). Заполнить перед деплоем.
+[vars]
+ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
+MH_PROJECT_ID = "220763"                # id проекта message.help — ПОДТВЕРДИТЬ
+TELEGRAM_CHAT_ID = ""                   # id рабочего чата отдела (для группы отрицательный, -100…)
+UNANSWERED_THRESHOLD_MIN = "20"         # порог «без ответа сейчас», мин
+
+# Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
+#   wrangler secret put ANTHROPIC_API_KEY  --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put TELEGRAM_BOT_TOKEN --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put DIGEST_SECRET      --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put WEBHOOK_SECRET     --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put MH_LOGIN           --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put MH_PASSWORD        --config worker/wrangler-mm-pulse-bot.toml
+#
+# После деплоя:
+#   вебхук для message.help —  https://mm-pulse-bot.<account>.workers.dev/?secret=<WEBHOOK_SECRET>
+#   ручной триггер дайджеста — https://mm-pulse-bot.<account>.workers.dev/?secret=<DIGEST_SECRET>
+#   регистрация вебхука —      https://mm-pulse-bot.<account>.workers.dev/?register=<DIGEST_SECRET>

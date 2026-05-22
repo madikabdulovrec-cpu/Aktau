@@ -73,13 +73,36 @@ WhatsApp → бот мгновенно отвечает, доводит до з�
 - `contact_by_phone` — поле `id` контакта;
 - Altegio: `clients/search`, `book_dates`/`book_times`, id услуги-консультации.
 
+## Второй бот — «Пульс продаж» (`mm-pulse-bot`)
+
+Отдельный Cloudflare Worker: каждые 3 часа (08/11/14/17/20 Алматы) шлёт в рабочий
+чат отдела продаж сводку «как идут продажи» — сколько заявок, скорость первого
+ответа, что висит без ответа сейчас, 1–2 действия голосом РОП. Вечерний отчёт
+продажника не заменяет — добавляет объективную картину по цифрам. ТЗ —
+`docs/sales/TASK_pulse_bot.md`.
+
+Архитектура — ветка B1: свой вебхук `channel.message` в message.help, накопление
+событий дня в KV (`events:YYYY-MM-DD`), cron-дайджест считает метрики кодом и зовёт
+персону РОП (`04_sales_lead_ai_persona.md`) за блоком «на что смотреть». От деплоя
+`mh-bot` не зависит (исключение — фоллбэк B2, если message.help не даст второй
+вебхук, — см. `MM_PULSE_BOT_SETUP.md`).
+
+Код, конфиг, инструкция: `worker/mm-pulse-bot.js`, `worker/wrangler-mm-pulse-bot.toml`,
+`worker/MM_PULSE_BOT_SETUP.md`. Синтаксис проверен (`node --check`), в проде не
+тестировался. Деплой по `MM_PULSE_BOT_SETUP.md` — нужны Telegram-бот и chat_id,
+доступы Cloudflare и message.help.
+
 ## Ключевые файлы
 
 | Файл | Что это |
 |---|---|
-| `worker/mh-bot.js` | Код бота |
-| `worker/MH_BOT_SETUP.md` | Инструкция деплоя |
-| `worker/wrangler-mh-bot.toml` | Конфиг деплоя |
+| `worker/mh-bot.js` | Код бота первичной обработки заявок |
+| `worker/MH_BOT_SETUP.md` | Инструкция деплоя `mh-bot` |
+| `worker/wrangler-mh-bot.toml` | Конфиг деплоя `mh-bot` |
+| `worker/mm-pulse-bot.js` | Код бота «Пульс продаж» |
+| `worker/MM_PULSE_BOT_SETUP.md` | Инструкция деплоя `mm-pulse-bot` |
+| `worker/wrangler-mm-pulse-bot.toml` | Конфиг деплоя `mm-pulse-bot` |
+| `docs/sales/TASK_pulse_bot.md` | ТЗ бота «Пульс продаж» |
 | `docs/sales/05_bot_system_prompt.md` | Системный промпт бота |
 | `docs/sales/Для бота.md` | Бриф и факты о студии |
 | `docs/sales/audit.html` | Аудит отдела продаж (зачем бот) |

@@ -26,13 +26,13 @@
 
 ## Код бота
 
-Реализация бота первичной обработки заявок (платформа — Wazzup24):
+Два бота в `worker/`. Точка входа для работы над ними — [HANDOFF.md](HANDOFF.md).
 
 | Файл | Что внутри |
 |---|---|
-| [`/worker/mm-bot.js`](../../worker/mm-bot.js) | Cloudflare Worker: Wazzup24 webhook → Claude API (prompt caching) → ответ. История диалогов в KV, теги `[[BOOKING]]`/`[[HANDOFF]]`, handoff менеджеру |
-| [`/worker/wrangler-mm-bot.toml`](../../worker/wrangler-mm-bot.toml) | Конфиг деплоя Worker |
-| [`/worker/BOT_SETUP.md`](../../worker/BOT_SETUP.md) | Пошаговая инструкция развёртывания |
+| [`/worker/mh-bot.js`](../../worker/mh-bot.js) | Бот первичной обработки заявок: message.help (WhatsApp) → Claude API → ответ клиенту. Деплой — [`MH_BOT_SETUP.md`](../../worker/MH_BOT_SETUP.md) |
+| [`/worker/mm-pulse-bot.js`](../../worker/mm-pulse-bot.js) | Бот «Пульс продаж»: cron каждые 3 часа шлёт в чат отдела сводку по продажам дня. Деплой — [`MM_PULSE_BOT_SETUP.md`](../../worker/MM_PULSE_BOT_SETUP.md), ТЗ — [`TASK_pulse_bot.md`](TASK_pulse_bot.md) |
+| [`/worker/mm-bot.js`](../../worker/mm-bot.js) | Legacy-прототип на Wazzup24 — отброшен, оставлен как история |
 
 ## Открытые вопросы к пользователю
 
