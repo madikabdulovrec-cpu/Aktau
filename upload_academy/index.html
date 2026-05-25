@@ -3181,23 +3181,23 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
     <div class="rating-stats-grid">
       <div class="rs-card rs-pink">
         <div class="rs-num" id="rsCompleted">0</div>
-        <div class="rs-label">Уроков пройдено</div>
+        <div class="rs-label" id="rsCompletedLabel">Уроков пройдено</div>
         <div class="rs-sub" id="rsCompletedSub">из 86</div>
       </div>
       <div class="rs-card rs-yellow">
         <div class="rs-num" id="rsAvg">—</div>
-        <div class="rs-label">Средняя оценка</div>
+        <div class="rs-label" id="rsAvgLabel">Средняя оценка</div>
         <div class="rs-sub" id="rsAvgSub">по оценённым</div>
       </div>
       <div class="rs-card rs-blue">
         <div class="rs-num" id="rsStreak">0</div>
-        <div class="rs-label">Подряд</div>
-        <div class="rs-sub">без пропусков</div>
+        <div class="rs-label" id="rsStreakLabel">Подряд</div>
+        <div class="rs-sub" id="rsStreakSub">без пропусков</div>
       </div>
       <div class="rs-card rs-green">
         <div class="rs-num" id="rsPending">0</div>
-        <div class="rs-label">На проверке</div>
-        <div class="rs-sub">у куратора</div>
+        <div class="rs-label" id="rsPendingLabel">На проверке</div>
+        <div class="rs-sub" id="rsPendingSub">у куратора</div>
       </div>
     </div>
 
@@ -11487,62 +11487,157 @@ function renderRating() {
   // ===== Key stats =====
   var totalLessons = (typeof TOTAL_LESSONS !== 'undefined') ? TOTAL_LESSONS : 86;
   var scores = state.scores || [];
-  // Профиль-корректный подсчёт: считаем только уроки, входящие в программу стажёра
-  var profReq = 0, profDone = 0;
-  if (!state.isAdmin) {
+
+  if (state.isAdmin) {
+    // ===== АДМИН: АГРЕГАЦИЯ ПО ВСЕМ СТАЖЁРАМ =====
+    // Раньше для админа все цифры были 0/—, потому что считались по state.scores
+    // (а у админа этот массив пустой). Теперь куратор видит реальные общие данные.
+    var totalGradeSum = 0, totalGradeCount = 0;
+    var totalCompleted = 0;
+    var totalPending = 0;
+    var activeInterns = 0;     // тех, у кого > 0 оценок
+    var totalProgressPct = 0;
+    var internsCount = INTERNS.length;
+
+    for (var k = 0; k < internsCount; k++) {
+      var it = INTERNS[k];
+      var sc = it.scores || [];
+      var ig = sc.filter(function(s){ return s > 0; });
+      totalGradeSum += ig.reduce(function(a,b){return a+b;}, 0);
+      totalGradeCount += ig.length;
+      // Прогресс — только по урокам внутри профиля стажёра
+      var prf = (it.profile === 'manual') ? 'manual' : 'medical';
+      var reqI = 0, doneI = 0;
+      for (var li = 0; li < totalLessons; li++) {
+        var inProf = (prf === 'manual') ? (CATEGORY_MAP[li] === 1 || CATEGORY_MAP[li] === 4) : true;
+        if (inProf) {
+          reqI++;
+          if (sc[li] > 0) doneI++;
+        }
+      }
+      totalCompleted += doneI;
+      totalProgressPct += reqI ? (doneI / reqI * 100) : 0;
+      if (ig.length > 0) activeInterns++;
+      totalPending += (it.pendingDays || []).length;
+    }
+
+    var aggAvg = totalGradeCount ? (totalGradeSum / totalGradeCount) : 0;
+    var aggPct = internsCount ? Math.round(totalProgressPct / internsCount) : 0;
+
+    document.getElementById('rsCompleted').textContent = totalCompleted;
+    document.getElementById('rsCompletedLabel').textContent = 'Сдано уроков';
+    document.getElementById('rsCompletedSub').textContent = 'всего по всем стажёрам';
+    document.getElementById('rsAvg').textContent = totalGradeCount ? aggAvg.toFixed(1) : '—';
+    document.getElementById('rsAvgLabel').textContent = 'Средняя оценка';
+    document.getElementById('rsAvgSub').textContent = totalGradeCount ? ('по ' + totalGradeCount + ' оцен.') : 'оценок ещё нет';
+    document.getElementById('rsStreak').textContent = activeInterns;
+    document.getElementById('rsStreakLabel').textContent = 'Активных';
+    document.getElementById('rsStreakSub').textContent = 'стажёров (с прогрессом)';
+    document.getElementById('rsPending').textContent = totalPending;
+    document.getElementById('rsPendingLabel').textContent = 'На проверке';
+    document.getElementById('rsPendingSub').textContent = 'заданий всего';
+
+    document.getElementById('overallPct').textContent = aggPct + '%';
+    document.getElementById('overallFill').style.width = aggPct + '%';
+    document.getElementById('overallMeta').textContent = activeInterns + ' активных из ' + internsCount + ' стажёров · средний прогресс ' + aggPct + '%';
+
+    // ===== Категории: средний % завершения по всем стажёрам =====
+    var catsHtml = '';
+    if (typeof CATEGORIES !== 'undefined') {
+      catsHtml = CATEGORIES.map(function(cat) {
+        // Сумма % завершения категории по всем стажёрам, у которых она в профиле
+        var sumPct = 0, count = 0, totalDone = 0, totalTotal = 0;
+        INTERNS.forEach(function(it) {
+          var prf = (it.profile === 'manual') ? 'manual' : 'medical';
+          var inProf = (prf === 'manual') ? (cat.id === 1 || cat.id === 4) : true;
+          if (!inProf) return;
+          var t = 0, d = 0;
+          for (var li = 0; li < totalLessons; li++) {
+            if (CATEGORY_MAP[li] === cat.id) {
+              t++;
+              if ((it.scores || [])[li] > 0) d++;
+            }
+          }
+          if (t > 0) {
+            sumPct += d / t * 100;
+            count++;
+            totalDone += d;
+            totalTotal += t;
+          }
+        });
+        var cpct = count ? Math.round(sumPct / count) : 0;
+        return '<div class="rating-cat-row" style="--cc:' + cat.color + ';">' +
+          '<div class="rating-cat-icon" style="background:' + cat.color + ';">' + cat.icon + '</div>' +
+          '<div class="rating-cat-info">' +
+            '<div class="rating-cat-name">Кат. ' + cat.id + ' — ' + cat.name + '</div>' +
+            '<div class="rating-cat-bar"><div class="rating-cat-bar-fill" style="width:' + cpct + '%;"></div></div>' +
+          '</div>' +
+          '<div class="rating-cat-pct">' + cpct + '%<small>ср. по ' + count + ' стажёр.</small></div>' +
+        '</div>';
+      }).join('');
+    }
+    document.getElementById('ratingCats').innerHTML = catsHtml || '<div class="rating-fb-empty">Нет данных о категориях</div>';
+  } else {
+    // ===== СТАЖЁР: индивидуальная статистика =====
+    var profReq = 0, profDone = 0;
     for (var ri = 0; ri < totalLessons; ri++) {
       if (isCategoryInProfile(CATEGORY_MAP[ri])) {
         profReq++;
         if (scores[ri] > 0) profDone++;
       }
     }
+    var completed = profDone;
+    var requiredTotal = profReq;
+
+    var graded = scores.filter(function(s){ return s > 0; });
+    var avg = graded.length ? (graded.reduce(function(a,b){return a+b;}, 0) / graded.length) : 0;
+    var pendingArr = state.pendingReview || [];
+    var pendingCnt = pendingArr.filter(function(p){ return p; }).length;
+    var streak = state.streak || 0;
+
+    document.getElementById('rsCompleted').textContent = completed;
+    document.getElementById('rsCompletedLabel').textContent = 'Уроков пройдено';
+    document.getElementById('rsCompletedSub').textContent = 'из ' + requiredTotal + (state.profile === 'manual' ? ' (профиль)' : '');
+    document.getElementById('rsAvg').textContent = graded.length ? avg.toFixed(1) : '—';
+    document.getElementById('rsAvgLabel').textContent = 'Средняя оценка';
+    document.getElementById('rsAvgSub').textContent = graded.length ? 'по ' + graded.length + ' оцен.' : 'нет оценок';
+    document.getElementById('rsStreak').textContent = streak;
+    document.getElementById('rsStreakLabel').textContent = 'Подряд';
+    document.getElementById('rsStreakSub').textContent = 'без пропусков';
+    document.getElementById('rsPending').textContent = pendingCnt;
+    document.getElementById('rsPendingLabel').textContent = 'На проверке';
+    document.getElementById('rsPendingSub').textContent = 'у куратора';
+
+    var pct = requiredTotal ? Math.round(completed / requiredTotal * 100) : 0;
+    document.getElementById('overallPct').textContent = pct + '%';
+    document.getElementById('overallFill').style.width = pct + '%';
+    document.getElementById('overallMeta').textContent = completed + ' из ' + requiredTotal + ' уроков пройдено' + (state.profile === 'manual' ? ' (ручной мастер)' : '');
+
+    // ===== Category progress — только категории профиля =====
+    var catsHtml2 = '';
+    if (typeof CATEGORIES !== 'undefined') {
+      var isManual2 = (getCurrentProfile() === 'manual');
+      var visibleCatsR = isManual2
+        ? CATEGORIES.filter(function(c){ return c.id === 1 || c.id === 4; })
+        : CATEGORIES.slice();
+
+      catsHtml2 = visibleCatsR.map(function(cat, di) {
+        var cs = getCategoryStats(cat.id);
+        var cpct = cs.total ? Math.round(cs.done / cs.total * 100) : 0;
+        var displayNum = isManual2 ? (di + 1) : cat.id;
+        var numLabel = isManual2 ? 'Этап' : 'Кат.';
+        return '<div class="rating-cat-row" style="--cc:' + cat.color + ';">' +
+          '<div class="rating-cat-icon" style="background:' + cat.color + ';">' + cat.icon + '</div>' +
+          '<div class="rating-cat-info">' +
+            '<div class="rating-cat-name">' + numLabel + ' ' + displayNum + ' — ' + cat.name + '</div>' +
+            '<div class="rating-cat-bar"><div class="rating-cat-bar-fill" style="width:' + cpct + '%;"></div></div>' +
+          '</div>' +
+          '<div class="rating-cat-pct">' + cpct + '%<small>' + cs.done + '/' + cs.total + '</small></div>' +
+        '</div>';
+      }).join('');
+    }
+    document.getElementById('ratingCats').innerHTML = catsHtml2 || '<div class="rating-fb-empty">Нет данных о категориях</div>';
   }
-  var completed = state.isAdmin ? 0 : profDone;
-  var requiredTotal = state.isAdmin ? totalLessons : profReq;
-
-  var graded = scores.filter(function(s){ return s > 0; });
-  var avg = graded.length ? (graded.reduce(function(a,b){return a+b;}, 0) / graded.length) : 0;
-  var pendingArr = state.pendingReview || [];
-  var pendingCnt = pendingArr.filter(function(p){ return p; }).length;
-  var streak = state.streak || 0;
-
-  document.getElementById('rsCompleted').textContent = completed;
-  document.getElementById('rsCompletedSub').textContent = 'из ' + requiredTotal + (state.profile === 'manual' ? ' (профиль)' : '');
-  document.getElementById('rsAvg').textContent = graded.length ? avg.toFixed(1) : '—';
-  document.getElementById('rsAvgSub').textContent = graded.length ? 'по ' + graded.length + ' оцен.' : 'нет оценок';
-  document.getElementById('rsStreak').textContent = streak;
-  document.getElementById('rsPending').textContent = pendingCnt;
-
-  // ===== Overall progress =====
-  var pct = requiredTotal ? Math.round(completed / requiredTotal * 100) : 0;
-  document.getElementById('overallPct').textContent = pct + '%';
-  document.getElementById('overallFill').style.width = pct + '%';
-  document.getElementById('overallMeta').textContent = completed + ' из ' + requiredTotal + ' уроков пройдено' + (state.profile === 'manual' ? ' (ручной мастер)' : '');
-
-  // ===== Category progress — показываем только те категории, что входят в программу =====
-  var catsHtml = '';
-  if (typeof CATEGORIES !== 'undefined') {
-    var isManual2 = (getCurrentProfile() === 'manual') && !state.isAdmin;
-    var visibleCatsR = isManual2
-      ? CATEGORIES.filter(function(c){ return c.id === 1 || c.id === 4; })
-      : CATEGORIES.slice();
-
-    catsHtml = visibleCatsR.map(function(cat, di) {
-      var cs = getCategoryStats(cat.id);
-      var cpct = cs.total ? Math.round(cs.done / cs.total * 100) : 0;
-      var displayNum = isManual2 ? (di + 1) : cat.id;
-      var numLabel = isManual2 ? 'Этап' : 'Кат.';
-      return '<div class="rating-cat-row" style="--cc:' + cat.color + ';">' +
-        '<div class="rating-cat-icon" style="background:' + cat.color + ';">' + cat.icon + '</div>' +
-        '<div class="rating-cat-info">' +
-          '<div class="rating-cat-name">' + numLabel + ' ' + displayNum + ' — ' + cat.name + '</div>' +
-          '<div class="rating-cat-bar"><div class="rating-cat-bar-fill" style="width:' + cpct + '%;"></div></div>' +
-        '</div>' +
-        '<div class="rating-cat-pct">' + cpct + '%<small>' + cs.done + '/' + cs.total + '</small></div>' +
-      '</div>';
-    }).join('');
-  }
-  document.getElementById('ratingCats').innerHTML = catsHtml || '<div class="rating-fb-empty">Нет данных о категориях</div>';
 
   // ===== Curator feedback list =====
   var fbHtml = '';
