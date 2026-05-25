@@ -12,12 +12,27 @@
 
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
+html, body {
+  /* Глобальная защита от горизонтального скролла на мобильных:
+     один широкий блок (картинка, таблица, длинный текст без переноса)
+     раздувал viewport и страницу можно было сдвинуть вправо.
+     Зажимаем максимальную ширину и режем overflow на обоих уровнях. */
+  max-width: 100vw;
+  overflow-x: hidden;
+}
 body {
   font-family:'Space Grotesk',sans-serif;
   background:#EDF4FC;
   color:#1A1A1A;
   min-height:100vh;
-  overflow-x:hidden;
+}
+/* Все длинные слова (особенно в текстах уроков) переносятся, чтобы не
+   раздвигать страницу. */
+img, video, iframe { max-width: 100%; height: auto; }
+table { max-width: 100%; }
+pre, code { white-space: pre-wrap; word-break: break-word; }
+.lesson-text, .ltc-body, .lesson-item-desc, .cat-lesson-desc {
+  overflow-wrap: anywhere; word-break: break-word;
 }
 :root {
   --yellow: #FFE600;
