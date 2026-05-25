@@ -180,6 +180,11 @@ const OPERATOR_PAUSE_TTL = 604800; // 7 дней — подключился со
 const SLOTS_CACHE_TTL = 600;       // 10 мин — кэш блока слотов (общий для всех)
 const TOKEN_KEY = 'mh:token';
 const ALMATY_UTC_OFFSET = 5;       // Алматы = UTC+5
+// Ночное окно работы бота (Almaty time): отвечает клиентам только в эти часы,
+// днём диалоги ведут менеджеры. Для круглосуточной работы — start=0, end=24.
+// Окно «через полночь» поддерживается (start > end → 21..23 + 0..6).
+const BOT_HOUR_START = 21;
+const BOT_HOUR_END = 7;
 
 // ── Точка входа ────────────────────────────────────────────────────────────
 export default {
@@ -272,6 +277,18 @@ async function processMessage(msg, env) {
   if (msg.destination !== 'from') return;
   if (msg.messageType !== 'text') return;
   if (!msg.text || !msg.userId) return;
+
+  // Ночное окно: бот отвечает только в часы BOT_HOUR_START..BOT_HOUR_END (Almaty).
+  // Эхо-защита и операторская пауза выше работают всегда — учёт ownership
+  // продолжается, даже когда бот не отвечает.
+  const almatyHour = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600 * 1000).getUTCHours();
+  const inWindow = BOT_HOUR_START < BOT_HOUR_END
+    ? (almatyHour >= BOT_HOUR_START && almatyHour < BOT_HOUR_END)
+    : (almatyHour >= BOT_HOUR_START || almatyHour < BOT_HOUR_END);
+  if (!inWindow) {
+    console.log(`outside bot hours (h=${almatyHour}, window=${BOT_HOUR_START}-${BOT_HOUR_END}), skip ${tag}`);
+    return;
+  }
 
   // Чат уже ведёт человек (сотрудник подключился, или бот ранее сделал
   // handoff/booking) — бот не вмешивается.
