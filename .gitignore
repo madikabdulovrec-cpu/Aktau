@@ -37,6 +37,10 @@ cf-api-token.txt
 deploy-secrets.local.txt
 anthropic-key.local.txt
 wazzup-key.local.txt
+altegio_credentials.txt
+
+# Локальные утилитные скрипты деплоя (содержат хардкоженные секреты)
+worker/scripts/
 
 # Локальные бэкапы Firestore (содержат PII клиентов — НИ В КОЕМ СЛУЧАЕ в git)
 .local_backups/
