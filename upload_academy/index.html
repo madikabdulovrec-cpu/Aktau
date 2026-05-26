@@ -2157,6 +2157,123 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
 }
 .admin-delete-btn:hover { opacity:0.8; }
 
+/* === Compact alerts button + Alerts modal === */
+.alerts-btn {
+  display:flex; align-items:center; justify-content:space-between;
+  width:100%; padding:14px 20px; gap:14px;
+  background:linear-gradient(135deg, rgba(255,45,123,0.06), rgba(45,91,255,0.06));
+  border:2px solid rgba(0,0,0,0.1); border-radius:var(--radius);
+  cursor:pointer; transition:all 0.15s;
+  font-family:'Space Grotesk',sans-serif; text-align:left;
+  margin-bottom:18px;
+}
+.alerts-btn:hover {
+  transform:translateY(-2px);
+  box-shadow:0 6px 18px rgba(0,0,0,0.12);
+  border-color:rgba(0,0,0,0.2);
+}
+.alerts-btn-left { display:flex; align-items:center; gap:14px; flex:1; min-width:0; }
+.alerts-bell {
+  width:46px; height:46px; border-radius:50%;
+  background:var(--yellow); color:var(--black);
+  display:flex; align-items:center; justify-content:center;
+  font-size:22px; flex-shrink:0;
+  animation: bellShake 4s ease-in-out infinite;
+}
+@keyframes bellShake {
+  0%, 90%, 100% { transform:rotate(0); }
+  92% { transform:rotate(8deg); }
+  94% { transform:rotate(-8deg); }
+  96% { transform:rotate(5deg); }
+  98% { transform:rotate(-5deg); }
+}
+.alerts-btn-title {
+  font-family:'Unbounded',sans-serif; font-size:14px; font-weight:800;
+  color:var(--black); margin-bottom:4px;
+}
+.alerts-btn-chips { display:flex; flex-wrap:wrap; gap:6px; }
+.al-chip {
+  font-size:11px; font-weight:700; padding:3px 10px; border-radius:999px;
+}
+.al-chip-pink { background:rgba(255,45,123,0.12); color:#c41a5b; }
+.al-chip-gray { background:rgba(0,0,0,0.08); color:#555; }
+.al-chip-green { background:rgba(0,200,83,0.12); color:#00874a; }
+.al-chip-orange { background:rgba(255,152,0,0.15); color:#e68900; }
+.alerts-btn-arrow {
+  font-size:20px; color:var(--black); opacity:0.6;
+  transition:transform 0.15s;
+}
+.alerts-btn:hover .alerts-btn-arrow { transform:translateX(4px); opacity:1; }
+
+/* Alerts modal */
+.alerts-modal-overlay {
+  position:fixed; inset:0; z-index:260;
+  background:rgba(15,20,30,0.55); backdrop-filter:blur(2px);
+  display:none; align-items:center; justify-content:center; padding:24px;
+}
+.alerts-modal-overlay.show { display:flex; }
+.alerts-modal {
+  background:#fff; border-radius:var(--radius-lg);
+  width:680px; max-width:96vw; max-height:92vh;
+  display:flex; flex-direction:column; overflow:hidden;
+  border:2px solid var(--black); box-shadow:0 24px 64px rgba(0,0,0,0.35);
+  animation: imSlideUp 0.25s ease-out;
+}
+.am-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:18px 22px; border-bottom:2px solid rgba(0,0,0,0.08);
+  background:var(--yellow);
+}
+.am-title { font-family:'Unbounded',sans-serif; font-size:18px; font-weight:800; }
+.am-body { overflow-y:auto; padding:18px 22px 22px; flex:1; }
+.am-group { margin-bottom:20px; }
+.am-group:last-child { margin-bottom:0; }
+.am-group-head {
+  font-family:'Unbounded',sans-serif; font-size:13px; font-weight:800;
+  margin-bottom:10px; display:flex; align-items:center; gap:8px;
+  text-transform:uppercase; letter-spacing:0.5px;
+}
+.am-group-count {
+  font-size:11px; padding:2px 8px; border-radius:999px;
+  background:rgba(0,0,0,0.08); color:#555;
+}
+.am-item {
+  display:flex; align-items:center; gap:12px; padding:10px 14px;
+  background:#f7f9fc; border-radius:12px; margin-bottom:6px;
+  cursor:pointer; transition:all 0.15s;
+  border-left:4px solid transparent;
+}
+.am-item:hover {
+  background:#eef2f8; transform:translateX(2px);
+  box-shadow:0 2px 8px rgba(0,0,0,0.08);
+}
+.am-item.pending { border-left-color:var(--pink); }
+.am-item.inactive { border-left-color:#999; }
+.am-item.certified { border-left-color:var(--green); }
+.am-item.bronze { border-left-color:#e68900; }
+.am-item-avatar {
+  width:36px; height:36px; border-radius:50%; background:var(--blue);
+  color:#fff; display:flex; align-items:center; justify-content:center;
+  font-family:'Unbounded',sans-serif; font-weight:800; font-size:14px;
+  flex-shrink:0;
+}
+.am-item-info { flex:1; min-width:0; }
+.am-item-name { font-weight:700; font-size:14px; color:var(--black); }
+.am-item-meta { font-size:12px; color:#666; margin-top:2px; }
+.am-item-arrow { color:#999; font-size:16px; flex-shrink:0; }
+.am-empty {
+  text-align:center; padding:40px 20px; color:#888;
+}
+.am-empty-icon { font-size:48px; margin-bottom:10px; }
+
+@media (max-width:768px) {
+  .alerts-modal-overlay { padding:0; }
+  .alerts-modal { width:100%; max-width:100%; height:100vh; max-height:100vh; border-radius:0; border:none; }
+  .alerts-btn { padding:12px 14px; }
+  .alerts-bell { width:40px; height:40px; font-size:18px; }
+  .alerts-btn-title { font-size:13px; }
+}
+
 /* === Universal Confirm / Prompt Dialog === */
 .dlg-overlay {
   position:fixed; inset:0; z-index:300;
@@ -3538,6 +3655,20 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
         <textarea class="admin-note" id="adminNote" placeholder="Добавьте комментарий о стажёре..."></textarea>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ==================== ALERTS MODAL ====================
+     Открывается по клику на компактную плашку «🔔 Уведомления (N)»
+     на главной admin-странице. Группирует уведомления по 4 категориям,
+     каждый элемент кликабелен → открывает модалку стажёра. -->
+<div class="alerts-modal-overlay" id="alertsModalOverlay" onclick="if(event.target===this)closeAlertsModal()">
+  <div class="alerts-modal">
+    <div class="am-header">
+      <div class="am-title">🔔 Уведомления</div>
+      <button class="im-icon-btn" onclick="closeAlertsModal()" title="Закрыть">✕</button>
+    </div>
+    <div class="am-body" id="alertsModalBody"></div>
   </div>
 </div>
 
@@ -10810,6 +10941,89 @@ function showToast(icon, text, sub) {
   setTimeout(() => t.classList.remove('show'), 3500);
 }
 
+// ===== ALERTS MODAL =====
+// Открывается из главной admin-страницы по клику на компактную плашку.
+// Данные берём из window.__adminAlertsCache (заполняется в renderAdmin).
+function openAlertsModal() {
+  const cache = window.__adminAlertsCache || {};
+  const overlay = document.getElementById('alertsModalOverlay');
+  const body = document.getElementById('alertsModalBody');
+  if (!overlay || !body) return;
+
+  function row(item, type, metaHtml) {
+    const intern = item.intern;
+    const initial = (intern.name || '?').charAt(0).toUpperCase();
+    return '<div class="am-item ' + type + '" onclick="closeAlertsModal();showInternDetail(' + item.idx + ');">' +
+      '<div class="am-item-avatar">' + escapeHtml(initial) + '</div>' +
+      '<div class="am-item-info">' +
+        '<div class="am-item-name">' + escapeHtml(intern.name + ' ' + intern.surname) + '</div>' +
+        '<div class="am-item-meta">' + metaHtml + '</div>' +
+      '</div>' +
+      '<div class="am-item-arrow">→</div>' +
+    '</div>';
+  }
+
+  let html = '';
+
+  // Pending — приоритет №1 для куратора, требует немедленного действия
+  if (cache.pending && cache.pending.length > 0) {
+    html += '<div class="am-group">' +
+      '<div class="am-group-head">⏳ На проверке <span class="am-group-count">' + cache.pending.length + '</span></div>' +
+      cache.pending.map(function(it) {
+        return row(it, 'pending', it.count + ' задание(я) ждут оценки куратора');
+      }).join('') +
+    '</div>';
+  }
+
+  // Готовы к сертификации
+  if (cache.certified && cache.certified.length > 0) {
+    html += '<div class="am-group">' +
+      '<div class="am-group-head">🏆 Готовы к сертификации <span class="am-group-count">' + cache.certified.length + '</span></div>' +
+      cache.certified.map(function(it) {
+        return row(it, 'certified', 'Все обязательные уроки сданы, средняя оценка 4+ ');
+      }).join('') +
+    '</div>';
+  }
+
+  // Бронза — требуют переобучения
+  if (cache.bronze && cache.bronze.length > 0) {
+    html += '<div class="am-group">' +
+      '<div class="am-group-head">🥉 Требуется переобучение <span class="am-group-count">' + cache.bronze.length + '</span></div>' +
+      cache.bronze.map(function(it) {
+        return row(it, 'bronze', 'Курс пройден, но процент хороших оценок < 70% — нужна пересдача слабых уроков');
+      }).join('') +
+    '</div>';
+  }
+
+  // Неактивные
+  if (cache.inactive && cache.inactive.length > 0) {
+    html += '<div class="am-group">' +
+      '<div class="am-group-head">😴 Неактивные <span class="am-group-count">' + cache.inactive.length + '</span></div>' +
+      cache.inactive.map(function(it) {
+        return row(it, 'inactive', 'Последняя активность: ' + escapeHtml(it.last) + ' · возможно требуется напоминание');
+      }).join('') +
+    '</div>';
+  }
+
+  if (!html) {
+    html = '<div class="am-empty">' +
+      '<div class="am-empty-icon">✨</div>' +
+      '<div style="font-family:Unbounded,sans-serif;font-size:14px;font-weight:700;margin-bottom:6px;">Всё в порядке</div>' +
+      '<div style="font-size:13px;">У стажёров нет ожидающих проверки заданий и активных проблем.</div>' +
+    '</div>';
+  }
+
+  body.innerHTML = html;
+  overlay.classList.add('show');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeAlertsModal() {
+  const overlay = document.getElementById('alertsModalOverlay');
+  if (overlay) overlay.classList.remove('show');
+  document.body.style.overflow = '';
+}
+
 // ===== UNIVERSAL DIALOG (replaces native confirm/prompt) =====
 // Возвращает Promise. Решается через нажатие OK/Cancel или Esc.
 // Опции: { title, message, icon, okText, cancelText, danger, input, defaultValue,
@@ -13545,14 +13759,22 @@ document.addEventListener('visibilitychange', function() {
   }
 });
 
-// ESC закрывает модалку детали стажёра
+// ESC закрывает любую открытую центральную модалку
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') {
-    var overlay = document.getElementById('internModalOverlay');
-    if (overlay && overlay.classList.contains('show')) {
-      e.preventDefault();
-      hideInternDetail();
-    }
+  if (e.key !== 'Escape') return;
+  // Приоритет: dialogs > alerts > intern detail
+  var dlg = document.getElementById('dlgOverlay');
+  if (dlg && dlg.classList.contains('show')) { return; /* dialog имеет свой ESC-обработчик */ }
+  var am = document.getElementById('alertsModalOverlay');
+  if (am && am.classList.contains('show')) {
+    e.preventDefault();
+    closeAlertsModal();
+    return;
+  }
+  var overlay = document.getElementById('internModalOverlay');
+  if (overlay && overlay.classList.contains('show')) {
+    e.preventDefault();
+    hideInternDetail();
   }
 });
 // Страховка-ретраер: если cloudPush упал (нет сети, Firestore offline,
@@ -13632,44 +13854,70 @@ function renderAdmin() {
     '<div class="admin-stat-card"><div class="asc-num">' + activeCount + '</div><div class="asc-label">Активных</div></div>' +
     '<div class="admin-stat-card"><div class="asc-num" style="' + (pendingCount > 0 ? '-webkit-text-fill-color:var(--pink);' : '') + '">' + pendingCount + '</div><div class="asc-label">На проверке</div></div>';
 
-  // Notifications/alerts
-  const alerts = [];
-  INTERNS.forEach(i => {
-    if (i.streak <= 0 && i.completed < 10) alerts.push({ type:'', text:'&#9888; ' + i.name + ' ' + i.surname + ' — неактивен (последняя активность: ' + (i.lastActive || '—') + ')' });
-    if (i.pendingDays && i.pendingDays.length > 0) alerts.push({ type:'warn', text:'&#9203; ' + i.name + ' ' + i.surname + ' — ' + i.pendingDays.length + ' задание(я) ожидают проверки' });
+  // === Notifications: компактная плашка вместо длинного списка ===
+  // Раньше для каждого «неактивного» / «на проверке» / «готов к сертификации»
+  // рендерилась отдельная строка во весь экран — при 10 стажёрах главная
+  // страница растягивалась на 5+ экранов. Теперь — одна карточка-кнопка
+  // «Уведомления (N)», по клику открывается модалка со сгруппированным списком.
+  //
+  // Считаем 4 категории и кэшируем для модалки в window.__adminAlertsCache.
+  const pendingList = [];
+  const inactiveList = [];
+  INTERNS.forEach(function(i, idx) {
+    if (i.pendingDays && i.pendingDays.length > 0) {
+      pendingList.push({ idx: idx, intern: i, count: i.pendingDays.length });
+    }
+    if (i.streak <= 0 && i.completed < 10) {
+      inactiveList.push({ idx: idx, intern: i, last: i.lastActive || '—' });
+    }
   });
   // Готовы к сертификации = все обязательные уроки профиля пройдены + tier Platinum
-  const certifiedInterns = INTERNS.filter(function(i) {
+  const certifiedList = [];
+  const bronzeList = [];
+  INTERNS.forEach(function(i, idx) {
     var req = 0, done = 0;
     for (var li = 0; li < TOTAL_LESSONS; li++) {
       var c = CATEGORY_MAP[li];
       var inProf = (i.profile === 'manual') ? (c === 1 || c === 4) : true;
       if (inProf) { req++; if ((i.scores||[])[li] > 0) done++; }
     }
-    if (req === 0 || done < req) return false;
-    return getInternTier(i).id === 'platinum';
+    if (req === 0 || done < req) return;
+    var t = getInternTier(i).id;
+    if (t === 'platinum') certifiedList.push({ idx: idx, intern: i });
+    else if (t === 'bronze') bronzeList.push({ idx: idx, intern: i });
   });
-  if (certifiedInterns.length > 0) {
-    alerts.push({ type:'info', text:'&#127942; ' + certifiedInterns.map(function(i){ return i.name; }).join(', ') + ' &mdash; готовы к сертификации' });
-  }
-  // Кто-то из стажёров в бронзовом уровне после завершения курса — требует повторного обучения
-  const bronzeInterns = INTERNS.filter(function(i) {
-    var req = 0, done = 0;
-    for (var li = 0; li < TOTAL_LESSONS; li++) {
-      var c = CATEGORY_MAP[li];
-      var inProf = (i.profile === 'manual') ? (c === 1 || c === 4) : true;
-      if (inProf) { req++; if ((i.scores||[])[li] > 0) done++; }
-    }
-    if (req === 0 || done < req) return false;
-    return getInternTier(i).id === 'bronze';
-  });
-  if (bronzeInterns.length > 0) {
-    alerts.push({ type:'warn', text:'&#9888; ' + bronzeInterns.map(function(i){ return i.name; }).join(', ') + ' &mdash; требуется полное повторное обучение (Бронза)' });
-  }
 
-  document.getElementById('adminAlerts').innerHTML = alerts.map(a =>
-    '<div class="admin-alert ' + a.type + '"><span></span>' + a.text + '</div>'
-  ).join('');
+  window.__adminAlertsCache = {
+    pending: pendingList,
+    inactive: inactiveList,
+    certified: certifiedList,
+    bronze: bronzeList
+  };
+
+  const totalAlerts = pendingList.length + inactiveList.length + certifiedList.length + bronzeList.length;
+  const alertsEl = document.getElementById('adminAlerts');
+  if (totalAlerts === 0) {
+    alertsEl.innerHTML = '';
+  } else {
+    // Компактная плашка-кнопка
+    const summary = [
+      pendingList.length > 0 ? '<span class="al-chip al-chip-pink">⏳ ' + pendingList.length + ' на проверке</span>' : '',
+      inactiveList.length > 0 ? '<span class="al-chip al-chip-gray">😴 ' + inactiveList.length + ' неактивных</span>' : '',
+      certifiedList.length > 0 ? '<span class="al-chip al-chip-green">🏆 ' + certifiedList.length + ' готовы</span>' : '',
+      bronzeList.length > 0 ? '<span class="al-chip al-chip-orange">🥉 ' + bronzeList.length + ' переобучить</span>' : ''
+    ].filter(function(s){ return s; }).join('');
+    alertsEl.innerHTML =
+      '<button class="alerts-btn" onclick="openAlertsModal()">' +
+        '<div class="alerts-btn-left">' +
+          '<div class="alerts-bell">🔔</div>' +
+          '<div>' +
+            '<div class="alerts-btn-title">Уведомления (' + totalAlerts + ')</div>' +
+            '<div class="alerts-btn-chips">' + summary + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="alerts-btn-arrow">→</div>' +
+      '</button>';
+  }
 
   // Диаграмма «Динамика обучения» перенесена в модалку стажёра (см. renderInternChart).
   // На главной admin-странице её больше нет — это сокращает страницу.
