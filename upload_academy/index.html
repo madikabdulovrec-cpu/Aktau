@@ -2157,6 +2157,53 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
 }
 .admin-delete-btn:hover { opacity:0.8; }
 
+/* === Universal Confirm / Prompt Dialog === */
+.dlg-overlay {
+  position:fixed; inset:0; z-index:300;
+  background:rgba(15,20,30,0.6); backdrop-filter: blur(3px);
+  display:none; align-items:center; justify-content:center; padding:20px;
+}
+.dlg-overlay.show { display:flex; }
+.dlg-card {
+  background:#fff; border-radius:var(--radius-lg);
+  width:480px; max-width:94vw; padding:28px 28px 22px;
+  border:2px solid var(--black); box-shadow:0 20px 60px rgba(0,0,0,0.3);
+  animation: dlgPop 0.2s ease-out;
+  text-align:center;
+}
+@keyframes dlgPop { from { opacity:0; transform:scale(0.92); } to { opacity:1; transform:scale(1); } }
+.dlg-icon { font-size:40px; margin-bottom:10px; line-height:1; }
+.dlg-title {
+  font-family:'Unbounded',sans-serif; font-size:18px; font-weight:800;
+  margin-bottom:10px; color:var(--black);
+}
+.dlg-msg {
+  font-size:14px; color:#444; line-height:1.5; margin-bottom:18px;
+  white-space:pre-wrap; word-break:break-word; text-align:left;
+}
+.dlg-input {
+  width:100%; padding:12px 16px; background:var(--gray);
+  border:2px solid rgba(0,0,0,0.08); border-radius:12px;
+  font-family:'Space Grotesk',sans-serif; font-size:15px;
+  margin-bottom:8px; outline:none; color:var(--black);
+}
+.dlg-input:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(45,91,255,0.1); }
+.dlg-error {
+  font-size:12px; color:#c41e3a; margin-bottom:12px; text-align:left;
+  background:rgba(196,30,58,0.08); padding:8px 12px; border-radius:8px;
+}
+.dlg-actions { display:flex; gap:10px; }
+.dlg-btn {
+  flex:1; padding:12px 18px; border-radius:var(--radius-pill);
+  font-family:'Unbounded',sans-serif; font-size:12px; font-weight:700;
+  cursor:pointer; border:2px solid var(--black); transition:all 0.15s;
+}
+.dlg-btn:hover { transform:translate(-1px,-1px); box-shadow:3px 3px 0 var(--black); }
+.dlg-btn-cancel { background:#fff; color:var(--black); }
+.dlg-btn-ok { background:var(--blue); color:#fff; }
+.dlg-btn-ok.danger { background:#c41e3a; }
+.dlg-btn-ok.success { background:var(--green); color:var(--black); }
+
 /* === Intern Detail Modal (central, with tabs) === */
 .intern-modal-overlay {
   position:fixed; inset:0; z-index:240;
@@ -3484,6 +3531,23 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
         <div class="im-section-hint">Внутренние пометки о стажёре. Видны только админу.</div>
         <textarea class="admin-note" id="adminNote" placeholder="Добавьте комментарий о стажёре..."></textarea>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== UNIVERSAL CONFIRM / PROMPT DIALOG ==================== -->
+<!-- Заменяет blocking confirm()/prompt() на стилизованную модалку.
+     Используется через await modalConfirm(opts) / await modalPrompt(opts). -->
+<div class="dlg-overlay" id="dlgOverlay" onclick="if(event.target===this)dlgCancel()">
+  <div class="dlg-card" role="dialog" aria-modal="true">
+    <div class="dlg-icon" id="dlgIcon">&#10067;</div>
+    <div class="dlg-title" id="dlgTitle">Подтверждение</div>
+    <div class="dlg-msg" id="dlgMsg"></div>
+    <input class="dlg-input" id="dlgInput" type="text" style="display:none;" />
+    <div class="dlg-error" id="dlgError" style="display:none;"></div>
+    <div class="dlg-actions">
+      <button class="dlg-btn dlg-btn-cancel" id="dlgCancelBtn" onclick="dlgCancel()">Отмена</button>
+      <button class="dlg-btn dlg-btn-ok" id="dlgOkBtn" onclick="dlgOk()">OK</button>
     </div>
   </div>
 </div>
@@ -10740,6 +10804,94 @@ function showToast(icon, text, sub) {
   setTimeout(() => t.classList.remove('show'), 3500);
 }
 
+// ===== UNIVERSAL DIALOG (replaces native confirm/prompt) =====
+// Возвращает Promise. Решается через нажатие OK/Cancel или Esc.
+// Опции: { title, message, icon, okText, cancelText, danger, input, defaultValue,
+//         placeholder, validate(value) → string|null }
+let _dlgResolve = null;
+let _dlgConfig = null;
+
+function _openDialog(opts) {
+  _dlgConfig = opts || {};
+  const overlay = document.getElementById('dlgOverlay');
+  document.getElementById('dlgIcon').innerHTML = opts.icon || '&#10067;';
+  document.getElementById('dlgTitle').textContent = opts.title || 'Подтверждение';
+  document.getElementById('dlgMsg').textContent = opts.message || '';
+  const ok = document.getElementById('dlgOkBtn');
+  const cancel = document.getElementById('dlgCancelBtn');
+  ok.textContent = opts.okText || 'OK';
+  cancel.textContent = opts.cancelText || 'Отмена';
+  ok.className = 'dlg-btn dlg-btn-ok' + (opts.danger ? ' danger' : '') + (opts.success ? ' success' : '');
+
+  const inp = document.getElementById('dlgInput');
+  const err = document.getElementById('dlgError');
+  err.style.display = 'none';
+  if (opts.input) {
+    inp.style.display = '';
+    inp.value = opts.defaultValue || '';
+    inp.placeholder = opts.placeholder || '';
+    inp.type = opts.inputType || 'text';
+    setTimeout(function(){ inp.focus(); inp.select(); }, 50);
+  } else {
+    inp.style.display = 'none';
+  }
+  overlay.classList.add('show');
+  document.body.style.overflow = 'hidden';
+
+  return new Promise(function(resolve){ _dlgResolve = resolve; });
+}
+
+function _closeDialog(result) {
+  const overlay = document.getElementById('dlgOverlay');
+  overlay.classList.remove('show');
+  document.body.style.overflow = '';
+  const r = _dlgResolve;
+  _dlgResolve = null;
+  _dlgConfig = null;
+  if (r) r(result);
+}
+
+function dlgOk() {
+  if (!_dlgConfig) return;
+  if (_dlgConfig.input) {
+    const val = document.getElementById('dlgInput').value;
+    if (typeof _dlgConfig.validate === 'function') {
+      const errText = _dlgConfig.validate(val);
+      if (errText) {
+        const err = document.getElementById('dlgError');
+        err.textContent = errText;
+        err.style.display = '';
+        return;
+      }
+    }
+    _closeDialog(val);
+  } else {
+    _closeDialog(true);
+  }
+}
+
+function dlgCancel() {
+  if (_dlgConfig && _dlgConfig.input) _closeDialog(null);
+  else _closeDialog(false);
+}
+
+// Хелперы — заменяют native confirm/prompt:
+function modalConfirm(opts) {
+  if (typeof opts === 'string') opts = { message: opts };
+  return _openDialog(Object.assign({ icon: '&#10067;', okText: 'Подтвердить' }, opts || {}));
+}
+function modalPrompt(opts) {
+  return _openDialog(Object.assign({ input: true, icon: '&#9999;&#65039;' }, opts || {}));
+}
+
+// Enter в input = OK, Esc = Cancel (для dlg).
+document.addEventListener('keydown', function(e) {
+  const overlay = document.getElementById('dlgOverlay');
+  if (!overlay || !overlay.classList.contains('show')) return;
+  if (e.key === 'Enter' && _dlgConfig && _dlgConfig.input) { e.preventDefault(); dlgOk(); }
+  if (e.key === 'Escape') { e.preventDefault(); dlgCancel(); }
+});
+
 // ===== LOGIN =====
 let loginRole = 'intern'; // 'intern' or 'admin'
 
@@ -11313,17 +11465,23 @@ function renderCategoryAccessControl(internIdx) {
   }).join('');
 }
 
-function toggleInternProfile(idx) {
+async function toggleInternProfile(idx) {
   var intern = INTERNS[idx];
   if (!intern) return;
   var newProfile = (intern.profile === 'manual') ? 'medical' : 'manual';
-  if (!confirm('Сменить профиль обучения?\n\nТекущий: ' + (intern.profile === 'manual' ? 'Ручной мастер' : 'Медицинский мастер') + '\nНовый: ' + (newProfile === 'manual' ? 'Ручной мастер (только Кат. 1 и 4)' : 'Медицинский мастер (все 5 категорий)'))) return;
+  var ok = await modalConfirm({
+    icon: '&#128137;',
+    title: 'Сменить профиль обучения?',
+    message: 'Текущий: ' + (intern.profile === 'manual' ? 'Ручной мастер' : 'Медицинский мастер') +
+             '\nНовый: ' + (newProfile === 'manual' ? 'Ручной мастер (только Кат. 1 и 4)' : 'Медицинский мастер (все 5 категорий)'),
+    okText: 'Сменить'
+  });
+  if (!ok) return;
   intern.profile = newProfile;
   persist();
-  // если сам стажёр сейчас залогинен в этой же вкладке — обновим state (маловероятно)
   if (!state.isAdmin && state.internIdx === idx) state.profile = newProfile;
   showToast('&#8635;', 'Профиль обновлён', newProfile === 'manual' ? 'Ручной мастер' : 'Медицинский мастер');
-  showInternDetail(idx); // перерисуем
+  showInternDetail(idx);
 }
 
 function setCategoryAccess(internIdx, catId, mode) {
@@ -11407,7 +11565,7 @@ function unlockNextLesson(internIdx) {
   showToast('&#128275;', 'Открыт следующий урок', '№' + (intern.unlockedUntil + 1) + ' — ' + nextTitle);
 }
 
-function lockOneLesson(internIdx) {
+async function lockOneLesson(internIdx) {
   var intern = INTERNS[internIdx];
   if (!intern) return;
   var cur = getInternUnlockedUntil(intern);
@@ -11415,9 +11573,15 @@ function lockOneLesson(internIdx) {
     showToast('&#9888;', 'Уже на самом первом уроке', 'Дальше закрывать некуда');
     return;
   }
-  // Не закрываем уроки, которые стажёр уже сдал и которые имеют оценку
   if (intern.scores && intern.scores[cur] > 0) {
-    if (!confirm('Этот урок уже пройден стажёром (оценка ' + intern.scores[cur] + '/5). Всё равно закрыть доступ?')) return;
+    var ok = await modalConfirm({
+      icon: '&#9888;&#65039;',
+      title: 'Закрыть пройденный урок?',
+      message: 'Этот урок уже пройден стажёром (оценка ' + intern.scores[cur] + '/5).\nВсё равно закрыть доступ?',
+      okText: 'Закрыть',
+      danger: true
+    });
+    if (!ok) return;
   }
   intern.unlockedUntil = cur - 1;
   if (!state.isAdmin && state.internIdx === internIdx) {
@@ -11918,15 +12082,22 @@ function addNewIntern() {
   showToast('&#10003;', 'Стажёр добавлен!', name + ' ' + surname + ' &bull; ' + profileLabel);
 }
 
-function deleteIntern(idx, event) {
-  event.stopPropagation();
+async function deleteIntern(idx, event) {
+  if (event) event.stopPropagation();
   const intern = INTERNS[idx];
-  if (confirm('Удалить стажёра ' + intern.name + ' ' + intern.surname + '?')) {
-    INTERNS.splice(idx, 1);
-    persist();
-    renderAdmin();
-    showToast('&#128465;', 'Стажёр удалён', intern.name + ' ' + intern.surname);
-  }
+  if (!intern) return;
+  const ok = await modalConfirm({
+    icon: '&#128465;',
+    title: 'Удалить стажёра?',
+    message: intern.name + ' ' + intern.surname + '\n\nВся история, оценки и ответы будут потеряны. Действие необратимо.',
+    okText: 'Удалить',
+    danger: true
+  });
+  if (!ok) return;
+  INTERNS.splice(idx, 1);
+  persist();
+  renderAdmin();
+  showToast('&#128465;', 'Стажёр удалён', intern.name + ' ' + intern.surname);
 }
 
 // ===== LESSON =====
@@ -12410,9 +12581,23 @@ function retakeFromBonuses(idx) {
 }
 
 // Полный сброс курса (для Bronze-tier)
-function resetFullCourse() {
-  if (!confirm('Вы точно хотите сбросить весь прогресс и начать курс заново?\n\nОценки, комментарии куратора и уровень обнулятся.\nОтменить нельзя.')) return;
-  if (!confirm('Последнее предупреждение: ВСЕ оценки будут сброшены к нулю. Продолжить?')) return;
+async function resetFullCourse() {
+  var ok1 = await modalConfirm({
+    icon: '&#128260;',
+    title: 'Сбросить весь прогресс?',
+    message: 'Вы точно хотите сбросить весь прогресс и начать курс заново?\n\nОценки, комментарии куратора и уровень обнулятся.\nОтменить нельзя.',
+    okText: 'Сбросить',
+    danger: true
+  });
+  if (!ok1) return;
+  var ok2 = await modalConfirm({
+    icon: '&#9888;&#65039;',
+    title: 'Последнее предупреждение',
+    message: 'ВСЕ оценки будут сброшены к нулю. Продолжить?',
+    okText: 'Да, сбросить всё',
+    danger: true
+  });
+  if (!ok2) return;
 
   state.scores = Array(TOTAL_LESSONS).fill(0);
   state.curatorComments = Array(TOTAL_LESSONS).fill('');
@@ -13214,8 +13399,15 @@ function showStorageBanner() {
 }
 
 // Глобальный reset (для экстренных случаев) — вызывается из консоли
-window.resetInterns = function() {
-  if (!confirm('Удалить ВСЕ данные стажёров? Отменить нельзя.')) return;
+window.resetInterns = async function() {
+  var ok = await modalConfirm({
+    icon: '&#128293;',
+    title: 'Удалить ВСЕ данные стажёров?',
+    message: 'Это удалит локальный кеш всех стажёров и перезагрузит страницу.\nДанные в облаке останутся (восстановятся из Firestore при следующем входе).\n\nОтменить нельзя.',
+    okText: 'Удалить локально',
+    danger: true
+  });
+  if (!ok) return;
   try { localStorage.removeItem(STORAGE_KEY); location.reload(); } catch (e) {}
 };
 
@@ -13812,25 +14004,32 @@ function changeInternProfile() {
   showInternDetail(idx);
 }
 
-function changeInternCode() {
+async function changeInternCode() {
   const idx = currentInternIdx;
   if (idx < 0) return;
   const intern = INTERNS[idx];
   if (!intern) return;
   const menu = document.getElementById('imMenu');
   if (menu) menu.classList.remove('show');
-  const newCode = prompt('Новый код доступа для «' + intern.name + ' ' + intern.surname + '»\n\nТекущий код: ' + intern.accessCode + '\nМинимум 4 символа, без пробелов.', intern.accessCode || '');
+  const newCode = await modalPrompt({
+    icon: '&#128273;',
+    title: 'Сменить код доступа',
+    message: 'Стажёр: ' + intern.name + ' ' + intern.surname + '\nТекущий код: ' + (intern.accessCode || '—') + '\n\nМинимум 4 символа, без пробелов.',
+    defaultValue: intern.accessCode || '',
+    placeholder: 'Например: 654321',
+    okText: 'Сохранить',
+    validate: function(val) {
+      var cleaned = (val || '').trim().replace(/[^0-9A-Za-zА-Яа-яЁё\-_]/g, '');
+      if (!cleaned || cleaned.length < 4) return 'Код должен быть минимум 4 символа';
+      if (cleaned === intern.accessCode) return 'Это тот же самый код';
+      if (INTERNS.some(function(it, i){ return i !== idx && it.accessCode === cleaned; })) {
+        return 'Такой код уже занят другим стажёром';
+      }
+      return null;
+    }
+  });
   if (newCode === null) return;
   const cleaned = newCode.trim().replace(/[^0-9A-Za-zА-Яа-яЁё\-_]/g, '');
-  if (!cleaned || cleaned.length < 4) {
-    showToast('⚠', 'Код должен быть минимум 4 символа', '');
-    return;
-  }
-  if (cleaned === intern.accessCode) return;
-  if (INTERNS.some(function(it, i){ return i !== idx && it.accessCode === cleaned; })) {
-    showToast('⚠', 'Такой код уже занят', 'Выберите другой');
-    return;
-  }
   intern.accessCode = cleaned;
   persist();
   showToast('🔑', 'Код доступа изменён', cleaned);
@@ -13838,36 +14037,50 @@ function changeInternCode() {
   renderAdmin();
 }
 
-function resetLessonByIdx() {
+async function resetLessonByIdx() {
   const idx = currentInternIdx;
   if (idx < 0) return;
   const intern = INTERNS[idx];
   if (!intern) return;
   const menu = document.getElementById('imMenu');
   if (menu) menu.classList.remove('show');
-  const input = prompt('Номер урока для сброса (1–' + TOTAL_LESSONS + ').\nТекущая оценка обнулится, и стажёр сможет пересдать.');
+  const input = await modalPrompt({
+    icon: '&#128260;',
+    title: 'Сбросить урок',
+    message: 'Введите номер урока (1–' + TOTAL_LESSONS + ').\nТекущая оценка обнулится, стажёр сможет пересдать.',
+    placeholder: 'Номер урока 1–' + TOTAL_LESSONS,
+    inputType: 'number',
+    okText: 'Сбросить',
+    validate: function(val) {
+      var n = parseInt(val, 10);
+      if (isNaN(n) || n < 1 || n > TOTAL_LESSONS) return 'Введите число от 1 до ' + TOTAL_LESSONS;
+      return null;
+    }
+  });
   if (input === null) return;
   const lessonNum = parseInt(input, 10);
-  if (isNaN(lessonNum) || lessonNum < 1 || lessonNum > TOTAL_LESSONS) {
-    showToast('⚠', 'Неверный номер урока', '');
-    return;
-  }
   resetSingleLesson(idx, lessonNum - 1);
 }
 
-function resetSingleLesson(idx, lessonIdx, event) {
+async function resetSingleLesson(idx, lessonIdx, event) {
   if (event) event.stopPropagation();
   const intern = INTERNS[idx];
   if (!intern) return;
   const lesson = LESSONS[lessonIdx];
   if (!lesson) return;
-  if (!confirm('Сбросить прогресс урока «' + lesson.title + '» (#' + (lessonIdx + 1) + ')?\n\nОценка, комментарий куратора и ответ стажёра будут удалены. Стажёр сможет пройти урок заново.')) return;
+  const ok = await modalConfirm({
+    icon: '&#128260;',
+    title: 'Сбросить прогресс урока?',
+    message: '«' + lesson.title + '» (№' + (lessonIdx + 1) + ')\n\nОценка, комментарий куратора и ответ стажёра будут удалены. Стажёр сможет пройти урок заново.',
+    okText: 'Сбросить',
+    danger: true
+  });
+  if (!ok) return;
   intern.scores = intern.scores || Array(TOTAL_LESSONS).fill(0);
   intern.scores[lessonIdx] = 0;
   if (Array.isArray(intern.curatorComments)) intern.curatorComments[lessonIdx] = '';
   intern.pendingDays = (intern.pendingDays || []).filter(function(d){ return d !== lessonIdx; });
   if (intern.answers && intern.answers[lessonIdx] !== undefined) delete intern.answers[lessonIdx];
-  // Пересчитываем агрегаты
   intern.points = (intern.scores || []).reduce(function(a,b){return a+(b||0);}, 0);
   intern.completed = (intern.scores || []).filter(function(s){return s>0;}).length;
   persist();
@@ -13876,14 +14089,21 @@ function resetSingleLesson(idx, lessonIdx, event) {
   renderAdmin();
 }
 
-function deleteCurrentIntern() {
+async function deleteCurrentIntern() {
   const idx = currentInternIdx;
   if (idx < 0) return;
   const intern = INTERNS[idx];
   if (!intern) return;
   const menu = document.getElementById('imMenu');
   if (menu) menu.classList.remove('show');
-  if (!confirm('Удалить стажёра ' + intern.name + ' ' + intern.surname + '?\n\nВся история, оценки и ответы будут потеряны. Действие необратимо.')) return;
+  const ok = await modalConfirm({
+    icon: '&#128465;',
+    title: 'Удалить стажёра?',
+    message: intern.name + ' ' + intern.surname + '\n\nВся история, оценки и ответы будут потеряны.\nДействие необратимо.',
+    okText: 'Удалить навсегда',
+    danger: true
+  });
+  if (!ok) return;
   INTERNS.splice(idx, 1);
   currentInternIdx = -1;
   persist();
