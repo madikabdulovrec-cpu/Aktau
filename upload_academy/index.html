@@ -2157,6 +2157,129 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
 }
 .admin-delete-btn:hover { opacity:0.8; }
 
+/* === Intern Detail Modal (central, with tabs) === */
+.intern-modal-overlay {
+  position:fixed; inset:0; z-index:240;
+  background:rgba(15,20,30,0.55); backdrop-filter: blur(2px);
+  display:none; align-items:center; justify-content:center;
+  padding:24px;
+}
+.intern-modal-overlay.show { display:flex; }
+.intern-modal {
+  background:var(--white); border-radius:var(--radius-lg);
+  width:900px; max-width:96vw; max-height:92vh;
+  display:flex; flex-direction:column; overflow:hidden;
+  border:2px solid var(--black); box-shadow:0 24px 64px rgba(0,0,0,0.35);
+  animation: imSlideUp 0.25s ease-out;
+}
+@keyframes imSlideUp { from { opacity:0; transform:translateY(20px) scale(0.98); } to { opacity:1; transform:none; } }
+.im-header {
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:18px 22px; border-bottom:1px solid rgba(0,0,0,0.06);
+  background:linear-gradient(135deg, rgba(45,91,255,0.05), rgba(255,45,123,0.04));
+}
+.im-header-left { display:flex; align-items:center; gap:14px; flex:1; min-width:0; }
+.im-avatar {
+  width:52px; height:52px; border-radius:50%; background:var(--blue); color:#fff;
+  font-family:'Unbounded',sans-serif; font-size:22px; font-weight:800;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
+.im-titles { min-width:0; }
+.im-name { font-family:'Unbounded',sans-serif; font-size:18px; font-weight:800; line-height:1.1; }
+.im-meta { font-size:12px; color:#666; margin-top:4px; }
+.im-header-actions { display:flex; align-items:center; gap:6px; position:relative; }
+.im-icon-btn {
+  width:36px; height:36px; border-radius:50%; border:none; background:rgba(0,0,0,0.06);
+  cursor:pointer; font-size:16px; display:flex; align-items:center; justify-content:center;
+  transition: all 0.15s;
+}
+.im-icon-btn:hover { background:rgba(0,0,0,0.12); transform:scale(1.05); }
+.im-menu {
+  position:absolute; top:42px; right:0; background:#fff;
+  border:1px solid rgba(0,0,0,0.1); border-radius:12px;
+  box-shadow:0 8px 24px rgba(0,0,0,0.18);
+  min-width:240px; padding:6px; z-index:5;
+  display:none; flex-direction:column;
+}
+.im-menu.show { display:flex; }
+.im-menu button {
+  background:none; border:none; padding:10px 14px; text-align:left;
+  font-family:'Space Grotesk',sans-serif; font-size:13px; font-weight:600;
+  border-radius:8px; cursor:pointer; transition:background 0.1s; color:#333;
+}
+.im-menu button:hover { background:rgba(0,0,0,0.05); }
+.im-menu-danger { color:#c41e3a !important; }
+.im-menu-danger:hover { background:rgba(196,30,58,0.08) !important; }
+
+.im-stats-row {
+  display:grid; grid-template-columns: repeat(4, 1fr); gap:10px;
+  padding:16px 22px 8px;
+}
+.im-stat {
+  background:#f7f9fc; border-radius:12px; padding:10px 12px; text-align:center;
+}
+.im-stat-num { font-family:'Unbounded',sans-serif; font-size:18px; font-weight:800; }
+.im-stat-lbl { font-size:11px; color:#888; margin-top:2px; text-transform:uppercase; letter-spacing:0.5px; }
+
+.im-chart {
+  margin:0 22px 12px; padding:16px; min-height:80px;
+  background:#f7f9fc; border-radius:12px; position:relative;
+}
+
+.im-tabs {
+  display:flex; gap:0; padding:0 16px; border-bottom:1px solid rgba(0,0,0,0.08);
+  background:#fff;
+}
+.im-tab {
+  flex:1; padding:14px 8px; background:none; border:none; cursor:pointer;
+  font-family:'Space Grotesk',sans-serif; font-size:13px; font-weight:700;
+  color:#888; border-bottom:3px solid transparent; transition:all 0.15s;
+}
+.im-tab:hover { color:#333; }
+.im-tab.active { color:var(--blue); border-bottom-color:var(--blue); }
+
+.im-body { overflow-y:auto; padding:18px 22px 22px; flex:1; }
+.im-tabpane { display:none; }
+.im-tabpane.active { display:block; animation: imFadeIn 0.2s ease-out; }
+@keyframes imFadeIn { from { opacity:0; } to { opacity:1; } }
+.im-tab-hint, .im-section-hint {
+  font-size:12px; color:#777; margin-bottom:14px; line-height:1.5;
+}
+.im-section-h {
+  font-family:'Unbounded',sans-serif; font-size:14px; font-weight:700;
+  margin:0 0 6px; display:flex; align-items:center; gap:8px;
+}
+
+/* Accordion: модули в табе «Прогресс» */
+.dp-module { background:#f7f9fc; border-radius:14px; margin-bottom:10px; overflow:hidden; }
+.dp-module-head {
+  padding:14px 18px; cursor:pointer; display:flex; align-items:center;
+  justify-content:space-between; user-select:none; transition:background 0.15s;
+}
+.dp-module-head:hover { background:rgba(45,91,255,0.04); }
+.dp-module-title { font-family:'Unbounded',sans-serif; font-size:13px; font-weight:700; }
+.dp-module-meta { font-size:12px; color:#666; display:flex; align-items:center; gap:10px; }
+.dp-module-arrow { transition:transform 0.2s; font-size:11px; }
+.dp-module.open .dp-module-arrow { transform:rotate(90deg); }
+.dp-module-body { display:none; padding:0 18px 18px; }
+.dp-module.open .dp-module-body { display:block; }
+.dp-module-pending { color:var(--pink); font-weight:700; }
+
+/* Mobile: модалка fullscreen */
+@media (max-width:768px) {
+  .intern-modal-overlay { padding:0; }
+  .intern-modal {
+    width:100%; max-width:100%; max-height:100vh; height:100vh;
+    border-radius:0; border:none;
+  }
+  .im-stats-row { grid-template-columns: repeat(2, 1fr); }
+  .im-chart { display:none; }
+  .im-header { padding:14px 16px; }
+  .im-name { font-size:16px; }
+  .im-tab { font-size:12px; padding:12px 4px; }
+  .im-body { padding:14px 16px 80px; }
+}
+
 /* Add Intern Modal */
 .add-intern-modal {
   position:fixed; top:0; left:0; right:0; bottom:0; z-index:250;
@@ -3257,14 +3380,6 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
     <!-- Notifications -->
     <div class="admin-alerts" id="adminAlerts"></div>
 
-    <!-- Progress Chart -->
-    <div class="admin-section">
-      <div class="admin-section-header">
-        <h3>&#128200; Динамика обучения</h3>
-      </div>
-      <div class="admin-chart" id="adminChart"></div>
-    </div>
-
     <div class="admin-section">
       <div class="admin-section-header">
         <h3>&#128101; Стажёры</h3>
@@ -3282,7 +3397,6 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
           <button class="admin-add-btn" onclick="showAddInternModal()">&#10133; Добавить стажёра</button>
           <button class="admin-export-btn" onclick="exportAdmin()">&#128424; Экспорт</button>
           <button class="admin-export-btn" onclick="exportInterns()" title="Скачать резервную копию всех стажёров в JSON">&#128190; Бэкап</button>
-          <button class="admin-export-btn" onclick="resetInterns()" title="Удалить всех стажёров (нельзя отменить)" style="background:rgba(196,30,58,0.15);color:#ff6b8b;">&#128465; Сброс</button>
         </div>
         <div id="adminStorageStatus" style="font-size:11px;color:rgba(255,255,255,0.5);padding:0 0 8px;"></div>
       </div>
@@ -3302,41 +3416,75 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
       </table>
     </div>
 
-    <!-- Intern detail (shown when clicking on intern) -->
-    <div class="admin-section" id="internDetailSection" style="display:none;">
-      <h3 id="internDetailTitle">&#128100; Детали стажёра</h3>
-      <div style="background:var(--white);border-radius:var(--radius-lg);box-shadow:var(--shadow);overflow:hidden;">
-        <div class="intern-detail">
-          <div class="intern-detail-header">
-            <div class="intern-detail-avatar" id="idAvatar">А</div>
-            <div class="intern-detail-info">
-              <h2 id="idName">Имя Фамилия</h2>
-              <div class="detail-rank" id="idRank">Ранг</div>
-            </div>
-          </div>
-          <div class="intern-detail-stats" id="idStats"></div>
+    <button class="btn-logout" onclick="doLogout()" style="margin-top:30px;">ВЫЙТИ ИЗ АККАУНТА</button>
+  </div>
+</div>
 
-          <!-- Lesson-by-lesson unlock (admin-only manual control) -->
-          <h4 style="font-family:'Unbounded',sans-serif;font-size:14px;margin:24px 0 6px;">&#128274; Доступ к урокам</h4>
-          <div style="font-size:12px;color:#666;margin-bottom:14px;">Стажёр видит только открытые вами уроки. Открывайте по одному после проверки задания. Уроки сверх открытого диапазона показываются с замком.</div>
-          <div id="lessonUnlockControl"></div>
-
-          <!-- Category access control -->
-          <h4 style="font-family:'Unbounded',sans-serif;font-size:14px;margin:24px 0 6px;">&#128273; Доступ к категориям</h4>
-          <div style="font-size:12px;color:#666;margin-bottom:14px;">Режим «Авто» — по прогрессу. «Открыть» — принудительно разблокировать категорию. «Закрыть» — заблокировать доступ даже если предыдущие пройдены.</div>
-          <div class="cat-access-list" id="catAccessList"></div>
-
-          <h4 style="font-family:'Unbounded',sans-serif;font-size:14px;margin-bottom:14px;">&#128250; Прогресс по дням</h4>
-          <div class="day-progress-list" id="dayProgressList"></div>
-          <button class="btn-save-grades" onclick="saveGrades()">&#9989; Сохранить оценки</button>
-
-          <h4 style="font-family:'Unbounded',sans-serif;font-size:14px;margin:24px 0 8px;">&#128221; Заметки куратора</h4>
-          <textarea class="admin-note" id="adminNote" placeholder="Добавьте комментарий о стажёре..."></textarea>
+<!-- ==================== INTERN DETAIL MODAL ==================== -->
+<!-- Центральная модалка с табами «Прогресс / Доступ / Заметки».
+     Заменила раскрывающийся inline-блок длиной в 1500px на главной admin-странице. -->
+<div class="intern-modal-overlay" id="internModalOverlay" onclick="if(event.target===this)hideInternDetail()">
+  <div class="intern-modal">
+    <!-- Header -->
+    <div class="im-header">
+      <div class="im-header-left">
+        <div class="im-avatar" id="imAvatar">А</div>
+        <div class="im-titles">
+          <div class="im-name" id="imName">Имя Фамилия</div>
+          <div class="im-meta" id="imMeta">Код · Категория · Статус</div>
+        </div>
+      </div>
+      <div class="im-header-actions">
+        <button class="im-icon-btn" id="imMenuBtn" onclick="toggleInternMenu(event)" title="Действия">&#8942;</button>
+        <button class="im-icon-btn" onclick="hideInternDetail()" title="Закрыть">&#10005;</button>
+        <!-- Dropdown menu -->
+        <div class="im-menu" id="imMenu">
+          <button onclick="changeInternProfile()">&#128138; Сменить профиль</button>
+          <button onclick="changeInternCode()">&#128273; Сменить код доступа</button>
+          <button onclick="resetLessonByIdx()">&#128260; Сбросить урок по номеру</button>
+          <button class="im-menu-danger" onclick="deleteCurrentIntern()">&#128465; Удалить стажёра</button>
         </div>
       </div>
     </div>
 
-    <button class="btn-logout" onclick="doLogout()" style="margin-top:30px;">ВЫЙТИ ИЗ АККАУНТА</button>
+    <!-- Mini stats + chart -->
+    <div class="im-stats-row" id="imStatsRow"></div>
+    <div class="im-chart" id="imChart"></div>
+
+    <!-- Tabs -->
+    <div class="im-tabs">
+      <button class="im-tab active" data-tab="progress" onclick="switchInternTab('progress')">&#128218; Прогресс</button>
+      <button class="im-tab" data-tab="access" onclick="switchInternTab('access')">&#128273; Доступ</button>
+      <button class="im-tab" data-tab="notes" onclick="switchInternTab('notes')">&#128221; Заметки</button>
+    </div>
+
+    <!-- Tab bodies -->
+    <div class="im-body">
+      <!-- Tab: Progress (по умолчанию) -->
+      <div class="im-tabpane active" id="imTabProgress">
+        <div class="im-tab-hint">Список уроков по модулям. Раскрывайте модуль, ставьте оценки и комментарии. Сохраните внизу.</div>
+        <div class="day-progress-list" id="dayProgressList"></div>
+        <button class="btn-save-grades" onclick="saveGrades()" style="margin-top:16px;">&#9989; Сохранить оценки</button>
+      </div>
+
+      <!-- Tab: Access -->
+      <div class="im-tabpane" id="imTabAccess">
+        <h4 class="im-section-h">&#128274; Доступ к урокам</h4>
+        <div class="im-section-hint">Стажёр видит только открытые вами уроки. Открывайте по одному после проверки задания.</div>
+        <div id="lessonUnlockControl"></div>
+
+        <h4 class="im-section-h" style="margin-top:24px;">&#128273; Доступ к категориям</h4>
+        <div class="im-section-hint">«Авто» — по прогрессу. «Открыть» — принудительно. «Закрыть» — заблокировать категорию.</div>
+        <div class="cat-access-list" id="catAccessList"></div>
+      </div>
+
+      <!-- Tab: Notes -->
+      <div class="im-tabpane" id="imTabNotes">
+        <h4 class="im-section-h">&#128221; Заметки куратора</h4>
+        <div class="im-section-hint">Внутренние пометки о стажёре. Видны только админу.</div>
+        <textarea class="admin-note" id="adminNote" placeholder="Добавьте комментарий о стажёре..."></textarea>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -13198,6 +13346,17 @@ document.addEventListener('visibilitychange', function() {
     try { flushCloudPush(); } catch(e) {}
   }
 });
+
+// ESC закрывает модалку детали стажёра
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    var overlay = document.getElementById('internModalOverlay');
+    if (overlay && overlay.classList.contains('show')) {
+      e.preventDefault();
+      hideInternDetail();
+    }
+  }
+});
 // Страховка-ретраер: если cloudPush упал (нет сети, Firestore offline,
 // браузер в фоне) — флаг cloudPushPending остался true. Каждые 30 сек
 // пытаемся снова. Когда сеть вернётся, изменения автоматически уйдут в облако.
@@ -13314,15 +13473,8 @@ function renderAdmin() {
     '<div class="admin-alert ' + a.type + '"><span></span>' + a.text + '</div>'
   ).join('');
 
-  // Chart: interns by progress
-  const chartColors = ['var(--pink)','var(--blue)','var(--green)','var(--yellow)','#9c27b0'];
-  document.getElementById('adminChart').innerHTML = INTERNS.map((intern, i) => {
-    const pct = Math.round(intern.completed / TOTAL_LESSONS * 100);
-    return '<div class="chart-bar-wrap">' +
-      '<div class="chart-bar-val">' + pct + '%</div>' +
-      '<div class="chart-bar" style="height:' + Math.max(pct, 5) + '%;background:' + chartColors[i % chartColors.length] + ';"></div>' +
-      '<div class="chart-bar-label">' + intern.name + '</div></div>';
-  }).join('');
+  // Диаграмма «Динамика обучения» перенесена в модалку стажёра (см. renderInternChart).
+  // На главной admin-странице её больше нет — это сокращает страницу.
 
   // Table with filtered interns
   const tbody = document.getElementById('internTableBody');
@@ -13372,11 +13524,11 @@ function renderAdmin() {
       '<td>' + avg + '</td>' +
       '<td>' + videoPct + '%</td>' +
       '<td><span class="status-badge ' + statusClass + '">' + statusText + '</span></td>' +
-      '<td><span style="color:var(--blue);cursor:pointer;font-size:13px;">Подробнее &rarr;</span> ' +
-      '<button class="admin-delete-btn" onclick="deleteIntern(' + idx + ', event)">&#128465;</button></td></tr>';
+      // Один CTA — открыть модалку. Все действия (профиль/код/удаление/сброс) живут в меню ⋯ внутри модалки.
+      '<td style="white-space:nowrap;text-align:right;"><span style="color:var(--blue);cursor:pointer;font-size:13px;font-weight:600;">Открыть &rarr;</span></td></tr>';
   }).join('');
 
-  document.getElementById('internDetailSection').style.display = 'none';
+  // Старый inline-блок internDetailSection удалён — теперь модалка.
   currentInternIdx = -1;
 }
 
@@ -13430,84 +13582,314 @@ function exportAdmin() {
   showToast('&#128424;', 'Отчёт экспортирован', 'interns_report.csv');
 }
 
+// ===== INTERN DETAIL MODAL =====
+// Открывает центральную модалку с табами «Прогресс / Доступ / Заметки»
+// и accordion по модулям. Заменила раскрывающуюся inline-секцию длиной
+// в 1500px на главной admin-странице.
 function showInternDetail(idx) {
   currentInternIdx = idx;
   const intern = INTERNS[idx];
+  if (!intern) return;
   const tier = getInternTier(intern);
 
-  document.getElementById('internDetailSection').style.display = 'block';
-  var profileLabel = (intern.profile === 'manual') ? '&#128400; Ручной мастер' : '&#128138; Медицинский мастер';
-  var profileToggleText = (intern.profile === 'manual') ? 'Сменить на медицинский' : 'Сменить на ручной';
-  document.getElementById('internDetailTitle').innerHTML =
-    '&#128100; ' + intern.name + ' ' + intern.surname +
-    ' <span style="font-size:13px;font-weight:600;color:#888;margin-left:10px;">' + profileLabel + '</span>' +
-    ' <button onclick="toggleInternProfile(' + idx + ')" style="margin-left:10px;padding:4px 12px;border:1px solid #ccc;background:#fff;border-radius:12px;cursor:pointer;font-size:11px;font-weight:600;color:#555;">&#8635; ' + profileToggleText + '</button>';
-  document.getElementById('idAvatar').textContent = intern.name.charAt(0);
-  document.getElementById('idName').textContent = intern.name + ' ' + intern.surname;
-  document.getElementById('idRank').innerHTML = tier.icon + ' ' + tier.name + ' &bull; ' + tier.pct + '% оценок 4★+';
+  // === Header ===
+  const profileLabel = (intern.profile === 'manual') ? '🖐 Ручной мастер' : '💊 Медицинский мастер';
+  document.getElementById('imAvatar').textContent = (intern.name.charAt(0) || '?').toUpperCase();
+  document.getElementById('imName').textContent = intern.name + ' ' + intern.surname;
+  document.getElementById('imMeta').innerHTML =
+    'Код: <strong>' + escapeHtml(intern.accessCode || '?') + '</strong>' +
+    ' &bull; ' + profileLabel +
+    ' &bull; ' + tier.icon + ' ' + tier.name + ' (' + tier.pct + '%)';
 
-  const doneScores = intern.scores.filter(s => s > 0);
-  const avg = doneScores.length ? (doneScores.reduce((a,b)=>a+b,0) / doneScores.length).toFixed(1) : '-';
-  const totalVideoMin = intern.videoMin.reduce((a,b)=>a+b,0);
+  // === Mini stats ===
+  const doneScores = (intern.scores || []).filter(s => s > 0);
+  const avg = doneScores.length ? (doneScores.reduce((a,b)=>a+b,0) / doneScores.length).toFixed(1) : '—';
+  const totalVideoMin = (intern.videoMin || []).reduce((a,b)=>a+b,0);
+  document.getElementById('imStatsRow').innerHTML =
+    '<div class="im-stat"><div class="im-stat-num">' + (intern.points || 0) + '</div><div class="im-stat-lbl">Баллов</div></div>' +
+    '<div class="im-stat"><div class="im-stat-num">' + (intern.completed || 0) + '/' + TOTAL_LESSONS + '</div><div class="im-stat-lbl">Уроков</div></div>' +
+    '<div class="im-stat"><div class="im-stat-num">' + avg + '</div><div class="im-stat-lbl">Ср. оценка</div></div>' +
+    '<div class="im-stat"><div class="im-stat-num">' + totalVideoMin + ' мин</div><div class="im-stat-lbl">Видео</div></div>';
 
-  document.getElementById('idStats').innerHTML =
-    '<div class="id-stat"><div class="id-stat-num">' + intern.points + '</div><div class="id-stat-label">Баллов</div></div>' +
-    '<div class="id-stat"><div class="id-stat-num">' + intern.completed + '/' + TOTAL_LESSONS + '</div><div class="id-stat-label">Уроков</div></div>' +
-    '<div class="id-stat"><div class="id-stat-num">' + avg + '</div><div class="id-stat-label">Ср. оценка</div></div>' +
-    '<div class="id-stat"><div class="id-stat-num">' + totalVideoMin + ' мин</div><div class="id-stat-label">Видео</div></div>';
+  // === Mini chart: progress per module (динамика обучения) ===
+  renderInternChart(intern);
 
-  // Category access control
+  // === Tab: Доступ ===
   renderCategoryAccessControl(idx);
-
-  // === Lesson-by-lesson unlock control ===
-  // Стажёр видит уроки только до intern.unlockedUntil включительно.
-  // Админ управляет двумя кнопками: открыть следующий / закрыть последний открытый.
   renderLessonUnlockControl(idx);
 
-  const pendingSet = new Set(intern.pendingDays || []);
-  const internAnswers = intern.answers || {};
-  const dpList = document.getElementById('dayProgressList');
-  dpList.innerHTML = LESSONS.map((lesson, i) => {
-    const done = intern.scores[i] > 0;
-    const isPending = pendingSet.has(i) && !done;
-    const answer = internAnswers[i] || '';
-    const curComment = (intern.curatorComments || [])[i] || '';
-    let borderStyle = '';
-    if (isPending) borderStyle = 'border-left:4px solid var(--pink);background:rgba(255,45,123,0.04);';
-    else if (done) borderStyle = 'border-left:4px solid var(--green);';
+  // === Tab: Прогресс — accordion по модулям ===
+  renderProgressAccordion(intern, idx);
 
-    let answerBlock = '';
-    if (answer) {
-      answerBlock =
-        '<div style="margin:8px 0;padding:10px 14px;background:rgba(45,91,255,0.06);border-left:3px solid var(--blue);border-radius:0 10px 10px 0;">' +
-          '<div style="font-size:11px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">&#128221; Ответ стажёра</div>' +
-          '<div style="font-size:13px;color:#333;line-height:1.5;white-space:pre-wrap;">' + escapeHtml(answer) + '</div>' +
-        '</div>';
-    }
-
-    return '<div class="day-progress-item' + (done ? ' done' : '') + '" style="' + borderStyle + '">' +
-      '<div class="dpi-header">' +
-        '<div class="dpi-day">Урок ' + (i+1) + (isPending ? ' &nbsp;<span style="background:var(--pink);color:#fff;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;">&#9203; НА ПРОВЕРКЕ</span>' : '') + '</div>' +
-        '<div class="dpi-title">' + lesson.title + '</div>' +
-      '</div>' +
-      answerBlock +
-      '<div class="dpi-details" style="gap:12px;">' +
-        '<div class="dpi-grade" style="display:flex;align-items:center;gap:8px;">' +
-          '<span style="font-weight:600;font-size:12px;">Оценка (0–5):</span>' +
-          '<input type="number" class="dpi-grade-input" min="0" max="5" value="' + (intern.scores[i] || 0) + '" data-intern="' + idx + '" data-day="' + i + '" ' + (!done ? 'placeholder="—"' : '') + ' style="width:60px;">' +
-        '</div>' +
-        '<div style="flex:1;display:flex;align-items:center;gap:8px;">' +
-          '<span style="font-weight:600;font-size:12px;color:#666;white-space:nowrap;">Комментарий:</span>' +
-          '<input type="text" class="dpi-comment-input" value="' + escapeHtml(curComment) + '" data-day="' + i + '" placeholder="Отзыв куратора (необязательно)" style="flex:1;padding:6px 10px;border:1px solid #ddd;border-radius:8px;font-size:12px;">' +
-        '</div>' +
-      '</div></div>';
-  }).join('');
-
+  // === Tab: Заметки ===
   document.getElementById('adminNote').value = intern.notes || '';
 
-  setTimeout(() => {
-    document.getElementById('internDetailSection').scrollIntoView({behavior:'smooth'});
-  }, 100);
+  // Открываем модалку и сбрасываем активный таб на «Прогресс»
+  switchInternTab('progress');
+  const overlay = document.getElementById('internModalOverlay');
+  overlay.classList.add('show');
+  document.body.style.overflow = 'hidden';
+  // Закрываем дропдаун меню если был открыт
+  const menu = document.getElementById('imMenu');
+  if (menu) menu.classList.remove('show');
+}
+
+function hideInternDetail() {
+  const overlay = document.getElementById('internModalOverlay');
+  overlay.classList.remove('show');
+  document.body.style.overflow = '';
+  const menu = document.getElementById('imMenu');
+  if (menu) menu.classList.remove('show');
+}
+
+function switchInternTab(tab) {
+  document.querySelectorAll('.im-tab').forEach(function(t){
+    t.classList.toggle('active', t.dataset.tab === tab);
+  });
+  document.querySelectorAll('.im-tabpane').forEach(function(p){
+    p.classList.remove('active');
+  });
+  const map = { progress:'imTabProgress', access:'imTabAccess', notes:'imTabNotes' };
+  const target = document.getElementById(map[tab]);
+  if (target) target.classList.add('active');
+}
+
+function toggleInternMenu(e) {
+  e.stopPropagation();
+  const menu = document.getElementById('imMenu');
+  menu.classList.toggle('show');
+  // Закрываем при клике снаружи
+  if (menu.classList.contains('show')) {
+    setTimeout(function(){
+      document.addEventListener('click', function closeMenu(){
+        menu.classList.remove('show');
+        document.removeEventListener('click', closeMenu);
+      });
+    }, 0);
+  }
+}
+
+// Мини-диаграмма прогресса стажёра — заменила «Динамику обучения» на главной
+function renderInternChart(intern) {
+  const host = document.getElementById('imChart');
+  if (!host) return;
+  if (typeof MODULES === 'undefined' || !MODULES) { host.style.display = 'none'; return; }
+  host.style.display = '';
+  const scores = intern.scores || [];
+  const modStats = MODULES.map(function(_, mIdx) {
+    let total = 0, done = 0;
+    for (let i = 0; i < TOTAL_LESSONS; i++) {
+      if (LESSONS[i] && LESSONS[i].module === mIdx) {
+        total++;
+        if (scores[i] > 0) done++;
+      }
+    }
+    return { total: total, done: done, pct: total ? Math.round(done / total * 100) : 0 };
+  });
+
+  host.innerHTML =
+    '<div style="font-size:11px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:10px;">📈 Прогресс по модулям</div>' +
+    '<div style="display:flex;gap:6px;align-items:flex-end;height:60px;">' +
+    modStats.map(function(s, i){
+      const h = Math.max(s.pct, 4);
+      const color = s.pct === 100 ? 'var(--green)' : (s.pct > 0 ? 'var(--blue)' : '#ddd');
+      const title = (MODULES[i] && MODULES[i].title ? MODULES[i].title : ('М' + i)) + ': ' + s.done + '/' + s.total + ' (' + s.pct + '%)';
+      return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;" title="' + escapeHtml(title) + '">' +
+        '<div style="height:' + h + '%;width:100%;background:' + color + ';border-radius:4px 4px 0 0;transition:height 0.3s;"></div>' +
+        '<div style="font-size:10px;color:#888;font-weight:600;">М' + i + '</div>' +
+      '</div>';
+    }).join('') +
+    '</div>';
+}
+
+// Accordion по модулям — раскрытым по умолчанию остаётся только модуль с
+// pending-уроками (или модуль 0, если ничего на проверке).
+function renderProgressAccordion(intern, idx) {
+  const host = document.getElementById('dayProgressList');
+  if (!host) return;
+  const pendingSet = new Set(intern.pendingDays || []);
+  const answers = intern.answers || {};
+  const scores = intern.scores || [];
+  const comments = intern.curatorComments || [];
+
+  // Группируем уроки по модулям
+  const groups = MODULES.map(function(mod, mIdx) {
+    const lessons = [];
+    for (let i = 0; i < TOTAL_LESSONS; i++) {
+      if (LESSONS[i] && LESSONS[i].module === mIdx) {
+        lessons.push(i);
+      }
+    }
+    return { module: mod, mIdx: mIdx, lessons: lessons };
+  });
+
+  // Определяем модуль для авто-раскрытия: первый с pending, иначе первый с открытыми уроками
+  let autoOpenMod = -1;
+  for (const g of groups) {
+    if (g.lessons.some(i => pendingSet.has(i) && !(scores[i] > 0))) {
+      autoOpenMod = g.mIdx; break;
+    }
+  }
+  if (autoOpenMod === -1) {
+    // Иначе раскрываем модуль с текущим открытым уроком стажёра
+    const unlocked = (typeof intern.unlockedUntil === 'number') ? intern.unlockedUntil : 0;
+    autoOpenMod = (LESSONS[unlocked] && typeof LESSONS[unlocked].module === 'number') ? LESSONS[unlocked].module : 0;
+  }
+
+  host.innerHTML = groups.map(function(g) {
+    const total = g.lessons.length;
+    let done = 0, pending = 0;
+    g.lessons.forEach(function(i) {
+      if (scores[i] > 0) done++;
+      if (pendingSet.has(i) && !(scores[i] > 0)) pending++;
+    });
+    const openClass = (g.mIdx === autoOpenMod) ? ' open' : '';
+    const pendingBadge = pending > 0
+      ? '<span class="dp-module-pending">' + pending + ' на проверке</span>'
+      : '';
+
+    const lessonsHtml = g.lessons.map(function(i) {
+      const lesson = LESSONS[i];
+      const lDone = scores[i] > 0;
+      const lPending = pendingSet.has(i) && !lDone;
+      const answer = answers[i] || '';
+      const curComment = comments[i] || '';
+      let borderStyle = '';
+      if (lPending) borderStyle = 'border-left:4px solid var(--pink);background:rgba(255,45,123,0.04);';
+      else if (lDone) borderStyle = 'border-left:4px solid var(--green);';
+
+      let answerBlock = '';
+      if (answer) {
+        answerBlock =
+          '<div style="margin:8px 0;padding:10px 14px;background:rgba(45,91,255,0.06);border-left:3px solid var(--blue);border-radius:0 10px 10px 0;">' +
+            '<div style="font-size:11px;font-weight:700;color:var(--blue);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">📝 Ответ стажёра</div>' +
+            '<div style="font-size:13px;color:#333;line-height:1.5;white-space:pre-wrap;">' + escapeHtml(answer) + '</div>' +
+          '</div>';
+      }
+
+      const resetBtn = lDone
+        ? '<button onclick="resetSingleLesson(' + idx + ',' + i + ',event)" title="Сбросить прогресс по этому уроку" style="background:none;border:1px solid #e0a0a0;color:#c41e3a;border-radius:8px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;">🔄 Сбросить</button>'
+        : '';
+
+      return '<div class="day-progress-item' + (lDone ? ' done' : '') + '" style="' + borderStyle + 'margin-bottom:8px;">' +
+        '<div class="dpi-header">' +
+          '<div class="dpi-day">Урок ' + (i+1) + (lPending ? ' &nbsp;<span style="background:var(--pink);color:#fff;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;">⏳ НА ПРОВЕРКЕ</span>' : '') + '</div>' +
+          '<div class="dpi-title">' + escapeHtml(lesson.title) + '</div>' +
+        '</div>' +
+        answerBlock +
+        '<div class="dpi-details" style="gap:12px;flex-wrap:wrap;">' +
+          '<div class="dpi-grade" style="display:flex;align-items:center;gap:8px;">' +
+            '<span style="font-weight:600;font-size:12px;">Оценка (0–5):</span>' +
+            '<input type="number" class="dpi-grade-input" min="0" max="5" value="' + (scores[i] || 0) + '" data-intern="' + idx + '" data-day="' + i + '" ' + (!lDone ? 'placeholder="—"' : '') + ' style="width:60px;">' +
+          '</div>' +
+          '<div style="flex:1;min-width:200px;display:flex;align-items:center;gap:8px;">' +
+            '<span style="font-weight:600;font-size:12px;color:#666;white-space:nowrap;">Комментарий:</span>' +
+            '<input type="text" class="dpi-comment-input" value="' + escapeHtml(curComment) + '" data-day="' + i + '" placeholder="Отзыв куратора (необязательно)" style="flex:1;padding:6px 10px;border:1px solid #ddd;border-radius:8px;font-size:12px;">' +
+          '</div>' +
+          resetBtn +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    return '<div class="dp-module' + openClass + '" data-mod="' + g.mIdx + '">' +
+      '<div class="dp-module-head" onclick="this.parentElement.classList.toggle(\'open\')">' +
+        '<div class="dp-module-title">📦 ' + escapeHtml(g.module.title) + '</div>' +
+        '<div class="dp-module-meta">' + done + '/' + total + ' ' + pendingBadge + ' <span class="dp-module-arrow">▶</span></div>' +
+      '</div>' +
+      '<div class="dp-module-body">' + lessonsHtml + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+// === Меню действий (⋯) ===
+function changeInternProfile() {
+  const idx = currentInternIdx;
+  if (idx < 0) return;
+  const menu = document.getElementById('imMenu');
+  if (menu) menu.classList.remove('show');
+  toggleInternProfile(idx);   // существующая функция — переключает medical↔manual
+  // refresh modal header/meta
+  showInternDetail(idx);
+}
+
+function changeInternCode() {
+  const idx = currentInternIdx;
+  if (idx < 0) return;
+  const intern = INTERNS[idx];
+  if (!intern) return;
+  const menu = document.getElementById('imMenu');
+  if (menu) menu.classList.remove('show');
+  const newCode = prompt('Новый код доступа для «' + intern.name + ' ' + intern.surname + '»\n\nТекущий код: ' + intern.accessCode + '\nМинимум 4 символа, без пробелов.', intern.accessCode || '');
+  if (newCode === null) return;
+  const cleaned = newCode.trim().replace(/[^0-9A-Za-zА-Яа-яЁё\-_]/g, '');
+  if (!cleaned || cleaned.length < 4) {
+    showToast('⚠', 'Код должен быть минимум 4 символа', '');
+    return;
+  }
+  if (cleaned === intern.accessCode) return;
+  if (INTERNS.some(function(it, i){ return i !== idx && it.accessCode === cleaned; })) {
+    showToast('⚠', 'Такой код уже занят', 'Выберите другой');
+    return;
+  }
+  intern.accessCode = cleaned;
+  persist();
+  showToast('🔑', 'Код доступа изменён', cleaned);
+  showInternDetail(idx);
+  renderAdmin();
+}
+
+function resetLessonByIdx() {
+  const idx = currentInternIdx;
+  if (idx < 0) return;
+  const intern = INTERNS[idx];
+  if (!intern) return;
+  const menu = document.getElementById('imMenu');
+  if (menu) menu.classList.remove('show');
+  const input = prompt('Номер урока для сброса (1–' + TOTAL_LESSONS + ').\nТекущая оценка обнулится, и стажёр сможет пересдать.');
+  if (input === null) return;
+  const lessonNum = parseInt(input, 10);
+  if (isNaN(lessonNum) || lessonNum < 1 || lessonNum > TOTAL_LESSONS) {
+    showToast('⚠', 'Неверный номер урока', '');
+    return;
+  }
+  resetSingleLesson(idx, lessonNum - 1);
+}
+
+function resetSingleLesson(idx, lessonIdx, event) {
+  if (event) event.stopPropagation();
+  const intern = INTERNS[idx];
+  if (!intern) return;
+  const lesson = LESSONS[lessonIdx];
+  if (!lesson) return;
+  if (!confirm('Сбросить прогресс урока «' + lesson.title + '» (#' + (lessonIdx + 1) + ')?\n\nОценка, комментарий куратора и ответ стажёра будут удалены. Стажёр сможет пройти урок заново.')) return;
+  intern.scores = intern.scores || Array(TOTAL_LESSONS).fill(0);
+  intern.scores[lessonIdx] = 0;
+  if (Array.isArray(intern.curatorComments)) intern.curatorComments[lessonIdx] = '';
+  intern.pendingDays = (intern.pendingDays || []).filter(function(d){ return d !== lessonIdx; });
+  if (intern.answers && intern.answers[lessonIdx] !== undefined) delete intern.answers[lessonIdx];
+  // Пересчитываем агрегаты
+  intern.points = (intern.scores || []).reduce(function(a,b){return a+(b||0);}, 0);
+  intern.completed = (intern.scores || []).filter(function(s){return s>0;}).length;
+  persist();
+  showToast('🔄', 'Урок сброшен', lesson.title);
+  showInternDetail(idx);
+  renderAdmin();
+}
+
+function deleteCurrentIntern() {
+  const idx = currentInternIdx;
+  if (idx < 0) return;
+  const intern = INTERNS[idx];
+  if (!intern) return;
+  const menu = document.getElementById('imMenu');
+  if (menu) menu.classList.remove('show');
+  if (!confirm('Удалить стажёра ' + intern.name + ' ' + intern.surname + '?\n\nВся история, оценки и ответы будут потеряны. Действие необратимо.')) return;
+  INTERNS.splice(idx, 1);
+  currentInternIdx = -1;
+  persist();
+  hideInternDetail();
+  renderAdmin();
+  showToast('🗑', 'Стажёр удалён', intern.name + ' ' + intern.surname);
 }
 
 function saveGrades() {
