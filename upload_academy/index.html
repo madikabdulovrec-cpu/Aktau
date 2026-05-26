@@ -2,7 +2,13 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- viewport-fit=cover нужен для iPhone X+, чтобы safe-area-inset
+     значения env() работали. Иначе env(safe-area-inset-*) всегда возвращает 0. -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#FFE600">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="format-detection" content="telephone=no">
 <title>M&M Fabrica — Обучение стажёров</title>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 
@@ -59,9 +65,14 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
 .login-screen {
   display:flex; align-items:center; justify-content:center;
   min-height:100vh;
+  /* На iOS Safari 100vh включает чёрный таб-бар; -webkit-fill-available
+     корректно учитывает только реально видимую часть. */
+  min-height:-webkit-fill-available;
   background: var(--yellow);
   position:relative;
   overflow:hidden;
+  /* Safe-area для notch */
+  padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0) env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
 }
 .login-screen::before {
   content:'';
@@ -2364,10 +2375,10 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
   transform:scale(1.08); box-shadow: 0 4px 12px rgba(0,0,0,0.2);
 }
 .im-menu {
-  position:absolute; top:42px; right:0; background:#fff;
-  border:1px solid rgba(0,0,0,0.1); border-radius:12px;
-  box-shadow:0 8px 24px rgba(0,0,0,0.18);
-  min-width:240px; padding:6px; z-index:5;
+  position:absolute; top:48px; right:0; background:#fff;
+  border:2px solid rgba(0,0,0,0.15); border-radius:14px;
+  box-shadow:0 12px 32px rgba(0,0,0,0.22);
+  min-width:240px; max-width:calc(100vw - 32px); padding:6px; z-index:5;
   display:none; flex-direction:column;
 }
 .im-menu.show { display:flex; }
@@ -2506,6 +2517,9 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
   border-top:2px solid rgba(0,0,0,0.06);
   display:flex; justify-content:center; gap:10px;
   padding:12px 20px; z-index:100;
+  /* iPhone X+ home indicator: добавляем safe-area padding снизу.
+     env(safe-area-inset-bottom) = высота home-indicator (обычно 34px). */
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
 }
 .nav-btn {
   display:flex; flex-direction:column; align-items:center; gap:4px;
@@ -3062,6 +3076,72 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
 
   /* Toast */
   .toast { top:10px; right:10px; left:10px; max-width:none; padding:12px 16px; font-size:13px; }
+
+  /* Universal dialog (modalConfirm/modalPrompt) — mobile */
+  .dlg-card { padding:22px 20px 18px; }
+  .dlg-icon { font-size:34px; }
+  .dlg-title { font-size:16px; }
+  .dlg-msg { font-size:13px; }
+  .dlg-actions { flex-direction:column-reverse; gap:8px; }
+  .dlg-btn { padding:14px 16px; font-size:13px; min-height:48px; }
+
+  /* Intern modal header — длинное имя не должно лезть на кнопки */
+  .im-name { font-size:15px; }
+  .im-meta { font-size:11px; }
+  .im-avatar { width:44px; height:44px; font-size:18px; }
+  .im-icon-btn { width:44px; height:44px; font-size:16px; }
+  .im-stats-row { grid-template-columns: repeat(2, 1fr); gap:8px; padding:12px 14px 6px; }
+  .im-tabs { padding:0 8px; }
+  .im-tab { padding:14px 4px; font-size:11px; min-height:48px; }
+  .im-body { padding:12px 14px 24px; }
+  /* Inputs внутри модалки — минимум 16px чтобы Safari не зуммил */
+  .im-body input, .im-body textarea, .im-body select { font-size:16px !important; }
+
+  /* Alerts modal */
+  .alerts-btn { padding:12px 14px; gap:10px; }
+  .alerts-bell { width:40px; height:40px; font-size:18px; }
+  .alerts-btn-title { font-size:13px; }
+  .al-chip { font-size:10px; padding:2px 8px; }
+  .am-header { padding:14px 16px; }
+  .am-title { font-size:16px; }
+  .am-body { padding:14px 16px 24px; }
+  .am-item { padding:10px 12px; }
+  .am-item-name { font-size:13px; }
+  .am-item-meta { font-size:11px; }
+
+  /* Add intern modal — input font ≥ 16 для iOS */
+  .add-intern-form input { font-size:16px !important; }
+  .add-intern-form { padding:30px 22px; }
+
+  /* Touch-target гарантия: все .btn-*, .role-btn ≥ 44px */
+  .role-btn, .nav-btn, .admin-add-btn, .admin-export-btn, .btn-form,
+  .btn-primary, .btn-secondary, .btn-outline, .btn-whatsapp, .btn-enter,
+  .btn-submit, .btn-save-grades { min-height:44px; }
+
+  /* Safe-area-inset для iPhone X+ (нижний home indicator) */
+  .bottom-nav {
+    padding-bottom: calc(env(safe-area-inset-bottom, 0) + 8px);
+  }
+
+  /* Login dlg-input — 16px чтобы Safari не зуммил */
+  .login-box input { font-size:16px; }
+
+  /* Lesson screen — assignment textarea iOS friendly */
+  .assignment-card textarea, #assignmentArea { font-size:16px !important; }
+
+  /* Intern table cells — растягивает на мобиле, делаем переносы */
+  .intern-table td, .intern-row td {
+    word-break: break-word;
+  }
+}
+
+/* === Защита от Safari iOS «100vh без bottom-bar» === */
+@supports (-webkit-touch-callout: none) {
+  /* На iOS Safari 100vh включает чёрный таб-бар браузера, который потом
+     уезжает при скролле — модалки прыгают. Используем 100% от parent. */
+  .intern-modal, .alerts-modal {
+    max-height: -webkit-fill-available;
+  }
 }
 
 @media(max-width:400px) {
@@ -13672,6 +13752,21 @@ function purgeDemoInterns() {
     localStorage.setItem(PURGE_DEMO_FLAG, '1');
   } catch (e) { console.warn('[academy] purgeDemoInterns failed:', e); }
 }
+
+// ===== Глобальный error handler =====
+// Async-функции из onclick (modalConfirm, modalPrompt) могут выбросить
+// исключение — браузер по умолчанию его проглатывает. Ловим и логируем.
+window.addEventListener('unhandledrejection', function(e) {
+  console.error('[academy] Unhandled promise rejection:', e.reason);
+  try {
+    showToast('&#9888;', 'Произошла ошибка', String(e.reason && e.reason.message || e.reason || 'Неизвестная').slice(0, 80));
+  } catch(_) {}
+});
+window.addEventListener('error', function(e) {
+  // Игнорируем ошибки от внешних скриптов (Firebase SDK и т.п.)
+  if (e.filename && e.filename.indexOf(location.host) === -1 && e.filename !== '') return;
+  console.error('[academy] Global error:', e.message, 'at', e.filename + ':' + e.lineno);
+});
 
 // ===== BOOT =====
 storageHealthCheck();
