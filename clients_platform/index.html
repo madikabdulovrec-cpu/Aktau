@@ -441,7 +441,7 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
         <button class="btn btn-danger" id="btnDelete" onclick="deleteClient()" style="display:none;">Удалить карточку</button>
         <div style="display:flex; gap:10px; margin-left:auto;">
           <button class="btn btn-light" onclick="showScreen('dashScreen')">Отмена</button>
-          <button class="btn btn-primary" onclick="saveClient()">Сохранить</button>
+          <button class="btn btn-primary" id="btnSaveClient" onclick="saveClient()">Сохранить</button>
         </div>
       </div>
     </div>
@@ -896,9 +896,12 @@ function cloudLoad() {
       refreshLoginGate();
       return;
     }
-    // Применяем cloud-данные ПОВЕРХ локальных (cloud — источник правды)
-    if(data.staff) STATE.staff = data.staff;
-    if(data.clients) STATE.clients = data.clients;
+    // MERGE с локальным STATE, НЕ прямое замещение. Если мастер закрыл вкладку
+    // с несохранёнными правками (cloudPush не успел) — они в localStorage,
+    // подгрузились в STATE через loadState, и merge их сохранит при следующем
+    // запуске. Прямое replace стерло бы их.
+    if(data.staff)   STATE.staff   = mergeArraysById(STATE.staff,   data.staff);
+    if(data.clients) STATE.clients = mergeArraysById(STATE.clients, data.clients);
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     cloudInitialLoadDone = true;
@@ -910,9 +913,19 @@ function cloudLoad() {
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
     refreshLoginGate();
+    // Если в localStorage остались правки, которые ещё не дошли до cloud —
+    // (например, мастер закрыл вкладку до cloudPush) — догонит сейчас.
+    if(cloudLastHash !== quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}))) {
+      console.log('[cloud] local has unsaved changes — pushing now');
+      cloudPush().catch(e => console.error('[cloud] catch-up push failed', e));
+    }
   }).catch(e => {
     console.error('[cloud] load fail', e);
     cloudInitialLoadDone = true;
+    // Показываем мастеру, что облако не подключилось — иначе он будет думать,
+    // что всё ок, и потерять данные при закрытии вкладки.
+    setCloudBadge('off');
+    if(typeof toast === 'function') toast('Облако недоступно. Изменения сохраняются локально','error');
     refreshLoginGate();
   });
 }
@@ -920,11 +933,26 @@ function cloudSubscribe() {
   if(!db || cloudUnsubscribe) return;
   cloudUnsubscribe = db.collection('mmClients').doc('data').onSnapshot(snap => {
     if(!snap.exists) return;
+    // КРИТИЧНО (фикс инцидента Оксаны 27.05):
+    // 1) Firebase SDK триггерит onSnapshot ДВАЖДЫ на каждый собственный write —
+    //    сначала с metadata.hasPendingWrites=true (local optimistic cache),
+    //    потом с false (после server-ack). Если мы реагируем на первый snapshot,
+    //    мы можем перетереть STATE данными, которые сами только что начали пушить.
+    // 2) fromCache=true — это offline-кэш, тоже не источник правды для merge.
+    if(snap.metadata && snap.metadata.hasPendingWrites) return;
+    if(snap.metadata && snap.metadata.fromCache) return;
+
     const data = snap.data();
-    // Не затираем своими пустыми данными
+    // Не затираем своими пустыми данными (cloud=пусто, локально что-то есть)
     if((!data.clients || data.clients.length===0) && (!data.staff || data.staff.length===0) && (STATE.clients.length>0 || STATE.staff.length>0)) return;
-    if(data.staff) STATE.staff = data.staff;
-    if(data.clients) STATE.clients = data.clients;
+
+    // MERGE, НЕ REPLACE (фикс P0-4): прямое присваивание STATE.clients = data.clients
+    // стирало несохранённые правки мастера, если он редактировал карточку и
+    // cloudPush ещё не успел уйти. Merge по id с приоритетом свежего updatedAt:
+    // remote-only записи (новые от Worker'а) добавляются, локальные правки
+    // (с большим updatedAt) сохраняются и потом догонят cloud при следующем push.
+    if(data.staff)   STATE.staff   = mergeArraysById(STATE.staff,   data.staff);
+    if(data.clients) STATE.clients = mergeArraysById(STATE.clients, data.clients);
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     // Real-time: если суперадмин деактивировал мастера прямо сейчас — выкидываем
@@ -969,9 +997,37 @@ async function cloudPush() {
     if(currentScreen==='adminScreen') renderAdmin();
   } catch(e) {
     console.error('[cloud] push fail', e);
-    if(String(e.message||'').includes('exceeds')) toast('Документ слишком большой — настройте Cloudinary для фото','error');
-    // hash НЕ обновляем — пусть следующий push повторит попытку
+    if(String(e.message||'').includes('exceeds')) {
+      toast('Документ слишком большой — настройте Cloudinary для фото','error');
+    } else {
+      // Видимо для мастера: критично, чтобы он понял, что его правки НЕ ушли
+      // в облако и НЕ закрывал вкладку. Без этого — тихая потеря данных.
+      toast('Не удалось сохранить в облако — попробуйте ещё раз','error');
+    }
+    // hash НЕ обновляем — пусть следующий push повторит попытку.
+    // Запускаем повторный push через 3 сек на случай временной сетевой проблемы.
+    if(!cloudPushRetryTimer) {
+      cloudPushRetryTimer = setTimeout(() => {
+        cloudPushRetryTimer = null;
+        cloudPush().catch(()=>{});
+      }, 3000);
+    }
+    // Прокидываем ошибку для await-вызовов (saveClient и т.д.), чтобы они
+    // могли её показать и не вели пользователя дальше как при успехе.
+    throw e;
   }
+}
+let cloudPushRetryTimer = null;
+
+// Немедленный flush pending debounced push. Используется в критичных save-flow
+// (saveClient, deleteClient, saveSession, …): после изменения STATE мы ОТМЕНЯЕМ
+// debounce-таймер и ждём реального завершения записи в Firestore. Это устраняет
+// баг «toast Сохранено» при не-доставленных данных (если мастер закрыл вкладку
+// быстрее 800мс debounce). Возвращает Promise — await'ить в async save-функциях.
+async function cloudPushFlush() {
+  if(cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
+  if(!db || !cloudInitialLoadDone) return; // в локальном режиме нечего пушить
+  return cloudPush();
 }
 
 // Merge двух массивов записей по id. Local имеет преимущество ТОЛЬКО если
@@ -998,9 +1054,22 @@ function mergeArraysById(localArr, remoteArr) {
   return Array.from(byId.values());
 }
 
+// Раньше: debounce 800мс. Это создавало баг «Натальи» — если мастер закрывал
+// вкладку быстрее 800мс после нажатия «Сохранить», cloudPush никогда не
+// выполнялся, данные оставались только в localStorage и не доходили до Firestore.
+// Теперь пушим СРАЗУ (без таймера). saveState вызывается только из
+// финальных save/delete-кнопок (не onChange), поэтому лишних push'ей не будет.
+// runTransaction в Firebase SDK сам обрабатывает contention при быстрых
+// последовательных вызовах. Имя функции оставлено для совместимости.
 function cloudPushDebounced() {
-  if(cloudPushTimer) clearTimeout(cloudPushTimer);
-  cloudPushTimer = setTimeout(cloudPush, 800);
+  if(cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
+  // Не await — saveState синхронная по соглашению, но кикаем cloudPush
+  // сразу же. Критичные save-flow (saveClient, deleteClient) могут после
+  // saveState дополнительно `await cloudPushFlush()` для надёжности.
+  cloudPush().catch(e => {
+    // Ошибка уже залогирована и показана через toast внутри cloudPush.
+    // Здесь — глотаем, чтобы не было uncaught promise rejection.
+  });
 }
 function saveLocalOnly() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({staff:STATE.staff, clients:STATE.clients})); } catch(e){}
@@ -1385,7 +1454,7 @@ function getChecked(group) {
   return [...document.querySelectorAll(`[data-group="${group}"] input:checked`)].map(i => i.value);
 }
 
-function saveClient() {
+async function saveClient() {
   const fio = document.getElementById('f_fio').value.trim();
   const age = document.getElementById('f_age').value.trim();
   if(!fio || !age) { toast('Заполните ФИО и возраст','error'); return; }
@@ -1417,18 +1486,47 @@ function saveClient() {
     updatedAt: Date.now(),
   };
 
-  if(editingClientId) {
-    const i = STATE.clients.findIndex(c => c.id===editingClientId);
-    if(i>=0) STATE.clients[i] = { ...STATE.clients[i], ...data };
-    toast('Карточка обновлена');
+  // Сохраняем снимок STATE до изменений — на случай отката если cloudPush упадёт.
+  const wasEditing = !!editingClientId;
+  const prevIdx = wasEditing ? STATE.clients.findIndex(c => c.id===editingClientId) : -1;
+  const prevSnapshot = prevIdx>=0 ? STATE.clients[prevIdx] : null;
+
+  if(wasEditing) {
+    if(prevIdx>=0) STATE.clients[prevIdx] = { ...prevSnapshot, ...data };
   } else {
     const c = { id:uid(), ...data, sessions:[], altegioId:'', altegioLink:'', createdAt:Date.now() };
     STATE.clients.unshift(c);
     editingClientId = c.id;
-    toast('Карточка создана');
   }
-  saveState();
-  openClientCard(editingClientId);
+
+  // Сохраняем локально сразу (UX моментальный, и если cloudPush упадёт,
+  // данные не теряются — догонят при следующем визите через cloudLoad merge).
+  saveLocalOnly();
+
+  // Дизейблим кнопку «Сохранить», чтобы мастер не закрыл вкладку
+  // и не нажал второй раз пока идёт асинхронная запись в Firestore.
+  // КРИТИЧНО: раньше тут был тост «Карточка обновлена» + saveState() +
+  // openClientCard() ДО успешного push. Мастер видел зелёный «Сохранено»,
+  // закрывал вкладку, debounce-таймер 800мс не успевал — данные не уходили
+  // в облако (баг «Натальи»: updatedAt в Firestore оставался от Worker'а).
+  const btn = document.getElementById('btnSaveClient');
+  const prevText = btn ? btn.textContent : '';
+  if(btn) { btn.disabled = true; btn.textContent = 'Сохраняем…'; }
+
+  try {
+    // Принудительно отменяем debounce и ждём реальной транзакции Firestore.
+    await cloudPushFlush();
+    toast(wasEditing ? 'Карточка обновлена' : 'Карточка создана');
+    openClientCard(editingClientId);
+  } catch(e) {
+    // cloudPush уже показал error-toast. Восстанавливаем кнопку, оставляем
+    // пользователя на форме (он видит свои правки и может попробовать снова).
+    // Локальный STATE и localStorage уже содержат правки — догонят при
+    // успешном push (после retry или при следующем визите через cloudLoad).
+    console.error('[saveClient] cloud sync failed:', e?.message || e);
+  } finally {
+    if(btn) { btn.disabled = false; btn.textContent = prevText; }
+  }
 }
 
 function deleteClient() {
@@ -2062,6 +2160,26 @@ function toast(text, kind) {
 
 // Enter в логине
 document.getElementById('loginPass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+
+// Flush pending cloudPush при закрытии/сворачивании вкладки. Это страховка
+// от инцидента «Натальи»: если debounce-таймер ещё не сработал (800мс), а
+// мастер уже закрыл вкладку — без этого слушателя данные оставались только
+// в localStorage и НИКОГДА не доходили до Firestore. Здесь мы ловим момент
+// перехода вкладки в background/закрытия и форсим push.
+// pagehide надёжнее unload (срабатывает в iOS Safari при свайпе), а
+// visibilitychange покрывает Android Chrome когда тab уходит в фон.
+function flushPendingPush() {
+  if(cloudPushTimer) {
+    clearTimeout(cloudPushTimer); cloudPushTimer = null;
+    // Не await — pagehide синхронный, но fetch уйдёт в keepalive-режиме
+    // на уровне Firebase SDK (он обычно использует sendBeacon для критичных).
+    try { cloudPush().catch(()=>{}); } catch(e){}
+  }
+}
+window.addEventListener('pagehide', flushPendingPush);
+window.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'hidden') flushPendingPush();
+});
 </script>
 </body>
 </html>
