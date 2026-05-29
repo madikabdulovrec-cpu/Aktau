@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260529-autosave-drafts">
+<meta name="app-version" content="20260529-inplace-merge-dirty">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -937,6 +937,24 @@ function initCloud() {
     refreshLoginGate();
   }
 }
+// ============================================================
+// DIRTY TRACKING (фикс Bug #2 + Bug #8 от 2026-05-29 ревью)
+// ============================================================
+// Раньше: cloudSubscribe мерджил remote с локалом и присваивал STATE.clients
+// НОВОЙ ССЫЛКЕ. Если в этот момент saveClient делал
+//   STATE.clients[prevIdx] = {...prevSnapshot, ...data}
+// между этой строкой и `await cloudPushFlush()` — запись уходила в осиротевший
+// старый массив, а cloudPush отправлял в облако НОВЫЙ массив без правок.
+// Симптом: «UI говорит "Сохранено", через час карточка снова пустая».
+//
+// Фикс: cloudDirtyIds — set id'ов, которые мастер сейчас редактирует или
+// которые в pending-push'е. cloudSubscribe НЕ ПЕРЕТИРАЕТ эти карточки из remote.
+// А все merge'ы теперь МУТИРУЮТ STATE.clients in-place — без создания нового
+// массива. Поэтому ссылка STATE.clients[i] остаётся валидной через await.
+const cloudDirtyIds = new Set();
+function markCardDirty(id) { if(id) cloudDirtyIds.add(id); }
+function clearCardDirty(id) { if(id) cloudDirtyIds.delete(id); }
+
 function cloudLoad() {
   if(!db) return;
   db.collection('mmClients').doc('data').get().then(snap => {
@@ -959,12 +977,10 @@ function cloudLoad() {
       refreshLoginGate();
       return;
     }
-    // MERGE с локальным STATE, НЕ прямое замещение. Если мастер закрыл вкладку
-    // с несохранёнными правками (cloudPush не успел) — они в localStorage,
-    // подгрузились в STATE через loadState, и merge их сохранит при следующем
-    // запуске. Прямое replace стерло бы их.
-    if(data.staff)   STATE.staff   = mergeArraysById(STATE.staff,   data.staff);
-    if(data.clients) STATE.clients = mergeArraysById(STATE.clients, data.clients);
+    // MERGE in-place: НЕ создаём новый STATE.clients массив. Поэтому ссылки
+    // на индексы (как в saveClient → prevIdx) переживают через await.
+    if(data.staff)   mergeIntoLocal(STATE.staff,   data.staff,   null);
+    if(data.clients) mergeIntoLocal(STATE.clients, data.clients, cloudDirtyIds);
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     cloudInitialLoadDone = true;
@@ -1009,13 +1025,15 @@ function cloudSubscribe() {
     // Не затираем своими пустыми данными (cloud=пусто, локально что-то есть)
     if((!data.clients || data.clients.length===0) && (!data.staff || data.staff.length===0) && (STATE.clients.length>0 || STATE.staff.length>0)) return;
 
-    // MERGE, НЕ REPLACE (фикс P0-4): прямое присваивание STATE.clients = data.clients
-    // стирало несохранённые правки мастера, если он редактировал карточку и
-    // cloudPush ещё не успел уйти. Merge по id с приоритетом свежего updatedAt:
-    // remote-only записи (новые от Worker'а) добавляются, локальные правки
-    // (с большим updatedAt) сохраняются и потом догонят cloud при следующем push.
-    if(data.staff)   STATE.staff   = mergeArraysById(STATE.staff,   data.staff);
-    if(data.clients) STATE.clients = mergeArraysById(STATE.clients, data.clients);
+    // MERGE in-place (фикс Bug #2 от 2026-05-29 ревью):
+    // Раньше STATE.clients = mergeArraysById(...) создавало НОВЫЙ массив.
+    // Это убивало правки мастера, если saveClient был между записью в STATE и
+    // await cloudPushFlush — наша запись уходила в осиротевший массив.
+    // Теперь mergeIntoLocal мутирует STATE.clients на месте.
+    // Плюс: карточки в cloudDirtyIds (которые мастер сейчас редактирует или
+    // которые в pending push) — НЕ перетираются remote-копией.
+    if(data.staff)   mergeIntoLocal(STATE.staff,   data.staff,   null);
+    if(data.clients) mergeIntoLocal(STATE.clients, data.clients, cloudDirtyIds);
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     // Real-time: если суперадмин деактивировал мастера прямо сейчас — выкидываем
@@ -1041,19 +1059,21 @@ async function cloudPush() {
 
   try {
     const ref = db.collection('mmClients').doc('data');
-    let mergedClients = STATE.clients, mergedStaff = STATE.staff;
     await db.runTransaction(async tx => {
       const snap = await tx.get(ref);
       const remote = snap.exists ? (snap.data() || {}) : {};
-      mergedClients = mergeArraysById(STATE.clients, remote.clients || []);
-      mergedStaff   = mergeArraysById(STATE.staff,   remote.staff   || []);
-      tx.set(ref, { staff: mergedStaff, clients: mergedClients, ts: Date.now() });
+      // MERGE in-place в STATE: мутируем массивы, ссылки сохраняются. Это
+      // важно для одновременного saveClient(): его prevIdx был валиден до
+      // await, и должен остаться валидным после tx.set.
+      // dirtyIds=null здесь — внутри транзакции мы хотим merge'нуть ВСЕ remote
+      // изменения, чтобы tx.set отправил полный консистентный массив (иначе
+      // remote-only записи от Worker'а потеряются при следующем push).
+      mergeIntoLocal(STATE.staff,   remote.staff   || [], null);
+      mergeIntoLocal(STATE.clients, remote.clients || [], null);
+      // tx.set отправляет полный массив — сериализуем сейчас, чтобы зафиксировать
+      // снимок и избежать гонки с дальнейшими мутациями STATE.
+      tx.set(ref, { staff: [...STATE.staff], clients: [...STATE.clients], ts: Date.now() });
     });
-    // Транзакция могла привести remote-only записи (от Worker'а) — подтягиваем
-    // их в локальный STATE, чтобы UI сразу их видел, и пересчитываем hash,
-    // чтобы дубли не пушили.
-    STATE.clients = mergedClients;
-    STATE.staff   = mergedStaff;
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     if(currentScreen==='dashScreen') renderClientList();
@@ -1093,28 +1113,97 @@ async function cloudPushFlush() {
   return cloudPush();
 }
 
-// Merge двух массивов записей по id. Local имеет преимущество ТОЛЬКО если
-// его updatedAt новее remote — иначе побеждает remote (свежие изменения от
-// Worker'а или с другого устройства не теряются). Записи, существующие
-// только в одной стороне, попадают в результат как есть.
-// ВАЖНО: hard-delete на стороне платформы (записи нет в local, но есть в
-// remote) воспринимается как "remote свежее" → карточка "воскреснет". Чтобы
-// действительно удалить, ставь флаг deleted=true (soft-delete), он переживёт
-// merge и UI должен фильтровать таких.
-function mergeArraysById(localArr, remoteArr) {
-  const byId = new Map();
-  for(const r of (remoteArr || [])) {
-    if(r && r.id) byId.set(r.id, r);
+// MERGE in-place: мутирует localArr, добавляя/обновляя записи из remoteArr.
+// КЛЮЧЕВОЕ: НЕ возвращает новый массив. STATE.clients остаётся той же ссылкой,
+// поэтому STATE.clients[prevIdx] = {...} остаётся валидным через await.
+//
+// Поведение для каждой записи r из remoteArr:
+//  - Если r нет в localArr → push в localArr.
+//  - Если r есть в localArr и id ∈ dirtyIds (мастер сейчас редактирует) → SKIP
+//    (мы не имеем права перетереть текущие правки remote-копией).
+//  - Если оба updatedAt равны → ничего не делаем (нет конфликта).
+//  - Если remote свежее ИЛИ local пуст по master-полям → field-level merge:
+//    altegio-поля (fio, phone, altegioId, altegioLink, deleted) берём
+//    у победителя по updatedAt; master-поля (complaints, anamnesis, sessions,
+//    measurements, фото, etc.) — берём у того, у кого они НЕ ПУСТЫЕ; при
+//    обоих заполненных — победитель по updatedAt. Это спасает от ситуации,
+//    когда Worker bump'нул updatedAt (изменив только fio), а merge раньше
+//    выкидывал ВСЁ master-наполнение, выбрав remote-копию целиком.
+//
+// Local-only записи (нет в remote) — остаются в localArr нетронутыми.
+// soft-delete: запись с deleted=true остаётся в массиве, UI её фильтрует.
+function mergeIntoLocal(localArr, remoteArr, dirtyIds) {
+  if(!Array.isArray(localArr) || !Array.isArray(remoteArr)) return;
+  const localIdxById = new Map();
+  for(let i = 0; i < localArr.length; i++) {
+    const x = localArr[i];
+    if(x && x.id) localIdxById.set(x.id, i);
   }
-  for(const l of (localArr || [])) {
-    if(!l || !l.id) continue;
-    const existing = byId.get(l.id);
-    if(!existing) { byId.set(l.id, l); continue; }
+  for(const r of remoteArr) {
+    if(!r || !r.id) continue;
+    // Skip карточек которые мастер сейчас редактирует. Мы их обновим сами
+    // через saveClient/persistFormToState.
+    if(dirtyIds && dirtyIds.has(r.id)) continue;
+    const i = localIdxById.get(r.id);
+    if(i === undefined) {
+      // remote-only: добавляем как есть.
+      localArr.push(r);
+      continue;
+    }
+    const l = localArr[i];
     const lTs = Number(l.updatedAt) || 0;
-    const rTs = Number(existing.updatedAt) || 0;
-    byId.set(l.id, lTs >= rTs ? l : existing);
+    const rTs = Number(r.updatedAt) || 0;
+    if(rTs <= lTs) continue; // наша версия не старше — оставляем как есть
+    // Field-level merge: remote свежее, но мы аккуратно сохраняем master-поля.
+    localArr[i] = mergeRecordFields(l, r);
   }
-  return Array.from(byId.values());
+}
+
+// Field-level merge для двух версий одной и той же карточки (по id).
+// remote свежее (rTs > lTs), но у local могут быть master-поля, которые
+// remote НЕ содержит (например, Worker записал fio/phone/altegioId, а
+// anamnesis/sessions создаёт мастер на платформе — Worker их пишет [] и
+// не трогает при обновлении).
+function mergeRecordFields(local, remote) {
+  // Стартуем с remote (он свежее по updatedAt).
+  const merged = { ...remote };
+  for(const f of MASTER_FIELDS) {
+    const lv = local[f], rv = remote[f];
+    const lEmpty = isFieldEmpty(lv), rEmpty = isFieldEmpty(rv);
+    if(!lEmpty && rEmpty) {
+      // У нас есть данные, у remote нет — наши данные не теряем.
+      merged[f] = lv;
+    } else if(!lEmpty && !rEmpty) {
+      // Оба заполнены. Конфликт. Если local-updatedAt был равен или старше — мы
+      // уже скипнули в mergeIntoLocal. Здесь remote свежее → побеждает remote.
+      // (Если хотим иначе — менять политику здесь.)
+      merged[f] = rv;
+    }
+    // оба пусты или local пуст — оставляем remote (уже в merged).
+  }
+  return merged;
+}
+const MASTER_FIELDS = [
+  'complaints', 'anamnesis', 'anamnesisOther', 'recommendations',
+  'initialPhotos', 'sessions', 'measurements',
+  'source', 'age', 'weight', 'height',
+  'date', 'specialist', 'specialistId', 'altegioLink',
+];
+function isFieldEmpty(v) {
+  if(v === null || v === undefined) return true;
+  if(typeof v === 'string') return v.trim() === '';
+  if(Array.isArray(v)) return v.length === 0;
+  if(typeof v === 'object') return Object.keys(v).length === 0;
+  return false;
+}
+
+// Backward-compat shim: старый код мог вызывать mergeArraysById с возвратом
+// нового массива. Не используем больше в основном пути, но если осталось
+// где-то ещё (или внешние плагины) — функция работает корректно.
+function mergeArraysById(localArr, remoteArr) {
+  const out = Array.isArray(localArr) ? [...localArr] : [];
+  mergeIntoLocal(out, remoteArr || [], null);
+  return out;
 }
 
 // Раньше: debounce 800мс. Это создавало баг «Натальи» — если мастер закрывал
@@ -1549,18 +1638,36 @@ async function saveClient() {
     updatedAt: Date.now(),
   };
 
-  // Сохраняем снимок STATE до изменений — на случай отката если cloudPush упадёт.
+  // Снимок STATE до изменений — на случай отката если cloudPush упадёт.
   const wasEditing = !!editingClientId;
-  const prevIdx = wasEditing ? STATE.clients.findIndex(c => c.id===editingClientId) : -1;
+  let prevIdx = wasEditing ? STATE.clients.findIndex(c => c.id===editingClientId) : -1;
   const prevSnapshot = prevIdx>=0 ? STATE.clients[prevIdx] : null;
 
-  if(wasEditing) {
-    if(prevIdx>=0) STATE.clients[prevIdx] = { ...prevSnapshot, ...data };
+  // Фикс Bug #1 (silent NOP): если editingClientId есть, но карточки нет в STATE
+  // (race condition: cloudSubscribe заменил массив, или import/reset, или Worker
+  // soft-deleted — раньше мы молча НИЧЕГО не делали, но toast «обновлено» уходил).
+  // Теперь: восстанавливаем запись с ТЕМ ЖЕ id (чтобы altegio-связь не потерялась).
+  if(wasEditing && prevIdx<0) {
+    console.warn('[saveClient] editing card lost from STATE — recreating with same id', editingClientId);
+    STATE.clients.unshift({
+      id: editingClientId, ...data,
+      sessions: [], measurements: [],
+      altegioId: '', altegioLink: '',
+      createdAt: Date.now(),
+    });
+    prevIdx = 0;
+  } else if(wasEditing) {
+    STATE.clients[prevIdx] = { ...prevSnapshot, ...data };
   } else {
-    const c = { id:uid(), ...data, sessions:[], altegioId:'', altegioLink:'', createdAt:Date.now() };
+    const c = { id:uid(), ...data, sessions:[], measurements:[], altegioId:'', altegioLink:'', createdAt:Date.now() };
     STATE.clients.unshift(c);
     editingClientId = c.id;
+    prevIdx = 0;
   }
+
+  // Фикс Bug #2: помечаем карточку dirty, чтобы cloudSubscribe не перетёр её
+  // remote-копией пока pending push не подтвердился. Снимаем после push'а в finally.
+  markCardDirty(editingClientId);
 
   // Сохраняем локально сразу (UX моментальный, и если cloudPush упадёт,
   // данные не теряются — догонят при следующем визите через cloudLoad merge).
@@ -1568,19 +1675,48 @@ async function saveClient() {
 
   // Дизейблим кнопку «Сохранить», чтобы мастер не закрыл вкладку
   // и не нажал второй раз пока идёт асинхронная запись в Firestore.
-  // КРИТИЧНО: раньше тут был тост «Карточка обновлена» + saveState() +
-  // openClientCard() ДО успешного push. Мастер видел зелёный «Сохранено»,
-  // закрывал вкладку, debounce-таймер 800мс не успевал — данные не уходили
-  // в облако (баг «Натальи»: updatedAt в Firestore оставался от Worker'а).
   const btn = document.getElementById('btnSaveClient');
   const prevText = btn ? btn.textContent : '';
   if(btn) { btn.disabled = true; btn.textContent = 'Сохраняем…'; }
 
+  const savedId = editingClientId; // зафиксируем — может измениться через async
   try {
     // Принудительно отменяем debounce и ждём реальной транзакции Firestore.
     await cloudPushFlush();
+
+    // Фикс Bug #2 (post-await sanity check): после await event loop отпускался
+    // и cloudSubscribe мог что-то сделать. Проверим что наша запись осталась
+    // в STATE с нужными данными. Если нет — restore и re-push.
+    const idxAfter = STATE.clients.findIndex(c => c.id===savedId);
+    if(idxAfter < 0) {
+      console.warn('[saveClient] card disappeared after push — restoring', savedId);
+      STATE.clients.unshift({
+        id: savedId, ...data,
+        sessions: prevSnapshot?.sessions || [],
+        measurements: prevSnapshot?.measurements || [],
+        altegioId: prevSnapshot?.altegioId || '',
+        altegioLink: prevSnapshot?.altegioLink || '',
+        createdAt: prevSnapshot?.createdAt || Date.now(),
+      });
+      saveLocalOnly();
+      await cloudPushFlush();
+    } else {
+      // Если remote-победитель (от Worker) пришёл за время await и затёр
+      // master-поля — повторно применим наши data (наш updatedAt свежее).
+      const cur = STATE.clients[idxAfter];
+      const ourUpdatedAt = data.updatedAt;
+      if((cur.updatedAt || 0) <= ourUpdatedAt) {
+        // нормально, наша версия — самая свежая
+      } else {
+        // Кто-то записал поверх. Применяем наши значения ещё раз.
+        STATE.clients[idxAfter] = { ...cur, ...data, updatedAt: Date.now() };
+        saveLocalOnly();
+        await cloudPushFlush();
+      }
+    }
+
     toast(wasEditing ? 'Карточка обновлена' : 'Карточка создана');
-    openClientCard(editingClientId);
+    openClientCard(savedId);
   } catch(e) {
     // cloudPush уже показал error-toast. Восстанавливаем кнопку, оставляем
     // пользователя на форме (он видит свои правки и может попробовать снова).
@@ -1589,6 +1725,9 @@ async function saveClient() {
     console.error('[saveClient] cloud sync failed:', e?.message || e);
   } finally {
     if(btn) { btn.disabled = false; btn.textContent = prevText; }
+    // ВАЖНО: dirty снимаем ТОЛЬКО после try, иначе при retry'е cloudSubscribe
+    // успеет затереть.
+    clearCardDirty(savedId);
   }
 }
 
@@ -2207,6 +2346,7 @@ function toast(text, kind) {
    ============================================================ */
 (async () => {
   await loadState();
+  cleanupExpiredDrafts();
   initCloud();
   refreshLoginGate();
 
@@ -2358,27 +2498,77 @@ async function persistFormToState(opts) {
   };
 
   const wasEditing = !!editingClientId;
-  const prevIdx = wasEditing ? STATE.clients.findIndex(c => c.id===editingClientId) : -1;
+  let prevIdx = wasEditing ? STATE.clients.findIndex(c => c.id===editingClientId) : -1;
   const prevSnapshot = prevIdx>=0 ? STATE.clients[prevIdx] : null;
 
-  if(wasEditing && prevIdx>=0) {
+  // Фикс Bug #1 (silent NOP в auto-save): если editingClientId есть, но в STATE
+  // нет — раньше auto-save просто молча уходил без записи. Это самый коварный
+  // путь: мастер не нажимал «Сохранить», auto-save якобы сохранил, но в
+  // реальности — НИЧЕГО. Восстанавливаем карточку с тем же id.
+  if(wasEditing && prevIdx<0) {
+    console.warn('[autosave] editing card lost from STATE — recreating', editingClientId);
+    STATE.clients.unshift({
+      id: editingClientId, ...data,
+      sessions: [], measurements: [],
+      altegioId: '', altegioLink: '',
+      createdAt: Date.now(),
+    });
+    prevIdx = 0;
+  } else if(wasEditing) {
     STATE.clients[prevIdx] = { ...prevSnapshot, ...data };
-  } else if(!wasEditing) {
-    const c = { id:uid(), ...data, sessions:[], altegioId:'', altegioLink:'', createdAt:Date.now() };
+  } else {
+    const c = { id:uid(), ...data, sessions:[], measurements:[], altegioId:'', altegioLink:'', createdAt:Date.now() };
     STATE.clients.unshift(c);
     editingClientId = c.id;
+    prevIdx = 0;
   }
+  // Bug #2: mark dirty чтобы cloudSubscribe не затёр пока pending push.
+  markCardDirty(editingClientId);
+  const savedId = editingClientId;
   saveLocalOnly();
-  await cloudPushFlush();
+  try {
+    await cloudPushFlush();
+    // post-await sanity check (зеркалит saveClient): если после await карточка
+    // вдруг пропала или была перезаписана с более новым updatedAt от Worker'а
+    // (который мог затереть master-поля), форсим повтор.
+    const idxAfter = STATE.clients.findIndex(c => c.id===savedId);
+    if(idxAfter < 0) {
+      console.warn('[autosave] card disappeared after push — restoring', savedId);
+      STATE.clients.unshift({
+        id: savedId, ...data,
+        sessions: prevSnapshot?.sessions || [],
+        measurements: prevSnapshot?.measurements || [],
+        altegioId: prevSnapshot?.altegioId || '',
+        altegioLink: prevSnapshot?.altegioLink || '',
+        createdAt: prevSnapshot?.createdAt || Date.now(),
+      });
+      saveLocalOnly();
+      await cloudPushFlush();
+    }
+  } finally {
+    clearCardDirty(savedId);
+  }
 }
 
 // ===== Drafts в localStorage (P3+) =====
 const DRAFT_KEY_PREFIX = 'mmClients_draft_';
 let draftDebounceTimer = null;
+// Bug #4 фикс: НЕТ generic '_new' ключа. Для новой карточки draft — только
+// in-memory (через newCardDraft). Это устраняет хаос «один мастер начал, не
+// сохранил, другой открыл “+ Новый” — увидел чужой draft».
+// Для существующих карточек ключ привязан к стабильному id.
 function getDraftKey(id) {
-  // Для новой карточки используем стабильный ключ "new", иначе id.
-  return DRAFT_KEY_PREFIX + (id || 'new');
+  if(!id) return null; // новая карточка — НЕ пишем в localStorage
+  return DRAFT_KEY_PREFIX + id;
 }
+
+// Bug #5 параметр: draft с TTL и сверкой свежести remote.
+const DRAFT_TTL_MS = 24 * 60 * 60 * 1000; // 24 часа
+
+// In-memory draft для новой карточки (Bug #4): живёт только пока вкладка
+// открыта. Не пересекается с другими мастерами на той же машине.
+let newCardDraft = null;
+
 function collectFormValues() {
   return {
     date: document.getElementById('f_date')?.value || '',
@@ -2402,22 +2592,73 @@ function scheduleDraftSave() {
 }
 function saveDraftNow() {
   if(!isFormScreen()) return;
+  const draft = { values: collectFormValues(), savedAt: Date.now(), clientId: editingClientId || null };
+  if(!editingClientId) {
+    // Новая карточка — только в памяти, чтобы при закрытии вкладки draft
+    // ушёл вместе с ней (без шанса перетереть чужую новую карточку).
+    newCardDraft = draft;
+    return;
+  }
   try {
     const key = getDraftKey(editingClientId);
-    const draft = { values: collectFormValues(), savedAt: Date.now(), clientId: editingClientId || null };
-    localStorage.setItem(key, JSON.stringify(draft));
+    if(key) localStorage.setItem(key, JSON.stringify(draft));
   } catch(e) { console.warn('[draft] save fail', e); }
 }
 function loadDraft(id) {
+  if(!id) return newCardDraft; // новая — только in-memory
   try {
-    const raw = localStorage.getItem(getDraftKey(id));
+    const key = getDraftKey(id);
+    if(!key) return null;
+    const raw = localStorage.getItem(key);
     if(!raw) return null;
     const d = JSON.parse(raw);
-    return d && d.values ? d : null;
+    if(!d || !d.values) return null;
+    // Bug #5 TTL: если draft старше 24ч — игнорим, чтобы не подсовывать
+    // мастеру устаревший «черновик» на актуальной карточке.
+    if(d.savedAt && Date.now() - d.savedAt > DRAFT_TTL_MS) {
+      console.log('[draft] expired (>24h), discarding for', id);
+      localStorage.removeItem(key);
+      return null;
+    }
+    // Bug #5 свежесть: если remote-карточка обновлялась ПОЗЖЕ чем сохранён
+    // draft, мастер не должен восстанавливать устаревшие значения — иначе
+    // он перетрёт правки, сделанные ИМ ЖЕ позже на другом устройстве или
+    // правки Worker'а (новый телефон от Altegio).
+    const remote = STATE.clients.find(c => c.id === id);
+    if(remote && (remote.updatedAt || 0) > (d.savedAt || 0)) {
+      console.log('[draft] remote newer than draft — discarding for', id, {remoteAt: remote.updatedAt, draftAt: d.savedAt});
+      localStorage.removeItem(key);
+      return null;
+    }
+    return d;
   } catch(e) { return null; }
 }
 function clearDraft(id) {
-  try { localStorage.removeItem(getDraftKey(id !== undefined ? id : editingClientId)); } catch(e){}
+  const targetId = id !== undefined ? id : editingClientId;
+  if(!targetId) { newCardDraft = null; return; }
+  try {
+    const key = getDraftKey(targetId);
+    if(key) localStorage.removeItem(key);
+  } catch(e){}
+}
+
+// Хелпер: очистить все expired drafts на старте платформы. Иначе они копятся
+// в localStorage и могут сюрприза прийти через месяцы.
+function cleanupExpiredDrafts() {
+  try {
+    const now = Date.now();
+    const toDelete = [];
+    for(let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if(!k || !k.startsWith(DRAFT_KEY_PREFIX)) continue;
+      try {
+        const d = JSON.parse(localStorage.getItem(k));
+        if(d && d.savedAt && (now - d.savedAt > DRAFT_TTL_MS)) toDelete.push(k);
+      } catch(e) { toDelete.push(k); /* битый — выкидываем */ }
+    }
+    for(const k of toDelete) localStorage.removeItem(k);
+    if(toDelete.length) console.log('[draft] cleaned up', toDelete.length, 'expired drafts');
+  } catch(e){}
 }
 function fmtTime(ts) {
   const t = new Date(ts);
@@ -2492,6 +2733,8 @@ function cancelClientForm() {
   stopAutoSave();
   formDirty = false;
   setSaveStatus('idle');
+  // Снимаем dirty флаг — cloudSubscribe теперь может обновлять эту карточку.
+  if(editingClientId) clearCardDirty(editingClientId);
   showScreen('dashScreen');
 }
 
@@ -2510,6 +2753,10 @@ function cancelClientForm() {
     const hint = document.getElementById('autosaveHint');
     if(hint) { hint.textContent = ''; hint.className = 'autosave-hint'; }
     startAutoSave();
+    // Bug #2: помечаем карточку как dirty (редактируется), чтобы cloudSubscribe
+    // НЕ перетирал её remote-копией пока мастер работает. Снимем флаг при
+    // cancel/save/delete или закрытии формы через showScreen.
+    if(id) markCardDirty(id);
     // Если есть draft для этой карточки — показать banner.
     const draft = loadDraft(id || null);
     if(draft) showDraftBanner(draft);
@@ -2522,17 +2769,23 @@ function cancelClientForm() {
   if(typeof orig !== 'function') return;
   window.saveClient = async function() {
     setSaveStatus('saving');
+    const savedIdBefore = editingClientId;
     try {
       await orig.apply(this, arguments);
       // saveClient переключает экран на clientCardScreen при успехе.
       formDirty = false;
-      clearDraft();
+      clearDraft(savedIdBefore);
       stopAutoSave();
       setSaveStatus('idle');
     } catch(e) {
       setSaveStatus('error');
       throw e;
     }
+    // dirty снимаем ВСЕГДА (и при успехе, и при ошибке): при ошибке мы
+    // остаёмся на форме, но если мастер закроет вкладку — данные в localStorage
+    // целые, при следующем заходе cloudLoad merge подтянет.
+    // ПРИМЕЧАНИЕ: orig.saveClient внутри уже делает clearCardDirty в finally,
+    // здесь дополнительно подстраховываемся для savedIdBefore.
   };
 })();
 
@@ -2542,9 +2795,15 @@ function cancelClientForm() {
   window.deleteClient = function() {
     const idBefore = editingClientId;
     orig.apply(this, arguments);
-    // Если delete прошёл — editingClientId стал null. Чистим draft.
-    if(idBefore && !editingClientId) {
-      try { localStorage.removeItem(DRAFT_KEY_PREFIX + idBefore); } catch(e){}
+    // Если delete прошёл — editingClientId стал null. Чистим draft и dirty.
+    if(idBefore) {
+      clearDraft(idBefore);
+      // Bug #2: SOFT-DELETE bumps updatedAt и пушит. После push cloudSubscribe
+      // может прийти с remote, в котором deleted=true, или с remote от Worker'а
+      // в котором deleted=false (если Worker перезавёл клиента). Снимаем dirty
+      // СРАЗУ ПОСЛЕ delete'а, чтобы remote-приход актуализировал статус.
+      // Если delete упал — данные в localStorage целые, dirty не нужен.
+      clearCardDirty(idBefore);
     }
     formDirty = false;
     stopAutoSave();
@@ -2563,6 +2822,9 @@ function cancelClientForm() {
       // Если уходим с грязной формы без save — НЕ сбрасываем draft (мастер
       // ещё может вернуться и нажать «Восстановить»).
       setSaveStatus('idle');
+      // Снимаем dirty: мастер ушёл из формы, теперь cloudSubscribe может
+      // обновлять эту карточку remote-копией.
+      if(editingClientId) clearCardDirty(editingClientId);
     }
     orig.apply(this, arguments);
   };
