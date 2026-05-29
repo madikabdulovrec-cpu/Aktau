@@ -1,0 +1,60 @@
+// Firestore Security Rules — версия V2 (после миграции на коллекции)
+// ============================================================================
+//
+// КОНТЕКСТ: до миграции у нас был один документ mmClients/data — правила
+// разрешали read/write по API key (без auth, т.к. платформа использует
+// собственный логин на SHA-256 поверх Firebase). После миграции у нас:
+//
+//   mmClientsV2/{clientId}  — каждая карточка отдельным документом
+//   mmStaffV2/{staffId}     — каждый мастер отдельным документом
+//   mmClients/data          — СТАРАЯ схема, оставлена для отката (не пишем)
+//
+// СТРАТЕГИЯ: фронт продолжает работать без Firebase Auth (свой логин
+// поверх). Тогда правила — read/write открыты с тем же API key, что и
+// раньше. Если когда-нибудь добавим Firebase Auth → правила переписать на
+// request.auth != null.
+//
+// КАК ЗАЛИТЬ:
+//   1. Firebase Console → Project → Build → Firestore → Rules.
+//   2. Скопировать содержимое этого файла (без верхнего комментария).
+//   3. Publish.
+// ============================================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===== V2 коллекции (новая схема) =====
+    // Открытые read/write — те же права, что были у старого документа.
+    // Безопасность данных обеспечивается своим логином (см. login flow в index.html).
+    match /mmClientsV2/{clientId} {
+      allow read, write: if true;
+    }
+    match /mmStaffV2/{staffId} {
+      allow read, write: if true;
+    }
+
+    // ===== Метаданные (опционально) =====
+    // Можно хранить версию схемы, последний backup timestamp и т.п.
+    match /mmMeta/{docId} {
+      allow read, write: if true;
+    }
+
+    // ===== Старый документ (для отката) =====
+    // Оставлен read+write на случай если придётся откатить index.html на V1.
+    // После того как V2 поработает стабильно неделю — можно сменить на read-only.
+    match /mmClients/{docId} {
+      allow read, write: if true;
+    }
+
+    // ===== Academy (стажёры) — не трогаем =====
+    match /mmAcademy/{document=**} {
+      allow read, write: if true;
+    }
+
+    // ===== Всё остальное — запрещено =====
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

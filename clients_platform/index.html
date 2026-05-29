@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260529-version-check">
+<meta name="app-version" content="20260529-autosave-drafts">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -85,6 +85,41 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
 .cloud-badge.on { background:#E8FFF1; color:#00A653; }
 .cloud-badge.off { background:#FFE5EC; color:var(--pink); }
 .cloud-badge .dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+
+/* ===== SAVE STATUS (P2 UX-страховка) =====
+   Видимый мастеру индикатор состояния синхронизации с облаком.
+   Появляется в topbar когда форма открыта. Цель — не дать мастеру
+   уйти со словами «я нажал Сохранить и закрыл», когда на самом деле
+   данные ещё летят в Firestore. */
+.save-status { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; border-radius:var(--radius-pill); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.08em; transition:.2s; }
+.save-status.idle { background:#F0F2F5; color:#888; }
+.save-status.pending { background:#FFF8E1; color:#B8860B; }
+.save-status.saving { background:#E3F2FD; color:#1976D2; }
+.save-status.saved { background:#E8FFF1; color:#00A653; }
+.save-status.error { background:#FFE5EC; color:var(--pink); }
+.save-status .dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+.save-status.saving .dot { animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.3;} }
+
+/* ===== DRAFT BANNER (P3+ восстановление черновика) =====
+   Показывается при возврате к редактированию карточки, если в localStorage
+   остался draft (мастер начал, не сохранил, ушёл). Зелёная плашка сверху
+   формы — «У вас есть несохранённый черновик от HH:MM — восстановить?». */
+.draft-banner { background:linear-gradient(135deg,#FFE600,#FF2D7B); color:#1A1A1A; padding:14px 18px; border-radius:var(--radius); margin-bottom:18px; display:flex; align-items:center; gap:14px; box-shadow:var(--shadow); }
+.draft-banner .ic { font-size:24px; }
+.draft-banner .body { flex:1; }
+.draft-banner .title { font-weight:700; font-size:14px; margin-bottom:2px; }
+.draft-banner .sub { font-size:12px; opacity:.85; }
+.draft-banner .acts { display:flex; gap:8px; }
+.draft-banner .btn-mini { padding:8px 14px; border:none; border-radius:var(--radius-pill); font-family:'Space Grotesk',sans-serif; font-size:12px; font-weight:600; cursor:pointer; }
+.draft-banner .btn-mini.primary { background:#1A1A1A; color:#fff; }
+.draft-banner .btn-mini.ghost { background:rgba(255,255,255,0.7); color:#1A1A1A; }
+
+/* ===== AUTOSAVE INDICATOR в форме =====
+   Маленький timestamp над кнопкой «Сохранить»: «Автосохранено 14:32». */
+.autosave-hint { font-size:11px; color:#999; margin-top:8px; text-align:right; min-height:14px; }
+.autosave-hint.ok { color:#00A653; }
+.autosave-hint.err { color:var(--pink); }
 
 /* ===== CONTAINER ===== */
 .page { max-width:1280px; margin:0 auto; padding:32px; }
@@ -310,6 +345,9 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
   </nav>
   <div style="display:flex; align-items:center; gap:12px;">
     <span id="cloudBadge" class="cloud-badge off"><span class="dot"></span><span id="cloudBadgeText">Локально</span></span>
+    <!-- P2: статус сохранения. Показывается только когда форма открыта или
+         есть несохранённые правки. Состояния: idle/pending/saving/saved/error. -->
+    <span id="saveStatus" class="save-status idle" style="display:none;"><span class="dot"></span><span id="saveStatusText">Сохранено</span></span>
     <div class="user-chip">
       <div class="av" id="userAv">M</div>
       <div>
@@ -372,6 +410,19 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
     </div>
 
     <div class="form-card">
+      <!-- P3+ Draft banner: показывается если в localStorage найден несохранённый
+           черновик этой карточки. Кнопки заполняются динамически (см. JS — showDraftBanner). -->
+      <div id="draftBanner" class="draft-banner" style="display:none;">
+        <div class="ic">📝</div>
+        <div class="body">
+          <div class="title">Найден несохранённый черновик</div>
+          <div class="sub" id="draftBannerSub">—</div>
+        </div>
+        <div class="acts">
+          <button class="btn-mini primary" onclick="restoreDraft()">Восстановить</button>
+          <button class="btn-mini ghost" onclick="discardDraft()">Удалить</button>
+        </div>
+      </div>
       <div class="form-section">
         <h3>Основное</h3>
         <div class="form-row">
@@ -447,9 +498,13 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
 
       <div class="form-actions">
         <button class="btn btn-danger" id="btnDelete" onclick="deleteClient()" style="display:none;">Удалить карточку</button>
-        <div style="display:flex; gap:10px; margin-left:auto;">
-          <button class="btn btn-light" onclick="showScreen('dashScreen')">Отмена</button>
-          <button class="btn btn-primary" id="btnSaveClient" onclick="saveClient()">Сохранить</button>
+        <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px; margin-left:auto;">
+          <div style="display:flex; gap:10px;">
+            <button class="btn btn-light" onclick="cancelClientForm()">Отмена</button>
+            <button class="btn btn-primary" id="btnSaveClient" onclick="saveClient()">Сохранить</button>
+          </div>
+          <!-- P3 autosave: показывает «Автосохранено HH:MM» или ошибку. -->
+          <div id="autosaveHint" class="autosave-hint"></div>
         </div>
       </div>
     </div>
@@ -2168,6 +2223,350 @@ function toast(text, kind) {
 
 // Enter в логине
 document.getElementById('loginPass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+
+/* ============================================================
+   FORM TRACKING — P2 UX-страховка + P3 Auto-save + P3+ Drafts
+   ============================================================
+   Тройная защита от потери анкеты:
+   1. P2 «Save Status» — видимый мастеру индикатор:
+      idle ▸ pending (есть несохранённое) ▸ saving (push в облако) ▸
+      saved (зелёный, всё ок) / error (красный, не ушло).
+      + beforeunload-confirm если есть pending изменения.
+   2. P3 «Auto-save» — пока форма открыта, каждые 10 сек dirty-form
+      пушится в Firestore тихо (toast «Автосохранено HH:MM»). Мастер
+      может уйти от вкладки и вернуться — данные уже в облаке.
+   3. P3+ «Drafts» — каждое изменение поля сохраняется в localStorage
+      (debounce 600мс). При возврате к карточке — banner «найден
+      черновик от HH:MM, восстановить?». Защита если auto-save не
+      успел (новая карточка и сразу закрытие, например).
+*/
+
+// ===== Save Status (P2) =====
+let saveStatusState = 'idle';
+function setSaveStatus(state, hint) {
+  // state: 'idle' | 'pending' | 'saving' | 'saved' | 'error'
+  saveStatusState = state;
+  const el = document.getElementById('saveStatus');
+  const tx = document.getElementById('saveStatusText');
+  if(!el || !tx) return;
+  el.classList.remove('idle','pending','saving','saved','error');
+  el.classList.add(state);
+  const labels = { idle:'Сохранено', pending:'Есть изменения', saving:'Сохраняем…', saved:'Сохранено', error:'Не сохранено' };
+  tx.textContent = labels[state] || 'Сохранено';
+  el.title = hint || labels[state] || '';
+  // Показываем индикатор только когда есть смысл (форма открыта или ошибка).
+  el.style.display = (state==='idle' && !isFormScreen()) ? 'none' : 'inline-flex';
+}
+function isFormScreen() {
+  return currentScreen==='clientFormScreen';
+}
+
+// ===== Dirty tracking + beforeunload guard (P2) =====
+let formDirty = false;
+function markFormDirty() {
+  if(!formDirty) {
+    formDirty = true;
+    setSaveStatus('pending');
+  }
+  // Каждое изменение поля → debounced draft save.
+  scheduleDraftSave();
+}
+function markFormClean() {
+  formDirty = false;
+  if(isFormScreen()) setSaveStatus('saved');
+  else setSaveStatus('idle');
+}
+function hasPendingChanges() {
+  return formDirty || !!cloudPushTimer || saveStatusState==='saving' || saveStatusState==='error';
+}
+window.addEventListener('beforeunload', function(e) {
+  if(!hasPendingChanges()) return;
+  // Принудительный flush в фоне (может не успеть, но шанс есть).
+  try { if(typeof flushPendingPush === 'function') flushPendingPush(); } catch(err){}
+  // Текст игнорируется современными браузерами, но returnValue нужен.
+  const msg = 'Есть несохранённые изменения. Уйти со страницы?';
+  e.preventDefault();
+  e.returnValue = msg;
+  return msg;
+});
+
+// ===== Auto-save (P3) =====
+let autoSaveTimer = null;
+const AUTOSAVE_INTERVAL_MS = 10000;
+function startAutoSave() {
+  stopAutoSave();
+  autoSaveTimer = setInterval(runAutoSave, AUTOSAVE_INTERVAL_MS);
+}
+function stopAutoSave() {
+  if(autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null; }
+}
+async function runAutoSave() {
+  if(!isFormScreen()) { stopAutoSave(); return; }
+  if(!formDirty) return; // нечего сохранять
+  // Минимальная валидация — пустую новую карточку не пушим (нет fio → нечего хранить).
+  const fio = (document.getElementById('f_fio')?.value || '').trim();
+  if(!fio) return;
+  // Используем тот же путь сохранения, что и saveClient, но без UI fanfare и без перехода.
+  try {
+    setSaveStatus('saving');
+    await persistFormToState({ silent:true });
+    setSaveStatus('saved');
+    const hint = document.getElementById('autosaveHint');
+    if(hint) {
+      const t = new Date();
+      hint.textContent = `Автосохранено ${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}`;
+      hint.className = 'autosave-hint ok';
+    }
+    formDirty = false;
+    clearDraft();
+  } catch(e) {
+    console.error('[autosave] fail', e);
+    setSaveStatus('error');
+    const hint = document.getElementById('autosaveHint');
+    if(hint) { hint.textContent = 'Автосохранение не удалось — нажмите «Сохранить»'; hint.className = 'autosave-hint err'; }
+  }
+}
+
+// Общая функция: собирает значения формы в STATE и пушит в облако.
+// silent=true — без toast и без перехода (используется автосейвом).
+async function persistFormToState(opts) {
+  opts = opts || {};
+  const fio = document.getElementById('f_fio').value.trim();
+  const age = document.getElementById('f_age').value.trim();
+  if(!fio || !age) throw new Error('Заполните ФИО и возраст');
+
+  let specName = document.getElementById('f_specialist').value.trim();
+  let specId = STATE.staff.find(s => s.name.toLowerCase()===specName.toLowerCase())?.id || '';
+  if(STATE.session?.role==='master') {
+    specId = STATE.session.staffId;
+    specName = STATE.session.name;
+  }
+
+  const data = {
+    date: document.getElementById('f_date').value,
+    specialist: specName, specialistId: specId,
+    fio, phone: document.getElementById('f_phone').value.trim(),
+    age, weight: document.getElementById('f_weight').value.trim(),
+    height: document.getElementById('f_height').value.trim(),
+    source: getChecked('source'),
+    complaints: document.getElementById('f_complaints').value.trim(),
+    anamnesis: getChecked('anamnesis'),
+    anamnesisOther: document.getElementById('f_anamnesisOther').value.trim(),
+    recommendations: document.getElementById('f_recommendations').value.trim(),
+    initialPhotos: editingInitialPhotos.map(p => ({url:p.url, publicId:p.publicId||'', caption:(p.caption||'').trim()})),
+    updatedAt: Date.now(),
+  };
+
+  const wasEditing = !!editingClientId;
+  const prevIdx = wasEditing ? STATE.clients.findIndex(c => c.id===editingClientId) : -1;
+  const prevSnapshot = prevIdx>=0 ? STATE.clients[prevIdx] : null;
+
+  if(wasEditing && prevIdx>=0) {
+    STATE.clients[prevIdx] = { ...prevSnapshot, ...data };
+  } else if(!wasEditing) {
+    const c = { id:uid(), ...data, sessions:[], altegioId:'', altegioLink:'', createdAt:Date.now() };
+    STATE.clients.unshift(c);
+    editingClientId = c.id;
+  }
+  saveLocalOnly();
+  await cloudPushFlush();
+}
+
+// ===== Drafts в localStorage (P3+) =====
+const DRAFT_KEY_PREFIX = 'mmClients_draft_';
+let draftDebounceTimer = null;
+function getDraftKey(id) {
+  // Для новой карточки используем стабильный ключ "new", иначе id.
+  return DRAFT_KEY_PREFIX + (id || 'new');
+}
+function collectFormValues() {
+  return {
+    date: document.getElementById('f_date')?.value || '',
+    specialist: document.getElementById('f_specialist')?.value || '',
+    fio: document.getElementById('f_fio')?.value || '',
+    phone: document.getElementById('f_phone')?.value || '',
+    age: document.getElementById('f_age')?.value || '',
+    weight: document.getElementById('f_weight')?.value || '',
+    height: document.getElementById('f_height')?.value || '',
+    source: getChecked('source'),
+    complaints: document.getElementById('f_complaints')?.value || '',
+    anamnesis: getChecked('anamnesis'),
+    anamnesisOther: document.getElementById('f_anamnesisOther')?.value || '',
+    recommendations: document.getElementById('f_recommendations')?.value || '',
+    initialPhotos: editingInitialPhotos.map(p => ({url:p.url, publicId:p.publicId||'', caption:(p.caption||'').trim()})),
+  };
+}
+function scheduleDraftSave() {
+  if(draftDebounceTimer) clearTimeout(draftDebounceTimer);
+  draftDebounceTimer = setTimeout(saveDraftNow, 600);
+}
+function saveDraftNow() {
+  if(!isFormScreen()) return;
+  try {
+    const key = getDraftKey(editingClientId);
+    const draft = { values: collectFormValues(), savedAt: Date.now(), clientId: editingClientId || null };
+    localStorage.setItem(key, JSON.stringify(draft));
+  } catch(e) { console.warn('[draft] save fail', e); }
+}
+function loadDraft(id) {
+  try {
+    const raw = localStorage.getItem(getDraftKey(id));
+    if(!raw) return null;
+    const d = JSON.parse(raw);
+    return d && d.values ? d : null;
+  } catch(e) { return null; }
+}
+function clearDraft(id) {
+  try { localStorage.removeItem(getDraftKey(id !== undefined ? id : editingClientId)); } catch(e){}
+}
+function fmtTime(ts) {
+  const t = new Date(ts);
+  return `${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}`;
+}
+function showDraftBanner(draft) {
+  const banner = document.getElementById('draftBanner');
+  const sub = document.getElementById('draftBannerSub');
+  if(!banner || !sub) return;
+  const ageMs = Date.now() - (draft.savedAt || 0);
+  const ageMin = Math.round(ageMs / 60000);
+  const ageTxt = ageMin < 1 ? 'только что' : ageMin < 60 ? `${ageMin} мин. назад` : `от ${fmtTime(draft.savedAt)}`;
+  sub.textContent = `Сохранён ${ageTxt}. ФИО: ${draft.values.fio || '—'}`;
+  banner.style.display = 'flex';
+}
+function hideDraftBanner() {
+  const banner = document.getElementById('draftBanner');
+  if(banner) banner.style.display = 'none';
+}
+function restoreDraft() {
+  const draft = loadDraft(editingClientId);
+  if(!draft) { hideDraftBanner(); return; }
+  const v = draft.values;
+  // Подставляем значения формы из черновика.
+  ['date','specialist','fio','phone','age','weight','height','complaints','anamnesisOther','recommendations'].forEach(k => {
+    const el = document.getElementById('f_' + k);
+    if(el && v[k] !== undefined) el.value = v[k] || '';
+  });
+  // Чекбоксы source/anamnesis
+  document.querySelectorAll('[data-group="source"] input').forEach(inp => {
+    const want = (v.source || []).includes(inp.value);
+    inp.checked = want;
+    inp.closest('.check-pill').classList.toggle('checked', want);
+  });
+  document.querySelectorAll('[data-group="anamnesis"] input').forEach(inp => {
+    const want = (v.anamnesis || []).includes(inp.value);
+    inp.checked = want;
+    inp.closest('.check-pill').classList.toggle('checked', want);
+  });
+  editingInitialPhotos = (v.initialPhotos || []).map(p => ({...p}));
+  renderInitialPhotos();
+  hideDraftBanner();
+  markFormDirty();
+  toast('Черновик восстановлен');
+}
+function discardDraft() {
+  clearDraft();
+  hideDraftBanner();
+  toast('Черновик удалён');
+}
+
+// ===== Hook: связываем события полей формы с tracking =====
+// Один document-wide listener — переживает любую перерисовку чекбоксов.
+document.addEventListener('input', function(e) {
+  if(currentScreen !== 'clientFormScreen') return;
+  if(!e.target.matches) return;
+  // Только поля карточки клиента (id="f_..." и чекбоксы в формах).
+  if(e.target.id && e.target.id.startsWith('f_')) markFormDirty();
+});
+document.addEventListener('change', function(e) {
+  if(currentScreen !== 'clientFormScreen') return;
+  if(!e.target.matches) return;
+  if(e.target.id && e.target.id.startsWith('f_')) markFormDirty();
+  if(e.target.closest && e.target.closest('[data-group="source"], [data-group="anamnesis"]')) markFormDirty();
+});
+
+// ===== Cancel form button (с проверкой dirty) =====
+function cancelClientForm() {
+  if(formDirty) {
+    if(!confirm('У вас есть несохранённые изменения. Уйти без сохранения?\n\nЧерновик останется — вы сможете восстановить его при следующем открытии карточки.')) return;
+  }
+  stopAutoSave();
+  formDirty = false;
+  setSaveStatus('idle');
+  showScreen('dashScreen');
+}
+
+// ===== Hook на открытие формы и saveClient =====
+// Мы патчим openClientForm и saveClient через монки-патчинг: оригиналы определены
+// выше, и мы оборачиваем их так, чтобы корректно подключить tracking без
+// дублирования кода. Это безопасно — оригинальные функции глобальные.
+(function patchOpenClientForm(){
+  const orig = window.openClientForm;
+  if(typeof orig !== 'function') return;
+  window.openClientForm = function(id) {
+    orig.apply(this, arguments);
+    // Initial state — нет грязи (только что подгрузили).
+    formDirty = false;
+    setSaveStatus('saved'); // показываем «Сохранено» по дефолту
+    const hint = document.getElementById('autosaveHint');
+    if(hint) { hint.textContent = ''; hint.className = 'autosave-hint'; }
+    startAutoSave();
+    // Если есть draft для этой карточки — показать banner.
+    const draft = loadDraft(id || null);
+    if(draft) showDraftBanner(draft);
+    else hideDraftBanner();
+  };
+})();
+
+(function patchSaveClient(){
+  const orig = window.saveClient;
+  if(typeof orig !== 'function') return;
+  window.saveClient = async function() {
+    setSaveStatus('saving');
+    try {
+      await orig.apply(this, arguments);
+      // saveClient переключает экран на clientCardScreen при успехе.
+      formDirty = false;
+      clearDraft();
+      stopAutoSave();
+      setSaveStatus('idle');
+    } catch(e) {
+      setSaveStatus('error');
+      throw e;
+    }
+  };
+})();
+
+(function patchDeleteClient(){
+  const orig = window.deleteClient;
+  if(typeof orig !== 'function') return;
+  window.deleteClient = function() {
+    const idBefore = editingClientId;
+    orig.apply(this, arguments);
+    // Если delete прошёл — editingClientId стал null. Чистим draft.
+    if(idBefore && !editingClientId) {
+      try { localStorage.removeItem(DRAFT_KEY_PREFIX + idBefore); } catch(e){}
+    }
+    formDirty = false;
+    stopAutoSave();
+    setSaveStatus('idle');
+  };
+})();
+
+// Когда мастер уходит со скрина формы (например, навигация через nav-btn) —
+// гарантированно останавливаем auto-save и прячем индикатор.
+(function patchShowScreen(){
+  const orig = window.showScreen;
+  if(typeof orig !== 'function') return;
+  window.showScreen = function(id) {
+    if(currentScreen === 'clientFormScreen' && id !== 'clientFormScreen') {
+      stopAutoSave();
+      // Если уходим с грязной формы без save — НЕ сбрасываем draft (мастер
+      // ещё может вернуться и нажать «Восстановить»).
+      setSaveStatus('idle');
+    }
+    orig.apply(this, arguments);
+  };
+})();
 
 /* ============================================================
    VERSION CHECK — автоматическое обновление при новом деплое
