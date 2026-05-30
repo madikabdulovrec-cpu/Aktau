@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260529-inplace-merge-dirty">
+<meta name="app-version" content="20260530-create-flow-fixes">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -1078,6 +1078,12 @@ async function cloudPush() {
     saveLocalOnly();
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
+    // Bug #16 фикс: если предыдущий push упал и был выставлен saveStatus='error',
+    // а ретрай через 3с УСПЕХ — мастер видит «Не сохранено» вечно, пока сам не
+    // ткнёт в форму. Сбрасываем error indicator при первом успешном push'е.
+    if(typeof saveStatusState !== 'undefined' && saveStatusState === 'error') {
+      try { setSaveStatus(isFormScreen() ? 'saved' : 'idle'); } catch(_){}
+    }
   } catch(e) {
     console.error('[cloud] push fail', e);
     if(String(e.message||'').includes('exceeds')) {
@@ -1717,17 +1723,22 @@ async function saveClient() {
 
     toast(wasEditing ? 'Карточка обновлена' : 'Карточка создана');
     openClientCard(savedId);
+    // dirty снимаем ТОЛЬКО при успехе И только потому что openClientCard
+    // увёл мастера с формы. Если cloudPush упал — НЕ снимаем (см. finally).
+    clearCardDirty(savedId);
   } catch(e) {
     // cloudPush уже показал error-toast. Восстанавливаем кнопку, оставляем
     // пользователя на форме (он видит свои правки и может попробовать снова).
     // Локальный STATE и localStorage уже содержат правки — догонят при
     // успешном push (после retry или при следующем визите через cloudLoad).
     console.error('[saveClient] cloud sync failed:', e?.message || e);
+    // Bug #12 фикс: dirty НЕ снимаем при ошибке. Мастер остался на форме
+    // (cloudPush throw → catch → finally → btn enable). Если снять dirty,
+    // следующий cloudSubscribe затрёт STATE.clients[i] remote-копией и
+    // правки мастера ПРОПАДУТ. Оставляем dirty до выхода из формы (cancel/
+    // успешный save/showScreen patch).
   } finally {
     if(btn) { btn.disabled = false; btn.textContent = prevText; }
-    // ВАЖНО: dirty снимаем ТОЛЬКО после try, иначе при retry'е cloudSubscribe
-    // успеет затереть.
-    clearCardDirty(savedId);
   }
 }
 
@@ -2443,10 +2454,40 @@ function stopAutoSave() {
 async function runAutoSave() {
   if(!isFormScreen()) { stopAutoSave(); return; }
   if(!formDirty) return; // нечего сохранять
-  // Минимальная валидация — пустую новую карточку не пушим (нет fio → нечего хранить).
+  // Минимальная валидация: пустую новую карточку не пушим (нет fio → нечего хранить).
   const fio = (document.getElementById('f_fio')?.value || '').trim();
   if(!fio) return;
-  // Используем тот же путь сохранения, что и saveClient, но без UI fanfare и без перехода.
+  // Bug #13 фикс: persistFormToState бросает Error если age пуст. Раньше
+  // runAutoSave ловил эту ошибку и показывал «Автосохранение не удалось» —
+  // мастер видел красное предупреждение, хотя на самом деле всё ОК (он просто
+  // ещё не дошёл до поля «возраст»). Проверяем age здесь до зова.
+  const age = (document.getElementById('f_age')?.value || '').trim();
+  if(!age) return;
+
+  // Bug #11 фикс (КРИТИЧНО): для НОВОЙ карточки (editingClientId=null)
+  // auto-save раньше создавал её в STATE+Firestore. Если мастер потом нажимал
+  // «Отмена», карточка ВСЁ РАВНО оставалась в облаке. Это противоречит
+  // ожиданию «Отмена = ничего не сохранили». Теперь для новой карточки
+  // auto-save идёт ТОЛЬКО в in-memory draft (newCardDraft). Полная фиксация —
+  // только по явному нажатию «Сохранить».
+  if(!editingClientId) {
+    try {
+      saveDraftNow(); // → newCardDraft (in-memory, не localStorage и не Firestore)
+      setSaveStatus('saved');
+      const hint = document.getElementById('autosaveHint');
+      if(hint) {
+        const t = new Date();
+        hint.textContent = `Черновик ${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}`;
+        hint.className = 'autosave-hint ok';
+      }
+      formDirty = false;
+    } catch(e) {
+      console.warn('[autosave] new-card draft fail', e);
+    }
+    return;
+  }
+
+  // Существующая карточка — полноценный push в STATE+Firestore.
   try {
     setSaveStatus('saving');
     await persistFormToState({ silent:true });
@@ -2458,7 +2499,7 @@ async function runAutoSave() {
       hint.className = 'autosave-hint ok';
     }
     formDirty = false;
-    clearDraft();
+    clearDraft(editingClientId);
   } catch(e) {
     console.error('[autosave] fail', e);
     setSaveStatus('error');
@@ -2526,28 +2567,29 @@ async function persistFormToState(opts) {
   markCardDirty(editingClientId);
   const savedId = editingClientId;
   saveLocalOnly();
-  try {
+  await cloudPushFlush();
+  // post-await sanity check (зеркалит saveClient): если после await карточка
+  // вдруг пропала или была перезаписана с более новым updatedAt от Worker'а
+  // (который мог затереть master-поля), форсим повтор.
+  const idxAfter = STATE.clients.findIndex(c => c.id===savedId);
+  if(idxAfter < 0) {
+    console.warn('[autosave] card disappeared after push — restoring', savedId);
+    STATE.clients.unshift({
+      id: savedId, ...data,
+      sessions: prevSnapshot?.sessions || [],
+      measurements: prevSnapshot?.measurements || [],
+      altegioId: prevSnapshot?.altegioId || '',
+      altegioLink: prevSnapshot?.altegioLink || '',
+      createdAt: prevSnapshot?.createdAt || Date.now(),
+    });
+    saveLocalOnly();
     await cloudPushFlush();
-    // post-await sanity check (зеркалит saveClient): если после await карточка
-    // вдруг пропала или была перезаписана с более новым updatedAt от Worker'а
-    // (который мог затереть master-поля), форсим повтор.
-    const idxAfter = STATE.clients.findIndex(c => c.id===savedId);
-    if(idxAfter < 0) {
-      console.warn('[autosave] card disappeared after push — restoring', savedId);
-      STATE.clients.unshift({
-        id: savedId, ...data,
-        sessions: prevSnapshot?.sessions || [],
-        measurements: prevSnapshot?.measurements || [],
-        altegioId: prevSnapshot?.altegioId || '',
-        altegioLink: prevSnapshot?.altegioLink || '',
-        createdAt: prevSnapshot?.createdAt || Date.now(),
-      });
-      saveLocalOnly();
-      await cloudPushFlush();
-    }
-  } finally {
-    clearCardDirty(savedId);
   }
+  // Bug #12 фикс: НЕ снимаем dirty здесь. Мастер всё ещё на форме — следующий
+  // cloudSubscribe может прилететь через секунду с remote-копией от Worker'а
+  // и перезаписать правки. Dirty снимем при выходе из формы (cancel/save/
+  // showScreen). Если push упал — исключение поднимется вверх в runAutoSave,
+  // там тоже dirty не снимаем по той же причине.
 }
 
 // ===== Drafts в localStorage (P3+) =====
