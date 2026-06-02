@@ -29,8 +29,9 @@ MH_CHANNELS = '{"17222":"3a00d58f-4060-42be-96b9-898cba18748e","20916":"71608151
 MANAGER_OPERATOR_ID = ""                # id оператора-менеджера message.help (опц.)
 ALTEGIO_COMPANY_ID = "1330174"                 # id филиала Altegio (опц. — гейт и слоты)
 ALTEGIO_CONSULT_SERVICE_ID = "13190960"         # id услуги-консультации Altegio (опц. — слоты)
-# MH_PRIMARY_CHANNEL_UUID = ""           # (опц.) канал для рассылки подтверждений
-                                          # — если пусто, берётся первый из MH_CHANNELS
+# Подтверждения шлём СТРОГО через тот канал, через который клиент уже писал
+# нам (из MH_CHANNELS). Клиентам, которые никогда не писали в WhatsApp, бот
+# напоминания не отправляет — чтобы не наводить шума с нового номера.
 
 # Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
 #   wrangler secret put ANTHROPIC_API_KEY     --config worker/wrangler-mh-bot.toml

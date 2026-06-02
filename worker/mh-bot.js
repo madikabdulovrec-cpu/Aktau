@@ -370,9 +370,33 @@ async function processMessage(msg, env) {
   if (msg.messageType !== 'text') return;
   if (!msg.text || !msg.userId) return;
 
-  // Ночное окно: бот отвечает только в часы BOT_HOUR_START..BOT_HOUR_END (Almaty).
-  // Эхо-защита и операторская пауза выше работают всегда — учёт ownership
-  // продолжается, даже когда бот не отвечает.
+  // Дедуп — message.help может повторить доставку вебхука. Делаем ДО
+  // confirm_pending, чтобы не среагировать дважды на ответ «Да/Нет».
+  const seenKey = `seen:${msg.messageId}`;
+  if (await env.BOT_KV.get(seenKey)) return;
+
+  // Ответ клиента на подтверждение записи — НЕЗАВИСИМО от часа суток.
+  // Днём бот вообще не отвечает на лиды, но если человек получил наше
+  // напоминание о записи и пишет «Да / Нет» — мы обязаны довести цепочку:
+  // помечаем attendance=2 или передаём менеджеру при отказе. Длинный или
+  // непонятный ответ → fall-through в обычный диалоговый flow (а там
+  // ночное окно и op-пауза уже отфильтруют что нужно).
+  const pendingRaw = await env.BOT_KV.get(`confirm_pending:user:${msg.userId}`);
+  if (pendingRaw) {
+    const kind = classifyConfirmationResponse(msg.text);
+    if (kind) {
+      let pending = null;
+      try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
+      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+      await handleConfirmationResponse(env, msg, kind, pending);
+      return;
+    }
+  }
+
+  // Ночное окно лидов: бот ведёт диалог только в BOT_HOUR_START..BOT_HOUR_END
+  // (Almaty). Днём диалоги ведут менеджеры — бот молчит. Эхо-защита,
+  // операторская пауза и обработка ответа на confirmation — выше, работают
+  // всегда: учёт ownership и завершение confirmation-цепочки идут круглосуточно.
   const almatyHour = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600 * 1000).getUTCHours();
   const inWindow = BOT_HOUR_START < BOT_HOUR_END
     ? (almatyHour >= BOT_HOUR_START && almatyHour < BOT_HOUR_END)
@@ -387,26 +411,6 @@ async function processMessage(msg, env) {
   if (await env.BOT_KV.get(`op:${msg.userId}`)) {
     console.log(`paused, human owns ${tag}`);
     return;
-  }
-
-  // Дедуп — message.help может повторить доставку вебхука.
-  const seenKey = `seen:${msg.messageId}`;
-  if (await env.BOT_KV.get(seenKey)) return;
-
-  // Если контакт ждёт ответ на подтверждение записи — пробуем распознать
-  // короткий «Да/Нет». При успехе обрабатываем без Claude (быстро + дёшево
-  // + предсказуемо). Длинный/непонятный ответ → fall-through в обычный
-  // диалоговый flow (Claude разберётся).
-  const pendingRaw = await env.BOT_KV.get(`confirm_pending:user:${msg.userId}`);
-  if (pendingRaw) {
-    const kind = classifyConfirmationResponse(msg.text);
-    if (kind) {
-      let pending = null;
-      try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
-      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
-      await handleConfirmationResponse(env, msg, kind, pending);
-      return;
-    }
   }
 
   // История диалога (baseLen — для защиты от гонки при записи).
@@ -1095,35 +1099,37 @@ async function markAttendanceConfirmed(env, recordId) {
 }
 
 // ── message.help: отправка по телефону ─────────────────────────────────────
-// Резолвит контакт в message.help по номеру (создаёт при необходимости),
-// добывает channel_uuid + user_id канала и шлёт сообщение. Возвращает
-// {ok, channelUuid, userId} — userId нужен наверху для KV-маппинга pending.
+// Резолвит контакт в message.help по номеру и шлёт сообщение СТРОГО через
+// тот канал, через который клиент уже писал нам. Возвращает
+// {ok, channelUuid, userId}.
+// Важно — не наводим шума:
+//   • НЕ создаём нового контакта в message.help (need_create=false);
+//   • НЕ открываем новый канал клиенту, который никогда нам не писал;
+//   • НЕ шлём через канал, которого нет в MH_CHANNELS (например в DM
+//     Instagram, если клиент когда-то писал туда). Чужие каналы — мимо.
 
 async function mhSendByPhone(env, phone, text) {
   const token = await getMhToken(env);
   if (!token) return { ok: false };
 
-  // Принудительный канал для исходящих confirmation — env.MH_PRIMARY_CHANNEL_UUID
-  // или первый ключ из MH_CHANNELS. Это влияет только на need_create:
-  // существующий контакт через свой исходный канал будет адресован.
-  let primaryChannelUuid = env.MH_PRIMARY_CHANNEL_UUID || '';
-  if (!primaryChannelUuid && env.MH_CHANNELS) {
-    try {
-      const map = JSON.parse(env.MH_CHANNELS);
-      const first = Object.values(map)[0];
-      if (first) primaryChannelUuid = String(first);
-    } catch (_) { /* noop */ }
+  // Список наших обслуживаемых каналов (WhatsApp 1, WhatsApp 2, …) из MH_CHANNELS.
+  const knownChannels = parseKnownChannelUuids(env);
+  if (!knownChannels.size) {
+    console.error('confirm: MH_CHANNELS empty, cannot resolve known channels');
+    return { ok: false };
   }
 
-  // contact_by_phone — пробуем без создания (чтобы попасть в исходный канал
-  // клиента), при пустом ответе — с созданием через primary канал.
-  let resolved = await mhResolveContact(env, token, phone, false, primaryChannelUuid);
-  if (!resolved && primaryChannelUuid) {
-    resolved = await mhResolveContact(env, token, phone, true, primaryChannelUuid);
-  }
+  // Резолв БЕЗ создания. Если контакта нет — клиент не писал нам, шлём в
+  // никуда нельзя: пропускаем.
+  const resolved = await mhResolveContact(env, token, phone, false, knownChannels);
   if (!resolved) {
-    console.error(`confirm: cannot resolve contact for phone=${maskPhone(phone)}`);
-    return { ok: false };
+    console.log(`confirm: no message.help contact for ${maskPhone(phone)}, skip`);
+    return { ok: false, reason: 'no_contact' };
+  }
+  if (!knownChannels.has(String(resolved.channelUuid))) {
+    console.log(`confirm: contact on non-WA channel ${resolved.channelUuid} `
+      + `for ${maskPhone(phone)}, skip`);
+    return { ok: false, reason: 'unknown_channel' };
   }
 
   const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
@@ -1165,10 +1171,10 @@ async function mhSendByPhone(env, phone, text) {
 
 // Резолв контакта в message.help по телефону. Возвращает {channelUuid, userId}
 // или null. message.help может вернуть либо плоский объект, либо вложенный —
-// пробуем оба варианта.
-async function mhResolveContact(env, token, phone, needCreate, channelUuid) {
+// extractContactChannel перебирает оба варианта и предпочитает каналы из
+// knownChannels (Set с uuid наших WhatsApp-каналов).
+async function mhResolveContact(env, token, phone, needCreate, knownChannels) {
   const body = { phone, need_create: !!needCreate };
-  if (channelUuid) body.channel_uuid = channelUuid;
   let res;
   try {
     res = await fetch(
@@ -1189,40 +1195,61 @@ async function mhResolveContact(env, token, phone, needCreate, channelUuid) {
     return null;
   }
   const data = await res.json().catch(() => null);
-  return extractContactChannel(data, channelUuid);
+  return extractContactChannel(data, knownChannels);
 }
 
-// Достаёт пару (channelUuid, userId) из ответа contact_by_phone.
-// Перебирает популярные расположения; логирует если не нашёл.
-function extractContactChannel(data, preferredChannelUuid) {
+// Достаёт пару (channelUuid, userId) из ответа contact_by_phone, отдавая
+// приоритет канал-связкам, чьи uuid входят в knownChannels (Set). Если ни
+// одна связка не из knownChannels, возвращает первый ненулевой вариант — а
+// фильтр в mhSendByPhone дальше сам решит, шлём или нет.
+function extractContactChannel(data, knownChannels) {
   if (!data) return null;
   const c = data.data || data;
   if (!c) return null;
+  const known = (knownChannels && knownChannels.has)
+    ? knownChannels
+    : new Set();
 
-  // Прямые поля
-  if (c.user_id && (c.channel_uuid || preferredChannelUuid)) {
-    return { channelUuid: c.channel_uuid || preferredChannelUuid, userId: c.user_id };
+  // Плоский объект — единственная связка контакт-канал.
+  if (c.user_id && c.channel_uuid) {
+    return { channelUuid: String(c.channel_uuid), userId: c.user_id };
   }
 
-  // Массив каналов/связей контакта
+  // Массив связок. Сначала фильтруем по known, потом первый из остатка.
   const lists = [c.channels, c.users, c.channel_links, c.contact_channels];
   for (const list of lists) {
     if (!Array.isArray(list) || !list.length) continue;
-    // Предпочитаем preferred-канал, если задан
     let pick = null;
-    if (preferredChannelUuid) {
-      pick = list.find((x) => x && (x.channel_uuid === preferredChannelUuid
-        || x.uuid === preferredChannelUuid));
+    for (const x of list) {
+      const ch = x && (x.channel_uuid || x.uuid);
+      const uid = x && (x.user_id || x.id);
+      if (!ch || !uid) continue;
+      if (known.has(String(ch))) { pick = { channelUuid: String(ch), userId: uid }; break; }
+      if (!pick) pick = { channelUuid: String(ch), userId: uid };
     }
-    if (!pick) pick = list[0];
-    const ch = pick.channel_uuid || pick.uuid || preferredChannelUuid;
-    const uid = pick.user_id || pick.id;
-    if (ch && uid) return { channelUuid: ch, userId: uid };
+    if (pick) return pick;
   }
 
   console.error('confirm: extractContactChannel — unexpected shape: '
     + JSON.stringify(c).slice(0, 400));
   return null;
+}
+
+// Set с uuid наших обслуживаемых WhatsApp-каналов (для фильтра confirmation).
+function parseKnownChannelUuids(env) {
+  const set = new Set();
+  if (env.MH_CHANNELS) {
+    try {
+      const map = JSON.parse(env.MH_CHANNELS);
+      for (const v of Object.values(map)) {
+        if (v) set.add(String(v));
+      }
+    } catch (e) {
+      console.error('parseKnownChannelUuids:', e && e.message);
+    }
+  }
+  if (env.MH_CHANNEL_UUID) set.add(String(env.MH_CHANNEL_UUID));
+  return set;
 }
 
 // ── Скрипт сообщения подтверждения ─────────────────────────────────────────
