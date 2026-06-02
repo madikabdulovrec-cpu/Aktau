@@ -229,6 +229,18 @@ const ALMATY_UTC_OFFSET = 5;       // Алматы = UTC+5
 const BOT_HOUR_START = 21;
 const BOT_HOUR_END = 7;
 
+// Дневное окно подтверждений записей (Almaty time): cron-задача рассылает
+// напоминания «за 24 часа» ТОЛЬКО в эти часы. Ночью сам себя пропускает.
+const CONFIRM_HOUR_START = 9;
+const CONFIRM_HOUR_END = 21;       // последний разрешённый час — 20 (по 20:59)
+const CONFIRM_LATE_FALLBACK_H = 20; // если идеал > 20:00 — слот = 20:00 сегодня
+const CONFIRM_WINDOW_MIN = 15;     // ширина «срабатывания» вокруг идеального слота, мин.
+const CONFIRM_DEDUP_TTL = 172800;  // 48 ч — пометка отправленных record_id (анти-дубль)
+const CONFIRM_PENDING_TTL = 129600;// 36 ч — ждём ответ клиента «Да/Нет»
+const CONFIRM_TICK_MAX = 25;       // макс. сообщений за один cron-tick (анти-бан)
+const CONFIRM_TICK_PAUSE_MIN = 1500;
+const CONFIRM_TICK_PAUSE_MAX = 3500;
+
 // ── Резолв канала ──────────────────────────────────────────────────────────
 // Project webhook message.help ловит сообщения со ВСЕХ каналов проекта (WhatsApp 1,
 // WhatsApp 2, Instagram, …). Мы обслуживаем только те, что прописаны в MH_CHANNELS
@@ -292,6 +304,14 @@ export default {
         console.error('processMessage failed:', e && e.message)));
     }
     return json({ ok: true });
+  },
+
+  // Cron-handler: подтверждение записей за ~24 часа.
+  // Триггер `*/15 * * * *` из wrangler-mh-bot.toml. Внутри сам себя пропускает
+  // вне дневного окна (09:00–20:59 по Алматы). Запускается параллельно с fetch.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runConfirmationJob(env).catch((e) =>
+      console.error('confirmation job failed:', e && e.message)));
   },
 };
 
@@ -372,6 +392,22 @@ async function processMessage(msg, env) {
   // Дедуп — message.help может повторить доставку вебхука.
   const seenKey = `seen:${msg.messageId}`;
   if (await env.BOT_KV.get(seenKey)) return;
+
+  // Если контакт ждёт ответ на подтверждение записи — пробуем распознать
+  // короткий «Да/Нет». При успехе обрабатываем без Claude (быстро + дёшево
+  // + предсказуемо). Длинный/непонятный ответ → fall-through в обычный
+  // диалоговый flow (Claude разберётся).
+  const pendingRaw = await env.BOT_KV.get(`confirm_pending:user:${msg.userId}`);
+  if (pendingRaw) {
+    const kind = classifyConfirmationResponse(msg.text);
+    if (kind) {
+      let pending = null;
+      try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
+      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+      await handleConfirmationResponse(env, msg, kind, pending);
+      return;
+    }
+  }
 
   // История диалога (baseLen — для защиты от гонки при записи).
   const histKey = `hist:${msg.userId}`;
@@ -860,6 +896,473 @@ async function handleBooking(env, msg, booking) {
   await assignToManager(env, msg);
   console.log(`booking saved u${msg.userId} name=${booking.name || '-'}`);
   // Бот в Altegio не пишет — запись оформляет менеджер по карточке лида.
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ПОДТВЕРЖДЕНИЕ ЗАПИСЕЙ ЗА 24 ЧАСА
+// Дневная функция: запускается cron'ом */15 мин, в окне 09:00–20:59 Almaty
+// читает Altegio, шлёт клиенту скрипт-напоминание, ловит ответ «Да/Нет»,
+// ставит attendance=2 в Altegio (единственная write-операция). При «Нет» —
+// передаёт менеджеру. Дедуп по record_id защищает от повторов даже если
+// мастер перекинул клиента на другого мастера/время (id записи не меняется).
+// ════════════════════════════════════════════════════════════════════════════
+
+async function runConfirmationJob(env) {
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
+    || !env.ALTEGIO_COMPANY_ID) {
+    console.log('confirm: altegio not configured, skip');
+    return;
+  }
+  if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) {
+    console.log('confirm: message.help not configured, skip');
+    return;
+  }
+
+  // Окно работы
+  const nowMs = Date.now();
+  const almaty = new Date(nowMs + ALMATY_UTC_OFFSET * 3600000);
+  const hour = almaty.getUTCHours();
+  if (hour < CONFIRM_HOUR_START || hour >= CONFIRM_HOUR_END) {
+    console.log(`confirm: outside window (h=${hour}), skip`);
+    return;
+  }
+
+  // Дата «завтра» по Almaty — YYYY-MM-DD
+  const tomorrowAlmaty = new Date(almaty.getTime() + 86400000);
+  const yyyy = tomorrowAlmaty.getUTCFullYear();
+  const mm = String(tomorrowAlmaty.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(tomorrowAlmaty.getUTCDate()).padStart(2, '0');
+  const tomorrowStr = `${yyyy}-${mm}-${dd}`;
+
+  let records;
+  try {
+    records = await altegioFetchRecords(env, tomorrowStr, tomorrowStr);
+  } catch (e) {
+    console.error('confirm: altegio fetch failed:', e && e.message);
+    return;
+  }
+  if (!Array.isArray(records) || !records.length) {
+    console.log(`confirm: no records for ${tomorrowStr}`);
+    return;
+  }
+
+  // Сегодняшние границы Almaty в ms (для clamp)
+  const todayCalAlmaty = new Date(Date.UTC(
+    almaty.getUTCFullYear(), almaty.getUTCMonth(), almaty.getUTCDate(), 0, 0, 0));
+  const todayCalUtcMs = todayCalAlmaty.getTime() - ALMATY_UTC_OFFSET * 3600000;
+  const today09Ms = todayCalUtcMs + CONFIRM_HOUR_START * 3600000;
+  const todayLateMs = todayCalUtcMs + CONFIRM_LATE_FALLBACK_H * 3600000;
+
+  const candidates = [];
+  for (const r of records) {
+    // Уже подтверждена / клиент пришёл / не пришёл — пропускаем.
+    const att = Number(r.attendance);
+    if (att !== 0) continue;
+
+    // Кандидат на удаление в Altegio (deleted/cancelled) — пропускаем.
+    if (r.deleted) continue;
+
+    // Телефон клиента
+    const rawPhone = (r.client && (r.client.phone || r.client.surname_with_phone))
+      || r.client_phone || '';
+    const phone = normalizePhone(rawPhone);
+    if (!phone) continue;
+
+    // Дата/время записи
+    const parts = parseAltegioParts(r.date || r.datetime);
+    if (!parts) continue;
+    const apptMs = partsToAlmatyMs(parts);
+    if (!apptMs || apptMs < nowMs + 60000) continue; // запись в прошлом — мимо
+
+    // Идеальный слот = appointment - 24h, с ограничением в дневное окно сегодня
+    const idealMs = apptMs - 24 * 3600000;
+    let slotMs;
+    if (idealMs < today09Ms) slotMs = today09Ms;
+    else if (idealMs > todayLateMs) slotMs = todayLateMs;
+    else slotMs = idealMs;
+
+    // Слот ещё не настал (> минуты впереди) — ждём следующих cron-тиков
+    if (slotMs > nowMs + 60000) continue;
+
+    // Дедуп по record_id (мастер перекинул клиента → id не меняется)
+    const dedupKey = `confirm_sent:${r.id}`;
+    candidates.push({ record: r, phone, parts, dedupKey });
+  }
+
+  if (!candidates.length) {
+    console.log(`confirm: ${records.length} tomorrow, 0 ready in this tick`);
+    return;
+  }
+
+  // Анти-бан: перетасовка + ограничение на один tick + микропаузы между
+  shuffleInPlace(candidates);
+  const batch = candidates.slice(0, CONFIRM_TICK_MAX);
+
+  let okCount = 0;
+  let skipCount = 0;
+  for (const item of batch) {
+    if (await env.BOT_KV.get(item.dedupKey)) { skipCount++; continue; }
+    const r = item.record;
+    const text = buildConfirmationText(item.parts);
+    let sent = false;
+    try {
+      sent = await mhSendByPhone(env, item.phone, text);
+    } catch (e) {
+      console.error('confirm send error:', e && e.message);
+    }
+    if (sent && sent.ok) {
+      okCount++;
+      // Дедуп по записи
+      await env.BOT_KV.put(item.dedupKey, JSON.stringify({
+        recordId: r.id, phone: item.phone, sentAt: new Date().toISOString(),
+        appointmentDate: r.date || r.datetime,
+      }), { expirationTtl: CONFIRM_DEDUP_TTL });
+      // Ждём короткий ответ Да/Нет — сохраняем pending по user_id канала
+      if (sent.userId) {
+        await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
+          recordId: r.id, phone: item.phone,
+          appointmentDate: r.date || r.datetime,
+          channelUuid: sent.channelUuid,
+        }), { expirationTtl: CONFIRM_PENDING_TTL });
+      }
+    }
+    await sleep(CONFIRM_TICK_PAUSE_MIN
+      + Math.floor(Math.random() * (CONFIRM_TICK_PAUSE_MAX - CONFIRM_TICK_PAUSE_MIN)));
+  }
+  console.log(`confirm tick: ${records.length} tomorrow, ${candidates.length} ready, `
+    + `${okCount} sent, ${skipCount} dedup`);
+}
+
+// ── Altegio: чтение записей и обновление attendance ────────────────────────
+
+async function altegioFetchRecords(env, startDate, endDate) {
+  const url = `${ALTEGIO_API}/records/${env.ALTEGIO_COMPANY_ID}`
+    + `?start_date=${startDate}&end_date=${endDate}&count=200`;
+  const res = await fetch(url, { headers: altegioHeaders(env) });
+  if (!res.ok) {
+    console.error('altegio records:', res.status, (await res.text()).slice(0, 200));
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  return (data && data.data) || [];
+}
+
+async function altegioFetchRecord(env, recordId) {
+  const url = `${ALTEGIO_API}/record/${env.ALTEGIO_COMPANY_ID}/${recordId}`;
+  const res = await fetch(url, { headers: altegioHeaders(env) });
+  if (!res.ok) {
+    console.error('altegio record get:', res.status);
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  return (data && data.data) || null;
+}
+
+// Бот в Altegio пишет ТОЛЬКО одно поле — attendance=2 (клиент подтвердил).
+// Безопасно: читаем запись, ставим attendance=2 и шлём PUT с полями, которые
+// API требует обязательными.
+async function markAttendanceConfirmed(env, recordId) {
+  const rec = await altegioFetchRecord(env, recordId);
+  if (!rec) return false;
+  const body = {
+    staff_id: rec.staff_id || (rec.staff && rec.staff.id) || null,
+    datetime: rec.date || rec.datetime,
+    seance_length: rec.length || rec.seance_length || 3600,
+    services: Array.isArray(rec.services) ? rec.services.map((s) => ({
+      id: s.id,
+      cost: s.cost,
+      first_cost: s.first_cost,
+      discount: s.discount,
+    })) : [],
+    client: rec.client ? {
+      id: rec.client.id,
+      phone: rec.client.phone,
+      name: rec.client.name,
+    } : null,
+    attendance: 2,
+    comment: rec.comment || '',
+  };
+  const url = `${ALTEGIO_API}/record/${env.ALTEGIO_COMPANY_ID}/${recordId}`;
+  const res = await fetch(url, {
+    method: 'PUT', headers: altegioHeaders(env), body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    console.error('altegio attendance PUT:', res.status,
+      (await res.text()).slice(0, 300));
+    return false;
+  }
+  return true;
+}
+
+// ── message.help: отправка по телефону ─────────────────────────────────────
+// Резолвит контакт в message.help по номеру (создаёт при необходимости),
+// добывает channel_uuid + user_id канала и шлёт сообщение. Возвращает
+// {ok, channelUuid, userId} — userId нужен наверху для KV-маппинга pending.
+
+async function mhSendByPhone(env, phone, text) {
+  const token = await getMhToken(env);
+  if (!token) return { ok: false };
+
+  // Принудительный канал для исходящих confirmation — env.MH_PRIMARY_CHANNEL_UUID
+  // или первый ключ из MH_CHANNELS. Это влияет только на need_create:
+  // существующий контакт через свой исходный канал будет адресован.
+  let primaryChannelUuid = env.MH_PRIMARY_CHANNEL_UUID || '';
+  if (!primaryChannelUuid && env.MH_CHANNELS) {
+    try {
+      const map = JSON.parse(env.MH_CHANNELS);
+      const first = Object.values(map)[0];
+      if (first) primaryChannelUuid = String(first);
+    } catch (_) { /* noop */ }
+  }
+
+  // contact_by_phone — пробуем без создания (чтобы попасть в исходный канал
+  // клиента), при пустом ответе — с созданием через primary канал.
+  let resolved = await mhResolveContact(env, token, phone, false, primaryChannelUuid);
+  if (!resolved && primaryChannelUuid) {
+    resolved = await mhResolveContact(env, token, phone, true, primaryChannelUuid);
+  }
+  if (!resolved) {
+    console.error(`confirm: cannot resolve contact for phone=${maskPhone(phone)}`);
+    return { ok: false };
+  }
+
+  const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
+    + `/channels/${resolved.channelUuid}/send_message/${resolved.userId}`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let res;
+    try {
+      const form = new FormData();
+      form.append('text', text);
+      form.append('destination', 'from_operator');
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+    } catch (e) {
+      console.error('confirm send fetch:', e && e.message);
+      await sleep(500 * (attempt + 1));
+      continue;
+    }
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      const sentId = data && data.data && data.data.id;
+      if (sentId) {
+        await env.BOT_KV.put(`sent:${sentId}`, '1', { expirationTtl: SENT_TTL });
+      }
+      return { ok: true, channelUuid: resolved.channelUuid, userId: resolved.userId };
+    }
+    if (res.status !== 429 && res.status < 500) {
+      console.error(`confirm send ${res.status}:`,
+        (await res.text()).slice(0, 200));
+      return { ok: false };
+    }
+    const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+    await sleep(retryAfter ? retryAfter * 1000 : 600 * (attempt + 1));
+  }
+  return { ok: false };
+}
+
+// Резолв контакта в message.help по телефону. Возвращает {channelUuid, userId}
+// или null. message.help может вернуть либо плоский объект, либо вложенный —
+// пробуем оба варианта.
+async function mhResolveContact(env, token, phone, needCreate, channelUuid) {
+  const body = { phone, need_create: !!needCreate };
+  if (channelUuid) body.channel_uuid = channelUuid;
+  let res;
+  try {
+    res = await fetch(
+      `${MH_API}/app/projects/${env.MH_PROJECT_ID}/contacts/contact_by_phone`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+  } catch (e) {
+    console.error('confirm contact_by_phone:', e && e.message);
+    return null;
+  }
+  if (!res.ok) {
+    if (res.status === 404 && !needCreate) return null; // не существует — нормально
+    console.error(`confirm contact_by_phone ${res.status}:`,
+      (await res.text()).slice(0, 200));
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  return extractContactChannel(data, channelUuid);
+}
+
+// Достаёт пару (channelUuid, userId) из ответа contact_by_phone.
+// Перебирает популярные расположения; логирует если не нашёл.
+function extractContactChannel(data, preferredChannelUuid) {
+  if (!data) return null;
+  const c = data.data || data;
+  if (!c) return null;
+
+  // Прямые поля
+  if (c.user_id && (c.channel_uuid || preferredChannelUuid)) {
+    return { channelUuid: c.channel_uuid || preferredChannelUuid, userId: c.user_id };
+  }
+
+  // Массив каналов/связей контакта
+  const lists = [c.channels, c.users, c.channel_links, c.contact_channels];
+  for (const list of lists) {
+    if (!Array.isArray(list) || !list.length) continue;
+    // Предпочитаем preferred-канал, если задан
+    let pick = null;
+    if (preferredChannelUuid) {
+      pick = list.find((x) => x && (x.channel_uuid === preferredChannelUuid
+        || x.uuid === preferredChannelUuid));
+    }
+    if (!pick) pick = list[0];
+    const ch = pick.channel_uuid || pick.uuid || preferredChannelUuid;
+    const uid = pick.user_id || pick.id;
+    if (ch && uid) return { channelUuid: ch, userId: uid };
+  }
+
+  console.error('confirm: extractContactChannel — unexpected shape: '
+    + JSON.stringify(c).slice(0, 400));
+  return null;
+}
+
+// ── Скрипт сообщения подтверждения ─────────────────────────────────────────
+
+function buildConfirmationText(parts) {
+  const dateStr = `${String(parts.day).padStart(2, '0')}.`
+    + `${String(parts.month).padStart(2, '0')}.${parts.year}`;
+  const timeStr = `${parts.hour}:${String(parts.minute).padStart(2, '0')}`;
+  return [
+    'Добрый день🌷',
+    '',
+    'Это автоматическое напоминание от M&M о вашей записи. '
+      + 'Если в данных будут неточности — ответьте, и менеджер всё уточнит.',
+    '',
+    'Вы записаны в M&M: ',
+    '',
+    '',
+    `🗓️ Дата : ${dateStr}`,
+    '',
+    `🕒 Время : ${timeStr}`,
+    '',
+    '📍 Ауэзова 175 Б ',
+    '',
+    '',
+    'Будем ждать вас! Подтвердите, пожалуйста, запись ❤️',
+    '',
+    '❗️*Отмена записи происходит за 24 часа* ',
+    '',
+    '*В случае отмены записи менее чем за 24 часа, '
+      + 'предоплата/посещение сгорает* ❗️',
+    '',
+    'M & M',
+    '',
+    'https://2gis.kz/almaty/geo/70000001060407110',
+  ].join('\n');
+}
+
+// ── Ответ клиента на подтверждение: Да / Нет ───────────────────────────────
+
+function classifyConfirmationResponse(rawText) {
+  if (!rawText) return null;
+  let t = String(rawText).trim().toLowerCase();
+  // Длинные/вопросительные ответы не считаем коротким Да/Нет — пусть Claude
+  // разбирает в обычном flow (либо менеджер).
+  if (t.length > 50) return null;
+  if (t.indexOf('?') !== -1) return null;
+
+  // Сначала «нет», потому что фразы «не приду / не получится» содержат «не»,
+  // а «да» в них нет.
+  if (/(^|\W)(нет|жок|joq|отмен|не приду|не буду|не получ|не смог|не прид|перенес|отказ|no|нету|👎|❌|✖|✗)(\W|$)/i.test(t)) {
+    return 'no';
+  }
+  if (/(^|\W)(да|ия|иә|плюс|ок|окей|хорошо|подтвержд|конечно|приду|буду|yes|ага|угу|👍|✅|☑|✔)(\W|$)/i.test(t)
+    || t === '1' || t === '+' || /(^|\W)\+(\W|$)/.test(t)) {
+    return 'yes';
+  }
+  // Эмодзи-only без слов
+  if (/^[\s👍✅☑✔❤❤️🌷👌]+$/u.test(t)) return 'yes';
+  if (/^[\s👎❌✖✗]+$/u.test(t)) return 'no';
+  return null;
+}
+
+async function handleConfirmationResponse(env, msg, kind, pending) {
+  // Сбрасываем pending в любом случае — повторно не реагируем.
+  await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
+
+  if (kind === 'yes') {
+    let altOk = false;
+    if (pending && pending.recordId) {
+      try { altOk = await markAttendanceConfirmed(env, pending.recordId); }
+      catch (e) { console.error('attendance set error:', e && e.message); }
+    }
+    await sendMessage(env, msg, 'Спасибо! Ждём вас 🌷');
+    // Локальная отметка на случай если Altegio не дался — менеджер увидит лог
+    await env.BOT_KV.put(`confirm_done:${pending && pending.recordId}`, JSON.stringify({
+      kind: 'confirmed', altegio: altOk, at: new Date().toISOString(),
+      userId: msg.userId,
+    }), { expirationTtl: LEAD_TTL });
+    console.log(`confirm reply YES u${msg.userId} record=${pending && pending.recordId} altegio=${altOk}`);
+    return;
+  }
+
+  if (kind === 'no') {
+    await sendMessage(env, msg, 'Поняла, передаю менеджеру — он(а) свяжется и поможет 🤍');
+    if (msg.userId) {
+      await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+    }
+    await env.BOT_KV.put(`confirm_done:${pending && pending.recordId}`, JSON.stringify({
+      kind: 'cancel_requested', at: new Date().toISOString(),
+      userId: msg.userId,
+    }), { expirationTtl: LEAD_TTL });
+    await assignToManager(env, msg);
+    console.log(`confirm reply NO u${msg.userId} record=${pending && pending.recordId}`);
+  }
+}
+
+// ── Парсеры даты Altegio (локальное время Almaty) ──────────────────────────
+
+function parseAltegioParts(s) {
+  if (!s) return null;
+  const m = String(s).match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  return {
+    year: +m[1], month: +m[2], day: +m[3],
+    hour: +m[4], minute: +m[5], second: +(m[6] || 0),
+  };
+}
+
+function partsToAlmatyMs(p) {
+  // Altegio отдаёт datetime в локальном времени филиала (Almaty, UTC+5)
+  // без таймзоны. Чтобы получить корректный ms-таймстамп, вычитаем смещение.
+  return Date.UTC(p.year, p.month - 1, p.day,
+    p.hour - ALMATY_UTC_OFFSET, p.minute, p.second);
+}
+
+// ── Утилиты телефонов и анти-бан ───────────────────────────────────────────
+
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const d = String(raw).replace(/\D/g, '');
+  if (d.length < 10) return null;
+  // 87xxxxxxxxx (Каз.) → 77xxxxxxxxx
+  if (d.length === 11 && d[0] === '8') return '7' + d.slice(1);
+  if (d.length === 11 && d[0] === '7') return d;
+  if (d.length === 10) return '7' + d;
+  return d;
+}
+
+function maskPhone(p) {
+  if (!p) return '<none>';
+  return String(p).slice(0, 4) + '***' + String(p).slice(-3);
+}
+
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+  }
+  return arr;
 }
 
 // ── Утилиты ────────────────────────────────────────────────────────────────

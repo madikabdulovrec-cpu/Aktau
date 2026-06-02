@@ -9,6 +9,11 @@ main = "mh-bot.js"
 compatibility_date = "2025-05-01"
 account_id = "650cb2300c9e29301178d3e5998be3b4"
 
+# Cron-триггеры — дневная функция «подтверждение записи за 24 часа».
+# Каждые 15 минут. Воркер сам пропускает тики вне 09:00–20:59 Almaty.
+[triggers]
+crons = ["*/15 * * * *"]
+
 # KV namespace — история диалогов, дедуп, кэш токена/слотов, карточки лидов.
 # Ниже — id существующего mm-bot-kv: его можно переиспользовать (прототип Wazzup
 # отключён). Либо создать новый:  wrangler kv namespace create mh-bot-kv
@@ -24,6 +29,8 @@ MH_CHANNELS = '{"17222":"3a00d58f-4060-42be-96b9-898cba18748e","20916":"71608151
 MANAGER_OPERATOR_ID = ""                # id оператора-менеджера message.help (опц.)
 ALTEGIO_COMPANY_ID = "1330174"                 # id филиала Altegio (опц. — гейт и слоты)
 ALTEGIO_CONSULT_SERVICE_ID = "13190960"         # id услуги-консультации Altegio (опц. — слоты)
+# MH_PRIMARY_CHANNEL_UUID = ""           # (опц.) канал для рассылки подтверждений
+                                          # — если пусто, берётся первый из MH_CHANNELS
 
 # Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
 #   wrangler secret put ANTHROPIC_API_KEY     --config worker/wrangler-mh-bot.toml
