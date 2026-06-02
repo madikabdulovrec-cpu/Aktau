@@ -20,7 +20,7 @@ id = "729a6c1778f24eaf82b875a8bfea9987"
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
 MH_PROJECT_ID = "220763"                # id проекта message.help — ПОДТВЕРДИТЬ
-MH_CHANNEL_UUID = "3a00d58f-4060-42be-96b9-898cba18748e"  # WhatsApp 1 (id 17222)
+MH_CHANNELS = '{"17222":"3a00d58f-4060-42be-96b9-898cba18748e","20916":"71608151-e312-48d2-b103-524c8b2e146e"}'  # WhatsApp 1 (17222) + WhatsApp 2 (20916)
 MANAGER_OPERATOR_ID = ""                # id оператора-менеджера message.help (опц.)
 ALTEGIO_COMPANY_ID = "1330174"                 # id филиала Altegio (опц. — гейт и слоты)
 ALTEGIO_CONSULT_SERVICE_ID = "13190960"         # id услуги-консультации Altegio (опц. — слоты)

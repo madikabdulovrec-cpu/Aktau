@@ -229,6 +229,25 @@ const ALMATY_UTC_OFFSET = 5;       // Алматы = UTC+5
 const BOT_HOUR_START = 21;
 const BOT_HOUR_END = 7;
 
+// ── Резолв канала ──────────────────────────────────────────────────────────
+// Project webhook message.help ловит сообщения со ВСЕХ каналов проекта (WhatsApp 1,
+// WhatsApp 2, Instagram, …). Мы обслуживаем только те, что прописаны в MH_CHANNELS
+// (JSON-карта channel_id → channel_uuid). Для неизвестного канала функция вернёт
+// null — processMessage в таком случае молча скипает сообщение.
+function resolveChannelUuid(env, channelId) {
+  if (env.MH_CHANNELS) {
+    try {
+      const map = JSON.parse(env.MH_CHANNELS);
+      const uuid = map[String(channelId)] || map[channelId];
+      if (uuid) return uuid;
+    } catch (e) {
+      console.error('MH_CHANNELS parse error:', e && e.message);
+    }
+  }
+  // Backward-compat: один канал через MH_CHANNEL_UUID (без проверки channel_id).
+  return env.MH_CHANNEL_UUID || null;
+}
+
 // ── Точка входа ────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -242,7 +261,7 @@ export default {
     }
 
     const missing = ['ANTHROPIC_API_KEY', 'MH_LOGIN', 'MH_PASSWORD', 'WEBHOOK_SECRET',
-      'MH_PROJECT_ID', 'MH_CHANNEL_UUID'].filter((k) => !env[k]);
+      'MH_PROJECT_ID', 'MH_CHANNELS'].filter((k) => !env[k]);
     if (!env.BOT_KV || typeof env.BOT_KV.get !== 'function') missing.push('BOT_KV');
     if (missing.length) {
       console.error('misconfigured: missing', missing.join(','));
@@ -295,6 +314,16 @@ function parseWebhook(body) {
 // ── Обработка одного входящего сообщения ───────────────────────────────────
 async function processMessage(msg, env) {
   const tag = `u${msg.userId}`;
+
+  // Резолвим канал из входящего: проектный вебхук message.help ловит сообщения
+  // со ВСЕХ каналов проекта, но мы обслуживаем только те, что в MH_CHANNELS.
+  // Незнакомый канал (Instagram и т.п.) — молча скипаем.
+  const channelUuid = resolveChannelUuid(env, msg.channelId);
+  if (!channelUuid) {
+    console.log(`unknown channel ${msg.channelId}, skip ${tag}`);
+    return;
+  }
+  msg.channelUuid = channelUuid;
 
   // Эхо-защита: сообщение, отправленное самим ботом, message.help может вернуть
   // обратно вебхуком. Свои id мы помечаем при отправке — такие пропускаем.
@@ -382,7 +411,7 @@ async function processMessage(msg, env) {
 
   // Ответ клиенту. Если не доставлено — не помечаем seen и не сохраняем
   // историю: остаётся шанс на повторную обработку.
-  const sent = await sendMessage(env, msg.userId, clientText);
+  const sent = await sendMessage(env, msg, clientText);
   if (!sent) {
     console.error(`reply not delivered ${tag}`);
     return;
@@ -418,7 +447,7 @@ async function classifyContact(msg, env) {
     return 'new';
   }
   try {
-    const phone = await getContactPhone(env, msg.userId);
+    const phone = await getContactPhone(env, msg);
     if (!phone) return 'new';
     return (await altegioHasVisitHistory(env, phone)) ? 'existing' : 'new';
   } catch (e) {
@@ -427,13 +456,15 @@ async function classifyContact(msg, env) {
   }
 }
 
-// Телефон клиента по user_id из message.help.
+// Телефон клиента по user_id из message.help. Используем uuid того канала,
+// откуда пришёл вебхук (msg.channelUuid), — этим путём message.help резолвит
+// конкретного пользователя.
 // VERIFY (task#8): точное имя поля телефона в ответе get-user — на первом тесте.
-async function getContactPhone(env, userId) {
+async function getContactPhone(env, msg) {
   const token = await getMhToken(env);
   if (!token) return null;
   const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
-    + `/channels/${env.MH_CHANNEL_UUID}/users/${userId}`;
+    + `/channels/${msg.channelUuid}/users/${msg.userId}`;
   let res;
   try {
     res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -694,7 +725,7 @@ async function getMhToken(env, force) {
 // send_message принимает multipart/form-data; destination=from_operator —
 // сообщение уходит клиенту как ответ оператора.
 // Возвращает true при успешной доставке, false — если доставить не удалось.
-async function sendMessage(env, userId, text) {
+async function sendMessage(env, msg, text) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const token = await getMhToken(env, attempt > 0);  // на ретрае — свежий токен
     if (!token) {
@@ -702,7 +733,7 @@ async function sendMessage(env, userId, text) {
       continue;
     }
     const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
-      + `/channels/${env.MH_CHANNEL_UUID}/send_message/${userId}`;
+      + `/channels/${msg.channelUuid}/send_message/${msg.userId}`;
     let res;
     try {
       const form = new FormData();
@@ -755,7 +786,7 @@ async function sendMessage(env, userId, text) {
 async function assignToManager(env, msg) {
   if (!env.MANAGER_OPERATOR_ID) return;
   try {
-    const contactId = await getContactId(env, msg.userId);
+    const contactId = await getContactId(env, msg);
     if (!contactId) { console.error('assignToManager: contact_id не получен'); return; }
     const token = await getMhToken(env);
     if (!token) return;
@@ -775,8 +806,8 @@ async function assignToManager(env, msg) {
 
 // contact_id message.help по user_id канала (через телефон + contact_by_phone).
 // VERIFY (task#8): поле id в ответе contact_by_phone.
-async function getContactId(env, userId) {
-  const phone = await getContactPhone(env, userId);
+async function getContactId(env, msg) {
+  const phone = await getContactPhone(env, msg);
   if (!phone) return null;
   const token = await getMhToken(env);
   if (!token) return null;
