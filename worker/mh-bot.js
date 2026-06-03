@@ -963,6 +963,12 @@ async function runConfirmationJob(env) {
     const att = Number(r.attendance);
     if (att !== 0) continue;
 
+    // ВАЖНО: поле `confirmed` НЕ используем для скипа. В этом кабинете
+    // Altegio оно проставляется автоматически при создании записи (все
+    // 50/50 на завтра имеют confirmed=1) и не означает «клиент подтвердил
+    // через мессенджер». Единственный надёжный признак подтверждения от
+    // клиента — attendance=2, его и проверяем выше.
+
     // Кандидат на удаление в Altegio (deleted/cancelled) — пропускаем.
     if (r.deleted) continue;
 
@@ -1112,24 +1118,19 @@ async function mhSendByPhone(env, phone, text) {
   const token = await getMhToken(env);
   if (!token) return { ok: false };
 
-  // Список наших обслуживаемых каналов (WhatsApp 1, WhatsApp 2, …) из MH_CHANNELS.
-  const knownChannels = parseKnownChannelUuids(env);
-  if (!knownChannels.size) {
+  // Map id→uuid наших обслуживаемых каналов (WhatsApp 1, WhatsApp 2, …)
+  const channelMap = parseKnownChannelMap(env);
+  if (!channelMap.size) {
     console.error('confirm: MH_CHANNELS empty, cannot resolve known channels');
     return { ok: false };
   }
 
-  // Резолв БЕЗ создания. Если контакта нет — клиент не писал нам, шлём в
-  // никуда нельзя: пропускаем.
-  const resolved = await mhResolveContact(env, token, phone, false, knownChannels);
+  // Резолв БЕЗ создания. Если контакта нет ИЛИ ни одна связка не на наших
+  // каналах (только Instagram, например) — шлём в никуда нельзя, пропускаем.
+  const resolved = await mhResolveContact(env, token, phone, false, channelMap);
   if (!resolved) {
-    console.log(`confirm: no message.help contact for ${maskPhone(phone)}, skip`);
+    console.log(`confirm: no usable WA contact for ${maskPhone(phone)}, skip`);
     return { ok: false, reason: 'no_contact' };
-  }
-  if (!knownChannels.has(String(resolved.channelUuid))) {
-    console.log(`confirm: contact on non-WA channel ${resolved.channelUuid} `
-      + `for ${maskPhone(phone)}, skip`);
-    return { ok: false, reason: 'unknown_channel' };
   }
 
   const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
@@ -1170,10 +1171,9 @@ async function mhSendByPhone(env, phone, text) {
 }
 
 // Резолв контакта в message.help по телефону. Возвращает {channelUuid, userId}
-// или null. message.help может вернуть либо плоский объект, либо вложенный —
-// extractContactChannel перебирает оба варианта и предпочитает каналы из
-// knownChannels (Set с uuid наших WhatsApp-каналов).
-async function mhResolveContact(env, token, phone, needCreate, knownChannels) {
+// или null. extractContactChannel матчит channel_id связки против channelMap
+// (id→uuid из MH_CHANNELS) и отдаёт пару, на которой клиент реально с нами.
+async function mhResolveContact(env, token, phone, needCreate, channelMap) {
   const body = { phone, need_create: !!needCreate };
   let res;
   try {
@@ -1195,61 +1195,73 @@ async function mhResolveContact(env, token, phone, needCreate, knownChannels) {
     return null;
   }
   const data = await res.json().catch(() => null);
-  return extractContactChannel(data, knownChannels);
+  return extractContactChannel(data, channelMap);
 }
 
-// Достаёт пару (channelUuid, userId) из ответа contact_by_phone, отдавая
-// приоритет канал-связкам, чьи uuid входят в knownChannels (Set). Если ни
-// одна связка не из knownChannels, возвращает первый ненулевой вариант — а
-// фильтр в mhSendByPhone дальше сам решит, шлём или нет.
-function extractContactChannel(data, knownChannels) {
+// Достаёт пару (channelUuid, userId) из ответа contact_by_phone.
+// message.help отдаёт связки вида {id, channel_id, uid (телефон), ...} в
+// data.users[]. channel_id — числовой id канала; uuid берём из knownChannels
+// (Map id→uuid, наша MH_CHANNELS). Если ни одна связка не попадает в наши
+// каналы — возвращаем null (контакт у клиента есть, но писать ему нам некуда).
+function extractContactChannel(data, channelMap) {
   if (!data) return null;
   const c = data.data || data;
   if (!c) return null;
-  const known = (knownChannels && knownChannels.has)
-    ? knownChannels
-    : new Set();
+  const map = (channelMap instanceof Map) ? channelMap : new Map();
 
-  // Плоский объект — единственная связка контакт-канал.
-  if (c.user_id && c.channel_uuid) {
-    return { channelUuid: String(c.channel_uuid), userId: c.user_id };
+  const candidates = [];
+  // Плоский объект
+  if (c.user_id || c.id) {
+    candidates.push({
+      cid: c.channel_id, cuuid: c.channel_uuid || c.uuid,
+      uid: c.user_id || c.id,
+    });
   }
-
-  // Массив связок. Сначала фильтруем по known, потом первый из остатка.
-  const lists = [c.channels, c.users, c.channel_links, c.contact_channels];
-  for (const list of lists) {
-    if (!Array.isArray(list) || !list.length) continue;
-    let pick = null;
+  // Массивы связок (приоритет — users, оно реально отдаётся message.help)
+  for (const list of [c.users, c.channels, c.channel_links, c.contact_channels]) {
+    if (!Array.isArray(list)) continue;
     for (const x of list) {
-      const ch = x && (x.channel_uuid || x.uuid);
-      const uid = x && (x.user_id || x.id);
-      if (!ch || !uid) continue;
-      if (known.has(String(ch))) { pick = { channelUuid: String(ch), userId: uid }; break; }
-      if (!pick) pick = { channelUuid: String(ch), userId: uid };
+      if (!x) continue;
+      candidates.push({
+        cid: x.channel_id,
+        cuuid: x.channel_uuid || x.uuid,
+        uid: x.user_id || x.id,
+        blocked: !!x.blocked,
+      });
     }
-    if (pick) return pick;
   }
 
-  console.error('confirm: extractContactChannel — unexpected shape: '
-    + JSON.stringify(c).slice(0, 400));
+  // Сначала ищем связку на нашем канале (по channel_id из MH_CHANNELS).
+  for (const x of candidates) {
+    if (!x.uid || x.blocked) continue;
+    if (x.cid != null) {
+      const uuid = map.get(String(x.cid));
+      if (uuid) return { channelUuid: uuid, userId: x.uid };
+    }
+    if (x.cuuid && Array.from(map.values()).includes(String(x.cuuid))) {
+      return { channelUuid: String(x.cuuid), userId: x.uid };
+    }
+  }
+
+  // Связки есть, но НИ ОДНА не из MH_CHANNELS (например только Instagram).
+  // Это и есть «контакт на чужом канале» — шлём null, в mhSendByPhone лог.
   return null;
 }
 
-// Set с uuid наших обслуживаемых WhatsApp-каналов (для фильтра confirmation).
-function parseKnownChannelUuids(env) {
-  const set = new Set();
+// Map id→uuid наших обслуживаемых каналов (MH_CHANNELS).
+function parseKnownChannelMap(env) {
+  const map = new Map();
   if (env.MH_CHANNELS) {
     try {
-      const map = JSON.parse(env.MH_CHANNELS);
-      for (const v of Object.values(map)) {
-        if (v) set.add(String(v));
+      const obj = JSON.parse(env.MH_CHANNELS);
+      for (const [id, uuid] of Object.entries(obj)) {
+        if (uuid) map.set(String(id), String(uuid));
       }
     } catch (e) {
-      console.error('parseKnownChannelUuids:', e && e.message);
+      console.error('parseKnownChannelMap:', e && e.message);
     }
   }
-  if (env.MH_CHANNEL_UUID) set.add(String(env.MH_CHANNEL_UUID));
-  return set;
+  return map;
 }
 
 // ── Скрипт сообщения подтверждения ─────────────────────────────────────────
