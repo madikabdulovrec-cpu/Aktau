@@ -237,9 +237,17 @@ const CONFIRM_LATE_FALLBACK_H = 20; // если идеал > 20:00 — слот 
 const CONFIRM_WINDOW_MIN = 15;     // ширина «срабатывания» вокруг идеального слота, мин.
 const CONFIRM_DEDUP_TTL = 172800;  // 48 ч — пометка отправленных record_id (анти-дубль)
 const CONFIRM_PENDING_TTL = 129600;// 36 ч — ждём ответ клиента «Да/Нет»
-const CONFIRM_TICK_MAX = 25;       // макс. сообщений за один cron-tick (анти-бан)
-const CONFIRM_TICK_PAUSE_MIN = 1500;
-const CONFIRM_TICK_PAUSE_MAX = 3500;
+
+// ── АНТИ-БАН (ужесточено после инцидента 03.06.2026 — Meta поставила WA1 на
+// проверку после залпа 15 сообщений за 25 сек). Параметры подобраны под
+// «человекоподобный» темп для одного номера WhatsApp.
+const CONFIRM_TICK_MAX = 5;             // макс. отправок за один cron-tick (15 мин)
+const CONFIRM_TICK_PAUSE_MIN = 60000;   // 60 сек между сообщениями (минимум)
+const CONFIRM_TICK_PAUSE_MAX = 120000;  // 120 сек (с рандомом)
+const CONFIRM_PER_CHANNEL_HOURLY_MAX = 6; // потолок исходящих с одного канала в час
+const CONFIRM_COLD_DAYS = 60;           // клиент не писал ≥ N дней → не дёргаем
+const CONFIRM_SLOT_JITTER_HOURS = 3;    // ±jitter к слоту, чтобы не было залпа в один момент
+const CONFIRM_HOUR_COUNTER_TTL = 7200;  // KV TTL счётчика «сколько ушло за час с канала»
 
 // ── Резолв канала ──────────────────────────────────────────────────────────
 // Project webhook message.help ловит сообщения со ВСЕХ каналов проекта (WhatsApp 1,
@@ -984,12 +992,19 @@ async function runConfirmationJob(env) {
     const apptMs = partsToAlmatyMs(parts);
     if (!apptMs || apptMs < nowMs + 60000) continue; // запись в прошлом — мимо
 
-    // Идеальный слот = appointment - 24h, с ограничением в дневное окно сегодня
+    // Идеальный слот = appointment - 24h, с ограничением в дневное окно
+    // сегодня + детерминированный jitter [0..CONFIRM_SLOT_JITTER_HOURS]
+    // на основе record_id, чтобы записи на один час не уходили залпом
+    // в одну минуту и slot не «прыгал» между тиками.
     const idealMs = apptMs - 24 * 3600000;
+    const jitterMs = (Number(r.id) % (CONFIRM_SLOT_JITTER_HOURS * 3600))
+      * 1000;
     let slotMs;
-    if (idealMs < today09Ms) slotMs = today09Ms;
+    if (idealMs < today09Ms) slotMs = today09Ms + jitterMs;
     else if (idealMs > todayLateMs) slotMs = todayLateMs;
-    else slotMs = idealMs;
+    else slotMs = idealMs + jitterMs;
+    // Не выпускаем за пределы окна работы
+    if (slotMs > todayLateMs) slotMs = todayLateMs;
 
     // Слот ещё не настал (> минуты впереди) — ждём следующих cron-тиков
     if (slotMs > nowMs + 60000) continue;
@@ -1004,43 +1019,95 @@ async function runConfirmationJob(env) {
     return;
   }
 
-  // Анти-бан: перетасовка + ограничение на один tick + микропаузы между
+  // Анти-бан: перетасовка + жёсткие ограничения на темп.
   shuffleInPlace(candidates);
-  const batch = candidates.slice(0, CONFIRM_TICK_MAX);
 
   let okCount = 0;
   let skipCount = 0;
-  for (const item of batch) {
+  let coldCount = 0;
+  let capCount = 0;
+  const sentChannels = []; // лог для контроля чередования
+
+  for (const item of candidates) {
+    if (okCount >= CONFIRM_TICK_MAX) break;
     if (await env.BOT_KV.get(item.dedupKey)) { skipCount++; continue; }
+
     const r = item.record;
-    const text = buildConfirmationText(item.parts);
-    let sent = false;
+    // Вариант текста детерминирован по record_id (0..5) — у одного клиента
+    // напоминание всегда выглядит одинаково, но среди разных получателей
+    // 6 разных приветствий/интро.
+    const variant = Math.abs(Number(r.id) || 0) % 6;
+    const text = buildConfirmationText(item.parts, variant);
+
+    let sent = null;
     try {
       sent = await mhSendByPhone(env, item.phone, text);
     } catch (e) {
       console.error('confirm send error:', e && e.message);
     }
-    if (sent && sent.ok) {
-      okCount++;
-      // Дедуп по записи
-      await env.BOT_KV.put(item.dedupKey, JSON.stringify({
-        recordId: r.id, phone: item.phone, sentAt: new Date().toISOString(),
-        appointmentDate: r.date || r.datetime,
-      }), { expirationTtl: CONFIRM_DEDUP_TTL });
-      // Ждём короткий ответ Да/Нет — сохраняем pending по user_id канала
-      if (sent.userId) {
-        await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
-          recordId: r.id, phone: item.phone,
-          appointmentDate: r.date || r.datetime,
-          channelUuid: sent.channelUuid,
-        }), { expirationTtl: CONFIRM_PENDING_TTL });
-      }
+
+    if (!sent || !sent.ok) {
+      if (sent && sent.reason === 'cold') coldCount++;
+      else if (sent && sent.reason === 'hour_cap') capCount++;
+      continue;
     }
-    await sleep(CONFIRM_TICK_PAUSE_MIN
-      + Math.floor(Math.random() * (CONFIRM_TICK_PAUSE_MAX - CONFIRM_TICK_PAUSE_MIN)));
+
+    okCount++;
+    sentChannels.push(sent.channelId || '?');
+
+    // Дедуп по записи
+    await env.BOT_KV.put(item.dedupKey, JSON.stringify({
+      recordId: r.id, phone: item.phone, sentAt: new Date().toISOString(),
+      appointmentDate: r.date || r.datetime, channelId: sent.channelId,
+    }), { expirationTtl: CONFIRM_DEDUP_TTL });
+
+    // Инкремент часового счётчика на канале (для CONFIRM_PER_CHANNEL_HOURLY_MAX)
+    if (sent.channelId != null) {
+      await incChannelHourCount(env, sent.channelId);
+    }
+
+    // Ждём короткий ответ Да/Нет — сохраняем pending по user_id канала
+    if (sent.userId) {
+      await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
+        recordId: r.id, phone: item.phone,
+        appointmentDate: r.date || r.datetime,
+        channelUuid: sent.channelUuid,
+      }), { expirationTtl: CONFIRM_PENDING_TTL });
+    }
+
+    // Темп: 60..120 сек между сообщениями (на ОДИН worker, не на канал —
+    // если в этом tick'е каналы чередуются, то на конкретный канал темп
+    // ещё в 2 раза мягче).
+    if (okCount < CONFIRM_TICK_MAX) {
+      await sleep(CONFIRM_TICK_PAUSE_MIN
+        + Math.floor(Math.random() * (CONFIRM_TICK_PAUSE_MAX - CONFIRM_TICK_PAUSE_MIN)));
+    }
   }
   console.log(`confirm tick: ${records.length} tomorrow, ${candidates.length} ready, `
-    + `${okCount} sent, ${skipCount} dedup`);
+    + `${okCount} sent ${JSON.stringify(sentChannels)}, ${skipCount} dedup, `
+    + `${coldCount} cold, ${capCount} hour-cap`);
+}
+
+// Часовой счётчик исходящих на канал — для CONFIRM_PER_CHANNEL_HOURLY_MAX.
+function channelHourKey(channelId) {
+  const almaty = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600000);
+  const y = almaty.getUTCFullYear();
+  const m = String(almaty.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(almaty.getUTCDate()).padStart(2, '0');
+  const h = String(almaty.getUTCHours()).padStart(2, '0');
+  return `confirm_hour:${channelId}:${y}-${m}-${d}-${h}`;
+}
+
+async function getChannelHourCount(env, channelId) {
+  const v = await env.BOT_KV.get(channelHourKey(channelId));
+  return Number(v) || 0;
+}
+
+async function incChannelHourCount(env, channelId) {
+  const key = channelHourKey(channelId);
+  const cur = Number(await env.BOT_KV.get(key)) || 0;
+  await env.BOT_KV.put(key, String(cur + 1),
+    { expirationTtl: CONFIRM_HOUR_COUNTER_TTL });
 }
 
 // ── Altegio: чтение записей и обновление attendance ────────────────────────
@@ -1133,6 +1200,30 @@ async function mhSendByPhone(env, phone, text) {
     return { ok: false, reason: 'no_contact' };
   }
 
+  // Анти-бан #1: «холодные» контакты — клиент не писал нам ≥ CONFIRM_COLD_DAYS.
+  // Шлём первым автомат-сообщением «с того света» = риск спам-сигнала и плохой
+  // клиентский опыт. Пропускаем — лучше менеджер позвонит.
+  if (resolved.lastMessageAt) {
+    const last = parseAltegioParts(resolved.lastMessageAt);
+    const lastMs = last ? partsToAlmatyMs(last) : null;
+    if (lastMs && (Date.now() - lastMs) > CONFIRM_COLD_DAYS * 86400000) {
+      console.log(`confirm: cold contact ${maskPhone(phone)} `
+        + `(last ${resolved.lastMessageAt}, ch ${resolved.channelId}), skip`);
+      return { ok: false, reason: 'cold' };
+    }
+  }
+
+  // Анти-бан #2: жёсткий часовой потолок на канал. Шесть исходящих с одного
+  // номера за час — лимит, дальше пропуск (попробуем в следующий час).
+  if (resolved.channelId != null) {
+    const used = await getChannelHourCount(env, resolved.channelId);
+    if (used >= CONFIRM_PER_CHANNEL_HOURLY_MAX) {
+      console.log(`confirm: hour-cap ${resolved.channelId} (${used}/${CONFIRM_PER_CHANNEL_HOURLY_MAX}), `
+        + `skip ${maskPhone(phone)}`);
+      return { ok: false, reason: 'hour_cap' };
+    }
+  }
+
   const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
     + `/channels/${resolved.channelUuid}/send_message/${resolved.userId}`;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1157,7 +1248,12 @@ async function mhSendByPhone(env, phone, text) {
       if (sentId) {
         await env.BOT_KV.put(`sent:${sentId}`, '1', { expirationTtl: SENT_TTL });
       }
-      return { ok: true, channelUuid: resolved.channelUuid, userId: resolved.userId };
+      return {
+        ok: true,
+        channelUuid: resolved.channelUuid,
+        channelId: resolved.channelId,
+        userId: resolved.userId,
+      };
     }
     if (res.status !== 429 && res.status < 500) {
       console.error(`confirm send ${res.status}:`,
@@ -1215,6 +1311,8 @@ function extractContactChannel(data, channelMap) {
     candidates.push({
       cid: c.channel_id, cuuid: c.channel_uuid || c.uuid,
       uid: c.user_id || c.id,
+      blocked: !!c.blocked,
+      lastMessageAt: c.last_message || null,
     });
   }
   // Массивы связок (приоритет — users, оно реально отдаётся message.help)
@@ -1227,6 +1325,7 @@ function extractContactChannel(data, channelMap) {
         cuuid: x.channel_uuid || x.uuid,
         uid: x.user_id || x.id,
         blocked: !!x.blocked,
+        lastMessageAt: x.last_message || null,
       });
     }
   }
@@ -1236,10 +1335,16 @@ function extractContactChannel(data, channelMap) {
     if (!x.uid || x.blocked) continue;
     if (x.cid != null) {
       const uuid = map.get(String(x.cid));
-      if (uuid) return { channelUuid: uuid, userId: x.uid };
+      if (uuid) return {
+        channelUuid: uuid, channelId: Number(x.cid),
+        userId: x.uid, lastMessageAt: x.lastMessageAt,
+      };
     }
     if (x.cuuid && Array.from(map.values()).includes(String(x.cuuid))) {
-      return { channelUuid: String(x.cuuid), userId: x.uid };
+      return {
+        channelUuid: String(x.cuuid), channelId: x.cid != null ? Number(x.cid) : null,
+        userId: x.uid, lastMessageAt: x.lastMessageAt,
+      };
     }
   }
 
@@ -1266,37 +1371,67 @@ function parseKnownChannelMap(env) {
 
 // ── Скрипт сообщения подтверждения ─────────────────────────────────────────
 
-function buildConfirmationText(parts) {
+// Текст подтверждения с 6 микро-вариантами + 50% случаев без ссылки на 2gis.
+// Вариант выбирается детерминированно по record_id (mod 6) → у одного клиента
+// напоминание всегда одинаковое, но Meta видит 6 разных текстов вместо
+// одинакового шаблона у всех получателей. variant: 0..5.
+function buildConfirmationText(parts, variant) {
+  const v = ((Number(variant) || 0) % 6 + 6) % 6;
   const dateStr = `${String(parts.day).padStart(2, '0')}.`
     + `${String(parts.month).padStart(2, '0')}.${parts.year}`;
   const timeStr = `${parts.hour}:${String(parts.minute).padStart(2, '0')}`;
-  return [
-    'Добрый день🌷',
+
+  const greet = [
+    'Добрый день 🌷',
+    'Здравствуйте 🌷',
+    'Добрый день!',
+    'Здравствуйте!',
+    'Добрый день, M&M на связи ✨',
+    'Здравствуйте! M&M на связи',
+  ][v];
+
+  const intro = [
+    'Это автоматическое напоминание о вашей записи. Если в данных будут неточности — ответьте, и менеджер всё уточнит.',
+    'Напоминаем о вашей записи. Если в деталях что-то не так — просто напишите, исправим.',
+    'Это напоминание о записи. Если детали не совпадают — ответьте сообщением, поправим.',
+    'Напоминаем о записи. Если в данных будут неточности — напишите, менеджер уточнит.',
+    'Автоматическое напоминание о записи. Если детали не совпадают — ответьте, разберёмся.',
+    'Это напоминание о вашей записи. Если в деталях есть неточность — напишите нам.',
+  ][v];
+
+  const ask = [
+    'Подтвердите, пожалуйста, запись ❤️',
+    'Подтвердите, пожалуйста, что придёте ❤️',
+    'Подтвердите запись, пожалуйста',
+    'Подтвердите, пожалуйста, что вы будете',
+    'Будем ждать! Подтвердите, пожалуйста, запись',
+    'Подтвердите, пожалуйста, придёте?',
+  ][v];
+
+  const lines = [
+    greet, '',
+    intro, '',
+    'Вы записаны в M&M:',
     '',
-    'Это автоматическое напоминание от M&M о вашей записи. '
-      + 'Если в данных будут неточности — ответьте, и менеджер всё уточнит.',
+    `🗓 Дата: ${dateStr}`,
+    `🕒 Время: ${timeStr}`,
+    '📍 Ауэзова 175 Б',
     '',
-    'Вы записаны в M&M: ',
+    ask,
     '',
-    '',
-    `🗓️ Дата : ${dateStr}`,
-    '',
-    `🕒 Время : ${timeStr}`,
-    '',
-    '📍 Ауэзова 175 Б ',
-    '',
-    '',
-    'Будем ждать вас! Подтвердите, пожалуйста, запись ❤️',
-    '',
-    '❗️*Отмена записи происходит за 24 часа* ',
-    '',
-    '*В случае отмены записи менее чем за 24 часа, '
-      + 'предоплата/посещение сгорает* ❗️',
+    '❗ Отмена записи — минимум за 24 часа.',
+    'При отмене менее чем за 24 часа предоплата/посещение сгорает.',
     '',
     'M & M',
-    '',
-    'https://2gis.kz/almaty/geo/70000001060407110',
-  ].join('\n');
+  ];
+
+  // 50% сообщений уходят без 2gis-ссылки — уменьшаем «шаблонность»
+  // и снижаем риск спам-классификации по длинным сообщениям со ссылкой.
+  if (v % 2 === 0) {
+    lines.push('', 'https://2gis.kz/almaty/geo/70000001060407110');
+  }
+
+  return lines.join('\n');
 }
 
 // ── Ответ клиента на подтверждение: Да / Нет ───────────────────────────────
