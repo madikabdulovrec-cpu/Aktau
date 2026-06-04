@@ -1011,7 +1011,7 @@ async function runConfirmationJob(env) {
 
     // Дедуп по record_id (мастер перекинул клиента → id не меняется)
     const dedupKey = `confirm_sent:${r.id}`;
-    candidates.push({ record: r, phone, parts, dedupKey });
+    candidates.push({ record: r, phone, parts, dedupKey, slotMs });
   }
 
   if (!candidates.length) {
@@ -1019,29 +1019,70 @@ async function runConfirmationJob(env) {
     return;
   }
 
-  // Анти-бан: перетасовка + жёсткие ограничения на темп.
-  shuffleInPlace(candidates);
+  // Группировка: если у одного телефона несколько записей на «завтра»
+  // (3 процедуры подряд), мы шлём ОДНО сообщение со списком всех слотов,
+  // а не N отдельных. В группе слоты сортируем по времени; общий slotMs
+  // группы = самый ранний (раньше всех «созревает» к отправке).
+  const byPhone = new Map();
+  for (const c of candidates) {
+    if (!byPhone.has(c.phone)) byPhone.set(c.phone, []);
+    byPhone.get(c.phone).push(c);
+  }
+  const groups = [];
+  for (const [phone, list] of byPhone.entries()) {
+    list.sort((a, b) => partsToAlmatyMs(a.parts) - partsToAlmatyMs(b.parts));
+    groups.push({
+      phone,
+      partsList: list.map((c) => c.parts),
+      recordIds: list.map((c) => c.record.id),
+      dedupKeys: list.map((c) => c.dedupKey),
+      slotMs: Math.min(...list.map((c) => c.slotMs)),
+      firstRecord: list[0].record,
+    });
+  }
+
+  // Анти-бан: перетасовка групп + жёсткие ограничения на темп.
+  shuffleInPlace(groups);
+
+  // Дата «сегодня» в Almaty — для per-phone-day дедупа.
+  const todayStr = `${almaty.getUTCFullYear()}-`
+    + `${String(almaty.getUTCMonth() + 1).padStart(2, '0')}-`
+    + `${String(almaty.getUTCDate()).padStart(2, '0')}`;
 
   let okCount = 0;
   let skipCount = 0;
+  let phoneDupCount = 0;
   let coldCount = 0;
   let capCount = 0;
   const sentChannels = []; // лог для контроля чередования
 
-  for (const item of candidates) {
+  for (const g of groups) {
     if (okCount >= CONFIRM_TICK_MAX) break;
-    if (await env.BOT_KV.get(item.dedupKey)) { skipCount++; continue; }
 
-    const r = item.record;
-    // Вариант текста детерминирован по record_id (0..5) — у одного клиента
-    // напоминание всегда выглядит одинаково, но среди разных получателей
-    // 6 разных приветствий/интро.
+    // Per-record дедуп: если хотя бы одна запись группы уже отправлялась,
+    // считаем что клиента уже трогали (значит ему уже шло) — skip всей группы.
+    let alreadySent = false;
+    for (const k of g.dedupKeys) {
+      if (await env.BOT_KV.get(k)) { alreadySent = true; break; }
+    }
+    if (alreadySent) { skipCount++; continue; }
+
+    // Per-phone-per-day дедуп: один номер — максимум одно сообщение от
+    // нашего бота в сутки. Защита от ситуации «у клиента записи на 4 и 5
+    // числа, ему пришло вчера за 4-е, сегодня собираемся за 5-е».
+    const phoneDayKey = `confirm_phone_day:${g.phone}:${todayStr}`;
+    if (await env.BOT_KV.get(phoneDayKey)) {
+      phoneDupCount++;
+      continue;
+    }
+
+    const r = g.firstRecord;
     const variant = Math.abs(Number(r.id) || 0) % 6;
-    const text = buildConfirmationText(item.parts, variant);
+    const text = buildConfirmationText(g.partsList, variant);
 
     let sent = null;
     try {
-      sent = await mhSendByPhone(env, item.phone, text);
+      sent = await mhSendByPhone(env, g.phone, text);
     } catch (e) {
       console.error('confirm send error:', e && e.message);
     }
@@ -1055,36 +1096,44 @@ async function runConfirmationJob(env) {
     okCount++;
     sentChannels.push(sent.channelId || '?');
 
-    // Дедуп по записи
-    await env.BOT_KV.put(item.dedupKey, JSON.stringify({
-      recordId: r.id, phone: item.phone, sentAt: new Date().toISOString(),
-      appointmentDate: r.date || r.datetime, channelId: sent.channelId,
-    }), { expirationTtl: CONFIRM_DEDUP_TTL });
+    // Пометить ВСЕ записи группы как уже отправленные — чтобы они не
+    // подгрузились в следующий tick по отдельности.
+    const payload = JSON.stringify({
+      recordIds: g.recordIds, phone: g.phone,
+      sentAt: new Date().toISOString(), channelId: sent.channelId,
+    });
+    for (const k of g.dedupKeys) {
+      await env.BOT_KV.put(k, payload, { expirationTtl: CONFIRM_DEDUP_TTL });
+    }
+    // Per-phone-day отметка
+    await env.BOT_KV.put(phoneDayKey, payload,
+      { expirationTtl: CONFIRM_DEDUP_TTL });
 
-    // Инкремент часового счётчика на канале (для CONFIRM_PER_CHANNEL_HOURLY_MAX)
+    // Инкремент часового счётчика на канале
     if (sent.channelId != null) {
       await incChannelHourCount(env, sent.channelId);
     }
 
-    // Ждём короткий ответ Да/Нет — сохраняем pending по user_id канала
+    // Ждём короткий ответ Да/Нет — pending по user_id канала. В записи
+    // группы кладём первый record_id (его пометит attendance=2 если клиент
+    // ответит «Да»). По остальным запискам клиент уже фактически на радаре;
+    // если их нужно тоже пометить attendance=2, менеджер сделает в кабинете.
     if (sent.userId) {
       await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
-        recordId: r.id, phone: item.phone,
-        appointmentDate: r.date || r.datetime,
+        recordId: r.id, recordIds: g.recordIds, phone: g.phone,
         channelUuid: sent.channelUuid,
       }), { expirationTtl: CONFIRM_PENDING_TTL });
     }
 
-    // Темп: 60..120 сек между сообщениями (на ОДИН worker, не на канал —
-    // если в этом tick'е каналы чередуются, то на конкретный канал темп
-    // ещё в 2 раза мягче).
+    // Темп: 60..120 сек между сообщениями
     if (okCount < CONFIRM_TICK_MAX) {
       await sleep(CONFIRM_TICK_PAUSE_MIN
         + Math.floor(Math.random() * (CONFIRM_TICK_PAUSE_MAX - CONFIRM_TICK_PAUSE_MIN)));
     }
   }
-  console.log(`confirm tick: ${records.length} tomorrow, ${candidates.length} ready, `
-    + `${okCount} sent ${JSON.stringify(sentChannels)}, ${skipCount} dedup, `
+  console.log(`confirm tick: ${records.length} tomorrow, ${candidates.length} cand, `
+    + `${groups.length} groups, ${okCount} sent ${JSON.stringify(sentChannels)}, `
+    + `${skipCount} dedup, ${phoneDupCount} phone-day-dup, `
     + `${coldCount} cold, ${capCount} hour-cap`);
 }
 
@@ -1371,15 +1420,20 @@ function parseKnownChannelMap(env) {
 
 // ── Скрипт сообщения подтверждения ─────────────────────────────────────────
 
-// Текст подтверждения с 6 микро-вариантами + 50% случаев без ссылки на 2gis.
-// Вариант выбирается детерминированно по record_id (mod 6) → у одного клиента
-// напоминание всегда одинаковое, но Meta видит 6 разных текстов вместо
-// одинакового шаблона у всех получателей. variant: 0..5.
-function buildConfirmationText(parts, variant) {
+// Текст подтверждения. partsList — список записей клиента на «завтра»
+// (если у него несколько процедур подряд, шлём ОДНО сообщение со всеми
+// временами). 6 микро-вариантов приветствия/интро/CTA + в половине случаев
+// без 2gis-ссылки. Вариант выбирается детерминированно по record_id mod 6.
+function buildConfirmationText(partsList, variant) {
   const v = ((Number(variant) || 0) % 6 + 6) % 6;
-  const dateStr = `${String(parts.day).padStart(2, '0')}.`
-    + `${String(parts.month).padStart(2, '0')}.${parts.year}`;
-  const timeStr = `${parts.hour}:${String(parts.minute).padStart(2, '0')}`;
+  // Совместимость: можно передать одну parts вместо массива
+  const list = Array.isArray(partsList) ? partsList : [partsList];
+
+  const fmt = (p) => ({
+    date: `${String(p.day).padStart(2, '0')}.`
+      + `${String(p.month).padStart(2, '0')}.${p.year}`,
+    time: `${p.hour}:${String(p.minute).padStart(2, '0')}`,
+  });
 
   const greet = [
     'Добрый день 🌷',
@@ -1408,25 +1462,45 @@ function buildConfirmationText(parts, variant) {
     'Подтвердите, пожалуйста, придёте?',
   ][v];
 
-  const lines = [
-    greet, '',
-    intro, '',
-    'Вы записаны в M&M:',
-    '',
-    `🗓 Дата: ${dateStr}`,
-    `🕒 Время: ${timeStr}`,
-    '📍 Ауэзова 175 Б',
-    '',
-    ask,
-    '',
-    '❗ Отмена записи — минимум за 24 часа.',
-    'При отмене менее чем за 24 часа предоплата/посещение сгорает.',
-    '',
-    'M & M',
-  ];
+  const lines = [greet, '', intro, ''];
 
-  // 50% сообщений уходят без 2gis-ссылки — уменьшаем «шаблонность»
-  // и снижаем риск спам-классификации по длинным сообщениям со ссылкой.
+  if (list.length === 1) {
+    const f = fmt(list[0]);
+    lines.push(
+      'Вы записаны в M&M:',
+      '',
+      `🗓 Дата: ${f.date}`,
+      `🕒 Время: ${f.time}`,
+      '📍 Ауэзова 175 Б',
+    );
+  } else {
+    // Несколько записей у одного клиента — группируем времена под общей датой
+    // (если все в один день) или показываем дата+время построчно.
+    const dates = new Set(list.map((p) => fmt(p).date));
+    if (dates.size === 1) {
+      const oneDate = list[0] ? fmt(list[0]).date : '';
+      lines.push(
+        `У вас в M&M ${list.length} записи на ${oneDate}:`,
+        '',
+      );
+      for (const p of list) {
+        lines.push(`🕒 ${fmt(p).time}`);
+      }
+      lines.push('📍 Ауэзова 175 Б');
+    } else {
+      lines.push('У вас в M&M несколько записей:', '');
+      for (const p of list) {
+        const f = fmt(p);
+        lines.push(`🗓 ${f.date} в ${f.time}`);
+      }
+      lines.push('📍 Ауэзова 175 Б');
+    }
+  }
+
+  lines.push('', ask, '', '❗ Отмена записи — минимум за 24 часа.',
+    'При отмене менее чем за 24 часа предоплата/посещение сгорает.',
+    '', 'M & M');
+
   if (v % 2 === 0) {
     lines.push('', 'https://2gis.kz/almaty/geo/70000001060407110');
   }
