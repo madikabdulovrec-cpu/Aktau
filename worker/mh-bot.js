@@ -1164,6 +1164,25 @@ async function incChannelHourCount(env, channelId) {
     { expirationTtl: CONFIRM_HOUR_COUNTER_TTL });
 }
 
+// Эффективный часовой потолок для канала: дефолт CONFIRM_PER_CHANNEL_HOURLY_MAX,
+// но env.MH_CHANNEL_HOURLY_OVERRIDE (JSON {"channelId": N}) может задать
+// меньшее значение для конкретного канала (например для свежеподключенного
+// номера, на который Meta смотрит особенно строго).
+function resolveChannelHourCap(env, channelId) {
+  if (env.MH_CHANNEL_HOURLY_OVERRIDE) {
+    try {
+      const map = JSON.parse(env.MH_CHANNEL_HOURLY_OVERRIDE);
+      const v = map[String(channelId)] || map[channelId];
+      if (Number.isFinite(Number(v))) {
+        return Math.min(CONFIRM_PER_CHANNEL_HOURLY_MAX, Number(v));
+      }
+    } catch (e) {
+      console.error('MH_CHANNEL_HOURLY_OVERRIDE parse error:', e && e.message);
+    }
+  }
+  return CONFIRM_PER_CHANNEL_HOURLY_MAX;
+}
+
 // ── Altegio: чтение записей и обновление attendance ────────────────────────
 
 async function altegioFetchRecords(env, startDate, endDate) {
@@ -1267,12 +1286,15 @@ async function mhSendByPhone(env, phone, text) {
     }
   }
 
-  // Анти-бан #2: жёсткий часовой потолок на канал. Шесть исходящих с одного
-  // номера за час — лимит, дальше пропуск (попробуем в следующий час).
+  // Анти-бан #2: жёсткий часовой потолок на канал. По умолчанию
+  // CONFIRM_PER_CHANNEL_HOURLY_MAX, но для конкретного канала можно задать
+  // более строгий лимит через env-переменную MH_CHANNEL_HOURLY_OVERRIDE
+  // (например {"17222": 2} — спец-режим на 24ч после реактивации номера).
   if (resolved.channelId != null) {
     const used = await getChannelHourCount(env, resolved.channelId);
-    if (used >= CONFIRM_PER_CHANNEL_HOURLY_MAX) {
-      console.log(`confirm: hour-cap ${resolved.channelId} (${used}/${CONFIRM_PER_CHANNEL_HOURLY_MAX}), `
+    const cap = resolveChannelHourCap(env, resolved.channelId);
+    if (used >= cap) {
+      console.log(`confirm: hour-cap ${resolved.channelId} (${used}/${cap}), `
         + `skip ${maskPhone(phone)}`);
       return { ok: false, reason: 'hour_cap' };
     }
