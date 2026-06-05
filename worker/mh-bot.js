@@ -251,7 +251,10 @@ const CONFIRM_TICK_PAUSE_MIN = 90000;   // 90 сек между сообщени
 const CONFIRM_TICK_PAUSE_MAX = 150000;  // 150 сек (с рандомом)
 const CONFIRM_PER_CHANNEL_HOURLY_MAX = 4; // потолок исходящих с одного канала в час
 const CONFIRM_COLD_DAYS = 30;           // клиент не писал ≥ N дней → не дёргаем
-const CONFIRM_SLOT_JITTER_HOURS = 3;    // ±jitter к слоту, чтобы не было залпа в один момент
+// CONFIRM_SLOT_JITTER_HOURS — раньше использовался для +0..3ч jitter после
+// идеального слота. Убран 05.06.2026: jitter в БУДУЩЕЕ нарушал политику
+// студии «отмена за 24ч». Размазывание теперь обеспечивается shuffle +
+// темпом 90–150 сек + потолком 4/час на канал.
 const CONFIRM_HOUR_COUNTER_TTL = 7200;  // KV TTL счётчика «сколько ушло за час с канала»
 
 // ── Резолв канала ──────────────────────────────────────────────────────────
@@ -997,19 +1000,35 @@ async function runConfirmationJob(env) {
     const apptMs = partsToAlmatyMs(parts);
     if (!apptMs || apptMs < nowMs + 60000) continue; // запись в прошлом — мимо
 
-    // Идеальный слот = appointment - 24h, с ограничением в дневное окно
-    // сегодня + детерминированный jitter [0..CONFIRM_SLOT_JITTER_HOURS]
-    // на основе record_id, чтобы записи на один час не уходили залпом
-    // в одну минуту и slot не «прыгал» между тиками.
+    // КРИТИЧНО — политика отмены студии: «менее 24ч до визита = услуга
+    // считается выполненной». Если бы мы прислали напоминание уже в зоне
+    // <24ч, клиент в ответ на «Нет» автоматически бы попал на штраф — это
+    // несправедливо, тк он получил предупреждение пост-фактум. Пропускаем,
+    // менеджер обзвонит вручную. Запас 30 минут — защита от пограничных
+    // случаев (tick запустился в 11:31, запись завтра в 12:00 = 24:29).
+    if (apptMs - nowMs < 24 * 3600000 + 30 * 60000) {
+      // лог только в первый раз для каждой такой записи, чтобы не зашумить
+      // каждые 30 минут одним и тем же id
+      const noticeKey = `confirm_late_notice:${r.id}`;
+      if (!(await env.BOT_KV.get(noticeKey))) {
+        console.log(`confirm: skip rec ${r.id} — appt ${r.date} осталось <24h, ` +
+          `менеджер обзвонит вручную`);
+        await env.BOT_KV.put(noticeKey, '1', { expirationTtl: CONFIRM_DEDUP_TTL });
+      }
+      continue;
+    }
+
+    // Идеальный слот = appointment - 24h. Без jitter в будущее, иначе
+    // отправка может попасть в зону <24ч и нарушить политику студии.
+    // Если идеал в окне 09:00–20:00 сегодня — шлём ровно по нему.
+    // Если идеал раньше 09:00 (запись очень рано утром завтра) — это
+    // запись с appointment < 9+24=33ч от полуночи сегодня, она ловится
+    // фильтром выше. Сюда не попадёт.
     const idealMs = apptMs - 24 * 3600000;
-    const jitterMs = (Number(r.id) % (CONFIRM_SLOT_JITTER_HOURS * 3600))
-      * 1000;
     let slotMs;
-    if (idealMs < today09Ms) slotMs = today09Ms + jitterMs;
+    if (idealMs < today09Ms) slotMs = today09Ms;
     else if (idealMs > todayLateMs) slotMs = todayLateMs;
-    else slotMs = idealMs + jitterMs;
-    // Не выпускаем за пределы окна работы
-    if (slotMs > todayLateMs) slotMs = todayLateMs;
+    else slotMs = idealMs;
 
     // Слот ещё не настал (> минуты впереди) — ждём следующих cron-тиков
     if (slotMs > nowMs + 60000) continue;
