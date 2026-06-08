@@ -29,10 +29,14 @@ __pycache__/
 .idea/
 *.swp
 
+# Wrangler build/cache
+.wrangler/
+
 # Локальные секреты
 .env
 .env.local
 secrets.json
+*.local.txt
 cf-api-token.txt
 deploy-secrets.local.txt
 anthropic-key.local.txt

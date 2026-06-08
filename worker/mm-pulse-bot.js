@@ -24,7 +24,7 @@
  * этом не меняется. Подробно — worker/MM_PULSE_BOT_SETUP.md.
  *
  * ─── ДВЕ ТОЧКИ ВХОДА ────────────────────────────────────────────────────────
- *  scheduled — cron 0 3,6,9,12,15 * * * (08/11/14/17/20 Алматы): метрики дня → Telegram.
+ *  scheduled — cron 0 3-16 * * * (ежечасно 08:00–20:00 пульс + 21:00 итог дня; Алматы): метрики → Telegram.
  *  fetch:
  *   POST ?secret=<WEBHOOK_SECRET>  — вебхук message.help, событие → KV-бакет дня;
  *   GET  ?secret=<DIGEST_SECRET>   — ручной запуск дайджеста;
@@ -62,23 +62,106 @@
 // ── Константы ────────────────────────────────────────────────────────────────
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
+const CF_ACCOUNT_ID = '650cb2300c9e29301178d3e5998be3b4';
+// Прямой Worker→Anthropic из нашего региона блокируется (403 «Request not allowed»).
+// Если задан AI_GATEWAY — гоним через Cloudflare AI Gateway (стабильный прокси).
+const anthropicUrl = (env) => (env.AI_GATEWAY
+  ? `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${env.AI_GATEWAY}/anthropic/v1/messages`
+  : ANTHROPIC_URL);
 const MH_API = 'https://message.help/api';
 const TELEGRAM_API = 'https://api.telegram.org';
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
 const ALMATY_UTC_OFFSET = 5;            // Алматы = UTC+5, перевода часов в Казахстане нет
+const MH_TZ_OFFSET = 3;                 // message.help отдаёт created_at в МСК (UTC+3) строкой без таймзоны
 const DEFAULT_UNANSWERED_MIN = 20;      // порог «без ответа сейчас» по умолчанию
-const DELTA_WINDOW_MS = 3 * 3600 * 1000; // окно «за 3 часа»
+const DELTA_WINDOW_MS = 1 * 3600 * 1000; // окно дельты «за час» (отчёты ежечасные)
 const EVENTS_TTL = 172800;              // 48 ч — бакет событий чистится сам
 const TOKEN_KEY = 'mh:token';
 const CLAUDE_TEMPERATURE = 0.4;
 const CLAUDE_MAX_TOKENS = 400;
-const FINAL_HOUR = 20;                  // последний слот дня — итоговый отчёт
+const FINAL_HOUR = 21;                  // последний слот дня (конец рабочего дня) — итог дня
+const MORNING_HOUR = 8;                 // первый слот дня — публикуем карточку «кто на смене»
+
+// ── Смены продавцов (KPI) ────────────────────────────────────────────────────
+// Личность оператора message.help НЕ отдаёт (проверено по API: comment_user_id
+// пуст у всех 7500 сообщений). Поэтому «чья работа» определяем по ВРЕМЕНИ: продавец
+// отмечает смену кнопкой, и все ответы в его окне смены — его. Условие корректности:
+// смены НЕ пересекаются (в чате в момент времени один продавец) — подтверждено заказчиком.
+const SHIFT_OPEN_KEY = 'shift:open';            // текущая открытая смена {manager,start,by}
+const SHIFT_CARD_GUARD = 'shiftcard:posted';    // отметка «карточку сегодня уже постили»
+const SELLERS_KEY = 'cfg:sellers';              // список сотрудников (строки «Фамилия Имя») — управляется управляющими, лежит в KV
+const shiftsKey = (dateStr) => `shifts:${dateStr}`; // закрытые смены за день [{manager,start,end}]
+
+// ── Altegio (журнал записей) — KPI администраторов ───────────────────────────
+// Записи Altegio имеют created_user_id (админ-автор) + attendance/confirmed →
+// строим воронку «лид → запись → дошёл» по администраторам. Доступ к /records
+// и /users ТОЛЬКО у owner-токена (app-токен «Карточки клиентов» 2b6f… = 403):
+//   • либо owner re-auth: ALTEGIO_OWNER_LOGIN+ALTEGIO_OWNER_PASSWORD (+PARTNER) →
+//     POST /auth → user_token (самообновляемо, кэш в KV);
+//   • либо готовый ALTEGIO_USER_TOKEN секретом напрямую (протухает при смене пароля).
+const ALTEGIO_API = 'https://api.alteg.io/api/v1';
+const ALTEGIO_ACCEPT = 'application/vnd.api.v2+json';
+const ALTEGIO_TOKEN_KEY = 'altegio:user_token';   // кэш owner user_token (re-auth)
+const ALTEGIO_USERS_KEY = 'altegio:users';        // кэш карты user_id→имя (сутки)
+const ALTEGIO_TOKEN_TTL = 6 * 3600;               // 6 ч — переавторизуемся не чаще
+// Запасная карта администраторов (если /users недоступен) — id→имя, по находке 06.06.
+const ADMIN_NAMES = { 12842041: 'Мевиш', 12840574: 'Вероника', 12832472: 'Мария', 12842040: 'Дарья' };
+
+// ── Уровни доступа ───────────────────────────────────────────────────────────
+// Управляющие (ADMIN_IDS — Telegram ID через запятую) могут добавлять/удалять
+// сотрудников. Сотрудники (SELLERS_KEY в KV) только отмечают свою смену кнопкой.
+const adminIds = (env) => new Set(String(env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean));
+const isAdmin = (env, userId) => adminIds(env).has(String(userId));
+// seed-список из env.SELLERS — только если KV пуст (миграция/первый запуск).
+const seedSellers = (env) => String(env.SELLERS || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+// Маркер приглашения «введите ФИО»: ответ управляющего на это сообщение = добавить сотрудника.
+const ADD_PROMPT_MARK = '➕ Добавление сотрудника';
+const ADD_PROMPT = `${ADD_PROMPT_MARK}\nОтветьте на ЭТО сообщение: Фамилия Имя (например: Иванова Кристина).`;
+
+// Маркер приглашения «введите число лидов таргетолога» (ответ → записать в сверку).
+const TARGET_PROMPT_MARK = '🎯 Лиды таргетолога';
+const TARGET_PROMPT = `${TARGET_PROMPT_MARK}\nОтветьте на ЭТО сообщение числом — сколько лидов заявил таргетолог сегодня.`;
+
+// Маркер приглашения «введите период отчёта» (ответ → отчёт за диапазон дат).
+const REPORT_PROMPT_MARK = '📄 Период отчёта';
 
 // Типы сообщений message.help, которые НЕ считаем живым обращением: реакции-эмодзи
 // и служебные события — не заявки (раздел 6 ТЗ).
 // VERIFY: точные строки message_type подтвердить по логам первого прода.
 const NON_LEAD_MESSAGE_TYPES = ['reaction', 'system', 'service', 'event', 'notice'];
+
+// Слова-«вежливости»/подтверждения. Сообщение считаем закрывающим, только если оно
+// состоит ЦЕЛИКОМ из этих слов (+ эмодзи/пунктуация) — тогда «Да, хочу записаться»
+// останется содержательным, а «Хорошо🙏», «Спасибо большое», «Подтверждаю приду» — нет.
+const CLOSING_WORDS = new Set([
+  // благодарности
+  'спасибо', 'спасибки', 'спс', 'благодарю', 'благодарствую', 'мерси', 'пожалуйста', 'пож',
+  // прощания
+  'до', 'встречи', 'свидания', 'свидание', 'завтра', 'увидимся', 'договорились', 'пока',
+  'всего', 'доброго', 'хорошего', 'наилучшего', 'дня', 'вечера',
+  // короткие согласия / подтверждения (фидбэк смены: «подтвердил приход»)
+  'хорошо', 'ок', 'окей', 'окс', 'ладно', 'поняла', 'понял', 'понятно', 'принято', 'принял',
+  'ясно', 'отлично', 'супер', 'класс', 'конечно', 'здорово', 'да', 'ага', 'угу', 'буду', 'будем',
+  'приду', 'придём', 'придем', 'подтверждаю', 'подтверждаем', 'согласна', 'согласен', 'согласны',
+  // заполнители (чтобы «спасибо большое за всё» тоже закрывалось)
+  'большое', 'огромное', 'вам', 'тебе', 'за', 'всё', 'все', 'это', 'очень', 'ну', 'вот', 'и', 'а',
+]);
+
+// Явная благодарность/прощание — короткое сообщение с этим считаем закрытием, даже
+// если есть пара «лишних» слов («Здравствуйте спасибо», «Спасибо за информацию»).
+const CLOSING_STRONG = /спасиб|благодар|мерси|признательн|до\s*встреч|до\s*свидан/i;
+// …но НЕ если в сообщении есть признак запроса (тогда это «спасибо, а подскажите…»).
+const REQUEST_HINT = /подскаж|скажите|можно|сколько|когда|цена|стоит|адрес|запиш|запис|хочу|отправ|скин|пришл|посчита|сч[её]т|во\s*скольк|свобод|окно|остат|перезвон|номер/i;
+// Входящий B2B/спам (продажа отзывов в 2ГИС, продвижение, рассылки, накрутка, франшиза…) —
+// НЕ клиент-лид. Если сообщение клиента это содержит — диалог исключаем из метрик целиком.
+// Консервативно: «реклама/видела рекламу» сюда НЕ входит (так пишут реальные клиенты).
+const SPAM_HINT = /2\s?гис|\b2gis\b|напишем[^?\n]{0,15}отзыв|накрут|подписчик|продвижен|раскрут(к|и|е)|сотрудничеств|рекламн\w*\s+услуг|коммерческ\w+\s+предложен|франшиз|оптом|рассылк/i;
+// Шаблон подтверждения записи (исходящее оператора). Если он был в диалоге — клиент УЖЕ записан.
+const BOOKING_CONFIRM = /вы\s*записаны|подтвердите[^?\n]{0,15}запис|жд[её]м\s*вас|ваша\s*запись|вы\s*записан\b/i;
+// Бытовое сообщение записанного клиента (опаздываю/подтверждаю/еду) — не потерянный лид.
+const LOGISTICS_HINT = /опазд|задерж|выезжа|уже\s*еду|\bеду\b|буду\s*(через|позже)|подтвержда|приду|подъед|договорил|спасиб|хорошо|\bок\b/i;
 
 // Для дайджеста обязательны. KV и MH_* проверяются отдельно по месту.
 const REQUIRED_ENV = ['ANTHROPIC_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
@@ -186,6 +269,16 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Апдейт Telegram (кнопки смены) — POST с ?tg=<DIGEST_SECRET>.
+    if (request.method === 'POST' && env.DIGEST_SECRET
+        && url.searchParams.get('tg') === env.DIGEST_SECRET) {
+      let upd;
+      try { upd = await request.json(); } catch { return json({ ok: true }); }
+      ctx.waitUntil(handleTelegramUpdate(upd, env).catch((e) =>
+        console.error('tg update failed:', e && e.message)));
+      return json({ ok: true });
+    }
+
     // Вебхук message.help — POST с секретом WEBHOOK_SECRET в URL.
     if (request.method === 'POST') {
       const ok = env.WEBHOOK_SECRET && url.searchParams.get('secret') === env.WEBHOOK_SECRET;
@@ -208,7 +301,11 @@ export default {
 
     // Ручной запуск дайджеста — GET с секретом DIGEST_SECRET.
     if (env.DIGEST_SECRET && url.searchParams.get('secret') === env.DIGEST_SECRET) {
-      const result = await runDigest(env, { trigger: 'manual' });
+      const result = await runDigest(env, {
+        trigger: 'manual',
+        forceFinal: url.searchParams.get('final') === '1',
+        dry: url.searchParams.get('dry') === '1', // dry=1 — посчитать и НЕ слать в чат (диагностика)
+      });
       return json({ ok: !result.error, ...result });
     }
 
@@ -216,6 +313,85 @@ export default {
     if (env.DIGEST_SECRET && url.searchParams.get('register') === env.DIGEST_SECRET) {
       const result = await registerWebhook(env, url);
       return json(result, result.ok ? 200 : 500);
+    }
+
+    // Настройка приёма кнопок: Telegram setWebhook на наш воркер — GET ?tgsetup=<DIGEST_SECRET>.
+    if (env.DIGEST_SECRET && url.searchParams.get('tgsetup') === env.DIGEST_SECRET) {
+      const result = await setupTelegramWebhook(env, url.origin);
+      return json(result, result.ok ? 200 : 500);
+    }
+
+    // Опубликовать карточку смены вручную (тест/повторно) — GET ?shiftcard=<DIGEST_SECRET>.
+    if (env.DIGEST_SECRET && url.searchParams.get('shiftcard') === env.DIGEST_SECRET) {
+      const result = await postShiftCard(env);
+      return json(result, result.ok ? 200 : 500);
+    }
+
+    // Текущее состояние смен (ops/отладка KPI) — GET ?shiftstate=<DIGEST_SECRET>.
+    if (env.DIGEST_SECRET && url.searchParams.get('shiftstate') === env.DIGEST_SECRET) {
+      const nowTs = Date.now();
+      const open = await getOpenShift(env);
+      const day = await loadDayShifts(env, almatyDateStr(nowTs), nowTs);
+      return json({ ok: true, sellers: await loadSellers(env), admins: [...adminIds(env)], open, day });
+    }
+
+    // Сброс смен (исправить ошибочный клик): чистит открытую смену и журнал за сегодня.
+    // GET ?shiftreset=<DIGEST_SECRET>  (опц. &date=YYYY-MM-DD — другой день).
+    if (env.DIGEST_SECRET && url.searchParams.get('shiftreset') === env.DIGEST_SECRET) {
+      const dateStr = url.searchParams.get('date') || almatyDateStr(Date.now());
+      await env.PULSE_KV.delete(SHIFT_OPEN_KEY);
+      await env.PULSE_KV.delete(shiftsKey(dateStr));
+      return json({ ok: true, reset: dateStr });
+    }
+
+    // [DEBUG] последние сырые вебхуки — GET ?rawdump=<DIGEST_SECRET>. Пишутся при DEBUG_RAW=1.
+    if (env.DIGEST_SECRET && url.searchParams.get('rawdump') === env.DIGEST_SECRET) {
+      const list = (await env.PULSE_KV.get('debug:raw', { type: 'json' })) || [];
+      return json({ ok: true, count: list.length, items: list });
+    }
+
+    // Сверка лидов дня — GET ?leads=<DIGEST_SECRET> (опц. &target=N задать число таргетолога).
+    if (env.DIGEST_SECRET && url.searchParams.get('leads') === env.DIGEST_SECRET) {
+      const tParam = url.searchParams.get('target');
+      const r = await buildReco(env, Date.now(), { setTarget: tParam != null ? parseInt(tParam, 10) : null });
+      return json({ ok: true, ...r });
+    }
+
+    // [DEBUG] сырой вызов Anthropic изнутри воркера — GET ?claudetest=<DIGEST_SECRET>.
+    if (env.DIGEST_SECRET && url.searchParams.get('claudetest') === env.DIGEST_SECRET) {
+      let status = 0, body = '';
+      try {
+        const res = await fetch(anthropicUrl(env), {
+          method: 'POST',
+          headers: { 'x-api-key': env.ANTHROPIC_API_KEY, 'anthropic-version': ANTHROPIC_VERSION, 'content-type': 'application/json' },
+          body: JSON.stringify({ model: env.ANTHROPIC_MODEL || DEFAULT_MODEL, max_tokens: 50, temperature: 0, messages: [{ role: 'user', content: 'Ответь: ОК' }] }),
+        });
+        status = res.status; body = (await res.text()).slice(0, 200);
+      } catch (e) { body = String((e && e.message) || e); }
+      return json({ ok: true, via: env.AI_GATEWAY ? `ai-gateway:${env.AI_GATEWAY}` : 'direct', status, body });
+    }
+
+    // [DEBUG] проверка доступа к Altegio — GET ?altegiotest=<DIGEST_SECRET>[&days=N].
+    if (env.DIGEST_SECRET && url.searchParams.get('altegiotest') === env.DIGEST_SECRET) {
+      const token = await altegioUserToken(env);
+      if (!token) return json({ ok: false, reason: 'no_token', hint: 'set ALTEGIO_OWNER_LOGIN+PASSWORD(+PARTNER) or ALTEGIO_USER_TOKEN' });
+      const days = Math.min(parseInt(url.searchParams.get('days') || '7', 10) || 7, 92);
+      const range = periodRange(days >= 30 ? 'month' : days >= 7 ? 'week' : 'day', Date.now());
+      const records = await fetchAltegioRecords(env, token, range.from, range.to);
+      if (records == null) return json({ ok: false, reason: 'records_403_or_error', tokenLen: token.length });
+      const usersMap = await fetchAltegioUsers(env, token);
+      const funnel = computeAdminFunnel(records, usersMap);
+      return json({ ok: true, from: range.from, to: range.to, fetched: records.length, users: Object.keys(usersMap).length,
+        funnel: { total: funnel.total, attended: funnel.attended, noshow: funnel.noshow, waiting: funnel.waiting, confirmed: funnel.confirmed },
+        admins: funnel.admins.map((a) => ({ name: a.name, total: a.total, attended: a.attended, noshow: a.noshow })) });
+    }
+
+    // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
+    if (env.DIGEST_SECRET && url.searchParams.get('report') === env.DIGEST_SECRET) {
+      const sec = url.searchParams.get('sec') || 'sales';
+      const per = url.searchParams.get('period') || 'day';
+      const text = sec === 'admins' ? await buildAdminReport(env, per, Date.now()) : await buildSalesReport(env, per, Date.now());
+      return json({ ok: true, sec, period: per, text });
     }
 
     // Healthcheck.
@@ -236,6 +412,28 @@ async function recordEvent(body, env) {
 
   // [DEBUG] сырой webhook — убрать после диагностики формата на проде.
   console.log('RAW_WEBHOOK ' + JSON.stringify(body).slice(0, 1200));
+
+  // [DEBUG] захват сырых вебхуков в KV для диагностики (включается DEBUG_RAW=1).
+  if (env.DEBUG_RAW === '1') {
+    try {
+      const p = (body && body.payload) || {};
+      const list = (await env.PULSE_KV.get('debug:raw', { type: 'json' })) || [];
+      list.push({
+        ts: Date.now(), action: body && body.action, destination: p.destination,
+        message_type: p.message_type, dialog: p.user_id, message: String(p.message || '').slice(0, 80),
+        raw: JSON.stringify(body).slice(0, 900),
+      });
+      while (list.length > 40) list.shift();
+      await env.PULSE_KV.put('debug:raw', JSON.stringify(list), { expirationTtl: 7200 });
+    } catch (_) { /* диагностика не должна мешать */ }
+  }
+
+  // Удаление сообщения («delete for everyone») приходит как channel.message.updated
+  // с текстом "_Message deleted_". Исходное сообщение убираем из бакета — отвечать не на что.
+  if (body && body.action === 'channel.message.updated' && isDeletedMarker(body.payload && body.payload.message)) {
+    await handleDeletion(env, body.payload || {});
+    return;
+  }
 
   const ev = parseWebhook(body);
   if (!ev) return; // не channel.message.created, либо не клиент/оператор
@@ -261,30 +459,76 @@ async function recordEvent(body, env) {
     + `bucket=${dateKey} n=${bucket.length}`);
 }
 
+// «Сообщение удалено»: message.help отдаёт удалённое как "_Message deleted_" (курсив).
+// Ловим RU/EN-варианты, игнорируя подчёркивания/звёздочки разметки.
+function isDeletedMarker(text) {
+  if (!text) return false;
+  const t = String(text).replace(/[_*\s]+/g, ' ').trim().toLowerCase();
+  return t === 'message deleted' || t === 'сообщение удалено' || t === 'this message was deleted';
+}
+
+// Убрать исходное сообщение из бакета дня по событию удаления. По message_id (точно),
+// иначе — последнее клиентское сообщение этого диалога (его обычно и удаляют).
+async function handleDeletion(env, p) {
+  const mid = p.id != null ? String(p.id) : '';
+  const dialog = p.user_id != null ? String(p.user_id) : '';
+  if (!mid && !dialog) return;
+  const dateKey = `events:${almatyDateStr(Date.now())}`;
+  const bucket = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
+  let idx = mid ? bucket.findIndex((e) => e.message_id === mid) : -1;
+  if (idx < 0 && dialog) {
+    for (let i = bucket.length - 1; i >= 0; i--) {
+      if (bucket[i].dialog_id === dialog && bucket[i].direction === 'client') { idx = i; break; }
+    }
+  }
+  if (idx < 0) { console.log(`[deleted] нечего убирать dialog=${dialog} mid=${mid}`); return; }
+  bucket.splice(idx, 1);
+  await env.PULSE_KV.put(dateKey, JSON.stringify(bucket), { expirationTtl: EVENTS_TTL });
+  console.log(`[deleted] убрано удалённое сообщение dialog=${dialog} mid=${mid}`);
+}
+
 // Разбор вебхука message.help: { action: "channel.message.created", payload }.
-// Берём только сообщения клиента (destination=from) и операторов/бота
-// (destination=from_operator). Всё прочее (to, comment, notice_*, ai, altegio_*)
-// — исходящее/служебное, в пульсе не участвует. Формат payload — по mh-bot.js.
+// destination (ПОДТВЕРЖДЕНО на проде по логам RAW_WEBHOOK):
+//   'from'         — входящее сообщение клиента;
+//   'from_<канал>' (from_whatsapp / from_instagram / from_telegram / from_operator …)
+//                  — ИСХОДЯЩИЙ ответ оператора/менеджера через этот канал;
+//   'to' / 'comment' / 'notice_*' / 'ai' / 'altegio_*' — служебное/внутреннее, не ответ.
+// ВАЖНО: реальные ответы менеджеров идут как 'from_whatsapp'/'from_instagram', НЕ
+// 'from_operator'. Раньше оператором считался только 'from_operator' → ответы
+// терялись, и почти все диалоги ложно попадали в «без ответа». Теперь оператор —
+// любой 'from_*'. Формат payload — см. RAW_WEBHOOK / mh-bot.js.
 function parseWebhook(body) {
   if (!body || body.action !== 'channel.message.created' || !body.payload) return null;
   const p = body.payload;
 
   let direction;
   if (p.destination === 'from') direction = 'client';
-  else if (p.destination === 'from_operator') direction = 'operator';
+  else if (typeof p.destination === 'string' && p.destination.startsWith('from_')) direction = 'operator';
   else return null;
 
   const dialogId = p.user_id != null ? String(p.user_id) : '';
   if (!dialogId) return null;
 
+  // Данные клиента лежат в payload.user (см. реальный вебхук): name, phone, contact_id.
+  // Телефон для WhatsApp = wa_id в E.164 без «+»; для Instagram телефона нет (пусто).
+  const u = p.user || {};
   return {
     message_id: p.id != null ? String(p.id) : '',
     dialog_id: dialogId,
-    contact_id: p.contact_id != null ? String(p.contact_id) : '',
-    contact_name: p.user_name || p.contact_name || p.name || '',
+    contact_id: u.contact_id != null ? String(u.contact_id) : (p.contact_id != null ? String(p.contact_id) : ''),
+    contact_name: u.name || p.user_name || p.contact_name || p.name || '',
+    phone: u.phone ? String(u.phone) : '',
+    channel_id: p.channel_id != null ? p.channel_id : (u.channel_id != null ? u.channel_id : null),
+    // Дата создания контакта в message.help — по ней отличаем НОВУЮ заявку (контакт
+    // создан сегодня) от ПРОДОЛЖЕНИЯ (контакт писал раньше). null = старое событие/нет данных.
+    contact_created: u.created_at ? parseTs(u.created_at) : null,
+    // Контакт заблокирован в message.help → отдел продаж этот чат НЕ видит. Состояние на
+    // момент сообщения (если заблокировали позже — ловим актуальное через API в дайджесте).
+    blocked: u.blocked === true,
     direction,
     operator_id: p.operator_id != null ? p.operator_id : null,
     message_type: p.message_type || 'text',
+    text: typeof p.message === 'string' ? p.message.slice(0, 280) : '',
     ts: parseTs(p.created_at),
     is_first_client_msg: false,
   };
@@ -304,21 +548,78 @@ async function runDigest(env, meta) {
 
   const now = Date.now();
   const parts = almatyParts(now);
-  const isFinal = parts.hour === FINAL_HOUR;
+  // forceFinal — ручной предпросмотр «Итога дня» через ?final=1 (не дожидаясь 21:00).
+  const isFinal = meta.forceFinal === true || parts.hour === FINAL_HOUR;
 
   try {
+    // Утром — карточка «кто на смене» (один раз в день, защита от дублей).
+    // postShiftCard сам пропустит публикацию, если сотрудников ещё нет.
+    if (parts.hour === MORNING_HOUR) {
+      const guardKey = `${SHIFT_CARD_GUARD}:${almatyDateStr(now)}`;
+      if (!(await env.PULSE_KV.get(guardKey))) {
+        const r = await postShiftCard(env);
+        if (r && r.ok) await env.PULSE_KV.put(guardKey, '1', { expirationTtl: EVENTS_TTL });
+      }
+    }
+    // Конец дня — закрываем открытую смену, чтобы журнал за день был полным.
+    if (isFinal) {
+      try { await closeOpenShift(env, now); }
+      catch (e) { console.error('[shift] close on final failed:', e && e.message); }
+    }
+
     const dateKey = `events:${almatyDateStr(now)}`;
-    const events = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
+    const rawDayEvents = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
+    // Отсечка по времени (EVENTS_SINCE_TS, epoch ms): игнорируем события, записанные
+    // ДО фикса распознавания операторов (02.06). Старые события в сегодняшнем бакете
+    // не содержат ответов менеджеров (тогда 'from_whatsapp' отбрасывался) и давали
+    // ложные «без ответа». Очистить KV-бакет надёжно нельзя (гонка read-modify-write
+    // со stale-чтением), поэтому фильтруем по ts. Не задано — берём все.
+    const sinceTs = parseInt(env.EVENTS_SINCE_TS, 10);
+    // Чёрный список внутренних номеров (сотрудники/тест) — их сообщения не заявки.
+    const internalPhones = new Set(
+      String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
+    const events = rawDayEvents.filter((e) => {
+      if (!e) return false;
+      if (Number.isFinite(sinceTs) && e.ts < sinceTs) return false;
+      if (isDeletedMarker(e.text)) return false; // удалённое сообщение — отвечать не на что
+      if (e.blocked) return false; // контакт заблокирован на момент сообщения — отдел его не видит
+      if (internalPhones.size && e.phone && internalPhones.has(String(e.phone).replace(/\D/g, ''))) return false;
+      return true;
+    });
     const metrics = computeMetrics(events, now, unansweredThreshold(env));
     if (events.length) {
       console.log('[digest] message types seen:', metrics.seenTypes.join(', '));
     }
 
+    // Отсеиваем заблокированные диалоги (отдел их не видит в хелпе) по актуальному
+    // статусу + попутно дотягиваем телефоны. Делаем ДО проверки «тихо», чтобы счётчик
+    // «без ответа» был честным (если все зависшие заблокированы — час тихий).
+    const unBefore = metrics.unanswered.slice();
+    await refineUnanswered(env, metrics, isFinal ? 60 : 30);
+    // Бот сам читает транскрипты зависших и решает, кто реально без ответа.
+    await judgeUnanswered(env, metrics, events);
+
+    // Dry-run (?dry=1): вернуть диагностику без отправки в чат.
+    if (meta.dry) {
+      return {
+        dry: true,
+        unansweredBefore: unBefore.length,
+        unansweredAfter: metrics.unanswered.length,
+        blockedSkipped: metrics.blockedSkipped || 0,
+        aiDropped: metrics.aiDropped || 0,
+        todayLeads: metrics.todayLeads,
+        newLeads: metrics.newLeads,
+        aiVerdicts: metrics.aiVerdicts || [],
+        finalUnanswered: metrics.unanswered.slice(0, 15).map((u) => ({ label: contactLabel(u), waitedMin: u.waitedMin })),
+        preview: (isFinal ? formatFinal : formatIntermediate)(metrics, parts, ''),
+      };
+    }
+
     // «Тихо»: за 3 часа ничего нового и нет зависших — короткая строка, без LLM.
     if (!isFinal && metrics.deltaLeads === 0 && metrics.unanswered.length === 0) {
       const text = `📊 Пульс продаж · ${parts.hhmm} · ${parts.ddmm}\n`
-        + `Тихо: 0 новых за 3 часа, все диалоги отвечены. `
-        + `${metrics.todayLeads} ${plural(metrics.todayLeads, ['заявка', 'заявки', 'заявок'])} с утра.`;
+        + `Тихо: 0 новых за час, все диалоги отвечены.\n`
+        + `Всего за день: ${metrics.todayLeads} ${plural(metrics.todayLeads, ['обращение', 'обращения', 'обращений'])}, из них новых: ${metrics.newLeads}.`;
       await sendTelegram(env, text);
       console.log('[digest] quiet', { ...metricsSummary(metrics), ...meta });
       return { sent: 1, quiet: true, ...metricsSummary(metrics) };
@@ -329,6 +630,11 @@ async function runDigest(env, meta) {
       ? formatFinal(metrics, parts, smart)
       : formatIntermediate(metrics, parts, smart);
     await sendTelegram(env, text);
+    // В «Итоге дня» — сохраняем лёгкий снимок дня для отчётов за неделю/месяц/период.
+    if (isFinal) {
+      try { await saveDailySnapshot(env, await buildDailySnapshot(env, now)); }
+      catch (e) { console.error('[snapshot] final failed:', e && e.message); }
+    }
     console.log('[digest] sent', { isFinal, ...metricsSummary(metrics), ...meta });
     return { sent: 1, isFinal, ...metricsSummary(metrics) };
   } catch (e) {
@@ -349,16 +655,37 @@ function unansweredThreshold(env) {
 
 function metricsSummary(m) {
   return {
-    todayLeads: m.todayLeads,
-    deltaLeads: m.deltaLeads,
+    newLeads: m.newLeads,
+    ongoing: m.ongoing,
+    deltaNew: m.deltaNew,
     todayMedianMin: m.todayMedianMin,
     unanswered: m.unanswered.length,
+    spam: m.spamSkipped || 0,
   };
 }
 
 /* ============================================================
  * МЕТРИКИ — реконструкция дня из потока событий (считает код, не LLM)
  * ============================================================ */
+
+// Сообщение клиента — это финальная вежливость, не требующая ответа? (благодарность,
+// прощание, чистые эмодзи). Вопросы (есть «?») и длинные сообщения таковыми НЕ считаем,
+// чтобы не спрятать реальные «без ответа».
+function isClosingText(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+  if (s.includes('?')) return false;                          // вопрос — нужен ответ
+  // убираем эмодзи/пунктуацию → остаются только слова
+  const cleaned = s.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!cleaned) return true;                                  // было только эмодзи/пунктуация
+  const words = cleaned.split(' ').filter(Boolean);
+  // всё сообщение состоит из вежливостей/подтверждений
+  if (words.length <= 6 && words.every((w) => CLOSING_WORDS.has(w))) return true;
+  // короткое сообщение с явной благодарностью/прощанием и без признаков запроса
+  // («Здравствуйте спасибо», «Спасибо за информацию») — тоже закрытие
+  if (words.length <= 5 && CLOSING_STRONG.test(cleaned) && !REQUEST_HINT.test(cleaned)) return true;
+  return false;
+}
 
 // Из массива событий дня считает: всего живых заявок, новые за 3 часа, медиану
 // первого ответа (за день и за 3 часа), список зависших без ответа сейчас.
@@ -391,10 +718,14 @@ function computeMetrics(rawEvents, now, thresholdMin) {
 
   let todayLeads = 0;
   let deltaLeads = 0;
+  let newLeads = 0;   // новые заявки: контакт создан сегодня (первое обращение)
+  let ongoing = 0;    // продолжения: контакт писал и раньше (действующий)
+  let deltaNew = 0;   // новых заявок за последнее окно
   const todayResponses = []; // диффы «первый ответ» (мс) за весь день
   const deltaResponses = []; // то же, только новые за 3 часа
   const unanswered = [];
   const seenTypes = new Set();
+  let spamSkipped = 0;
 
   for (const [dialogId, evs] of dialogs) {
     evs.sort((a, b) => a.ts - b.ts);
@@ -403,11 +734,18 @@ function computeMetrics(rawEvents, now, thresholdMin) {
     const clientMsgs = evs.filter(isLiveClient);
     const operatorMsgs = evs.filter((e) => e.direction === 'operator');
     if (clientMsgs.length === 0) continue; // только служебка/реакции — не заявка
+    // B2B/спам-обращение (продажа отзывов, продвижение и т.п.) — не лид, исключаем целиком.
+    if (clientMsgs.some((c) => SPAM_HINT.test(c.text || ''))) { spamSkipped++; continue; }
 
     const firstClientTs = clientMsgs[0].ts;
     todayLeads++;
+    // Новая заявка = контакт создан СЕГОДНЯ (по Алматы); иначе — продолжение/действующий.
+    // contact_created нет в старых событиях → считаем продолжением (не завышаем «новых»).
+    const cc = (clientMsgs.find((c) => c.contact_created) || {}).contact_created || null;
+    const isNewLead = cc != null && almatyDateStr(cc) === almatyDateStr(now);
+    if (isNewLead) newLeads++; else ongoing++;
     const isNewInWindow = firstClientTs >= deltaStart && firstClientTs <= now;
-    if (isNewInWindow) deltaLeads++;
+    if (isNewInWindow) { deltaLeads++; if (isNewLead) deltaNew++; }
 
     // Скорость первого ответа: первый клиентский → первый ответ после него.
     const firstReply = operatorMsgs.find((o) => o.ts >= firstClientTs);
@@ -417,12 +755,28 @@ function computeMetrics(rawEvents, now, thresholdMin) {
       if (isNewInWindow) deltaResponses.push(diff);
     }
 
-    // Без ответа сейчас: последнее живое сообщение клиента позже последнего
-    // ответа оператора и провисело дольше порога.
-    const lastClientTs = clientMsgs[clientMsgs.length - 1].ts;
+    // Без ответа сейчас: последнее СОДЕРЖАТЕЛЬНОЕ сообщение клиента позже последнего
+    // ответа оператора и провисело дольше порога. Финальные вежливости (спасибо,
+    // «До встречи 🌹», эмодзи) игнорируем — на них не отвечают, иначе закрытый диалог
+    // ложно считался бы «без ответа».
+    // Содержательное сообщение клиента = текст-не-вежливость, ЛИБО медиа/стикер без
+    // текста, но только если оператор ещё НЕ вступал (возможно, новый лид прислал фото).
+    // Если оператор уже отвечал, а клиент прислал стикер/смайл/фото без текста — это
+    // реакция, не «вопрос без ответа» (фидбэк смены: «там смайлик отправил клиент»).
+    const substantiveClient = clientMsgs.filter((c) =>
+      c.text ? !isClosingText(c.text) : operatorMsgs.length === 0);
+    const lastClientMsg = substantiveClient.length ? substantiveClient[substantiveClient.length - 1] : null;
     const lastOperatorTs = operatorMsgs.length ? operatorMsgs[operatorMsgs.length - 1].ts : -1;
-    if (lastOperatorTs < lastClientTs && (now - lastClientTs) > thresholdMs) {
-      unanswered.push({ dialogId, waitedMin: Math.round((now - lastClientTs) / 60000) });
+    if (lastClientMsg && lastOperatorTs < lastClientMsg.ts && (now - lastClientMsg.ts) > thresholdMs) {
+      unanswered.push({
+        dialogId,
+        phone: lastClientMsg.phone || '',
+        name: lastClientMsg.contact_name || '',
+        channelId: lastClientMsg.channel_id != null ? lastClientMsg.channel_id : null,
+        lastClientTs: lastClientMsg.ts,
+        waitedMin: Math.round((now - lastClientMsg.ts) / 60000),
+        isNew: isNewLead,
+      });
     }
   }
 
@@ -431,10 +785,14 @@ function computeMetrics(rawEvents, now, thresholdMin) {
   return {
     todayLeads,
     deltaLeads,
+    newLeads,
+    ongoing,
+    deltaNew,
     todayMedianMin: medianMinutes(todayResponses),
     deltaMedianMin: medianMinutes(deltaResponses),
     unanswered,
     seenTypes: [...seenTypes],
+    spamSkipped,
   };
 }
 
@@ -448,25 +806,434 @@ function medianMinutes(diffsMs) {
 }
 
 /* ============================================================
+ * СВЕРКА ЛИДОВ ДНЯ — таргетолог vs message.help vs реальные диалоги
+ * ============================================================ */
+
+// События дня с теми же фильтрами, что в дайджесте (отсечка ts, удалённые, заблок., внутренние).
+async function loadFilteredEvents(env, now) {
+  const raw = (await env.PULSE_KV.get(`events:${almatyDateStr(now)}`, { type: 'json' })) || [];
+  const sinceTs = parseInt(env.EVENTS_SINCE_TS, 10);
+  const internalPhones = new Set(
+    String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
+  return raw.filter((e) => {
+    if (!e) return false;
+    if (Number.isFinite(sinceTs) && e.ts < sinceTs) return false;
+    if (isDeletedMarker(e.text)) return false;
+    if (e.blocked) return false;
+    if (internalPhones.size && e.phone && internalPhones.has(String(e.phone).replace(/\D/g, ''))) return false;
+    return true;
+  });
+}
+
+// Классифицирует НОВЫЕ контакты сегодня: реальный диалог vs спам/односложное/без текста.
+// «Реальный» = есть содержательное текстовое сообщение клиента (намерение, вопрос, запрос).
+function computeLeadReco(rawEvents, now) {
+  const seen = new Set(); const events = [];
+  for (const e of rawEvents) {
+    if (!e || !e.dialog_id) continue;
+    if (e.message_id) { if (seen.has(e.message_id)) continue; seen.add(e.message_id); }
+    events.push(e);
+  }
+  const isLiveClient = (e) => e.direction === 'client'
+    && !NON_LEAD_MESSAGE_TYPES.includes(String(e.message_type || '').toLowerCase());
+  const dialogs = new Map();
+  for (const e of events) {
+    if (!dialogs.has(e.dialog_id)) dialogs.set(e.dialog_id, []);
+    dialogs.get(e.dialog_id).push(e);
+  }
+  const today = almatyDateStr(now);
+  const list = [];
+  const breakdown = { real: 0, spam: 0, greeting: 0, noText: 0 };
+  let newContacts = 0;
+  for (const [dialogId, evs] of dialogs) {
+    evs.sort((a, b) => a.ts - b.ts);
+    const clientMsgs = evs.filter(isLiveClient);
+    if (!clientMsgs.length) continue;
+    const cc = (clientMsgs.find((c) => c.contact_created) || {}).contact_created || null;
+    if (cc == null || almatyDateStr(cc) !== today) continue; // только новые контакты сегодня
+    newContacts++;
+    const texts = clientMsgs.map((c) => c.text || '').filter(Boolean);
+    let kind;
+    if (clientMsgs.some((c) => SPAM_HINT.test(c.text || ''))) kind = 'spam';
+    else if (!texts.length) kind = 'noText';
+    else if (texts.every((t) => isClosingText(t))) kind = 'greeting';
+    else kind = 'real';
+    breakdown[kind]++;
+    const phone = (clientMsgs.find((c) => c.phone) || {}).phone || '';
+    const name = (clientMsgs.find((c) => c.contact_name) || {}).contact_name || '';
+    const firstMsg = texts[0] || `[${clientMsgs[0].message_type || 'без текста'}]`;
+    list.push({ label: contactLabel({ phone, name, dialogId }), channelId: clientMsgs[0].channel_id, firstMsg: firstMsg.slice(0, 60), kind });
+  }
+  return { newContacts, real: breakdown.real, breakdown, list };
+}
+
+// Сколько новых контактов message.help зарегистрировал за дату (по API, авторитетно).
+// created_at в MSK → переводим в дату Алматы (как бакеты). Оценочно: до 6 страниц/канал.
+async function fetchMhNewContacts(env, dateStr) {
+  const out = { total: 0, perChannel: {} };
+  if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) return out;
+  const token = await getMhToken(env);
+  if (!token) return out;
+  const H = { Authorization: `Bearer ${token}` };
+  let channels = [];
+  try {
+    const j = await (await fetch(`${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/`, { headers: H })).json();
+    channels = ((j && j.data) || []).filter((c) => c.uuid);
+  } catch (_) { return out; }
+  for (const c of channels) {
+    let cnt = 0;
+    for (let page = 1; page <= 6; page++) {
+      let users = [];
+      try {
+        const j = await (await fetch(
+          `${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/${c.uuid}/users/?limit=50&page=${page}`, { headers: H })).json();
+        users = (j && j.data) || [];
+        for (const u of users) {
+          const cc = u.created_at ? parseTs(u.created_at) : null;
+          if (cc != null && almatyDateStr(cc) === dateStr) cnt++;
+        }
+        if (!j || !j.has_more || !users.length) break;
+      } catch (_) { break; }
+    }
+    if (cnt) out.perChannel[String(c.name).trim()] = cnt;
+    out.total += cnt;
+  }
+  return out;
+}
+
+function formatLeadReco(ddmm, target, mh, reco) {
+  const lines = [`📋 Сверка лидов · ${ddmm}`];
+  lines.push(`🎯 Таргетолог: ${target != null ? target : '—'}`);
+  const chParts = Object.entries(mh.perChannel || {}).map(([n, c]) => `${n} ${c}`).join(' · ');
+  lines.push(`📥 message.help создал: ${mh.total}${chParts ? ` (${chParts})` : ''}`);
+  lines.push(`✍️ Написали нам: ${reco.newContacts}`);
+  lines.push(`✅ Реальных диалогов: ${reco.real}`);
+  const b = reco.breakdown; const junk = [];
+  if (b.spam) junk.push(`спам ${b.spam}`);
+  if (b.greeting) junk.push(`односложные ${b.greeting}`);
+  if (b.noText) junk.push(`без текста ${b.noText}`);
+  if (junk.length) lines.push(`🗑 Отсеяно: ${junk.join(' · ')}`);
+  return lines.join('\n');
+}
+
+// Собрать сверку: посчитать, при необходимости записать число таргетолога.
+async function buildReco(env, now, opts = {}) {
+  const dateStr = almatyDateStr(now);
+  if (opts.setTarget != null && Number.isFinite(opts.setTarget)) {
+    await env.PULSE_KV.put(`target:${dateStr}`, String(opts.setTarget), { expirationTtl: 14 * 24 * 3600 });
+  }
+  const events = await loadFilteredEvents(env, now);
+  const reco = computeLeadReco(events, now);
+  const mh = await fetchMhNewContacts(env, dateStr);
+  const tRaw = await env.PULSE_KV.get(`target:${dateStr}`);
+  const target = tRaw != null ? parseInt(tRaw, 10) : null;
+  const text = formatLeadReco(almatyParts(now).ddmm, target, mh, reco);
+  return { date: dateStr, target, mh, reco, text };
+}
+
+/* ============================================================
+ * ОТЧЁТЫ ЗА ПЕРИОД (день/неделя/месяц/произвольный)
+ * ============================================================ */
+
+const ddmmFromDate = (s) => { const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? `${m[3]}.${m[2]}` : String(s); };
+
+// Лёгкий снимок дня (только из НАШИХ событий, без внешних API) — для агрегации периодов.
+// Сохраняется в KV daily:YYYY-MM-DD (TTL 120 дней). Зовётся в «Итоге дня» (21:00) и лениво.
+async function buildDailySnapshot(env, now) {
+  const events = await loadFilteredEvents(env, now);
+  const m = computeMetrics(events, now, unansweredThreshold(env));
+  const reco = computeLeadReco(events, now);
+  const dateStr = almatyDateStr(now);
+  const tRaw = await env.PULSE_KV.get(`target:${dateStr}`);
+  return {
+    date: dateStr,
+    target: tRaw != null ? parseInt(tRaw, 10) : null,
+    wrote: reco.newContacts, real: reco.real,
+    spam: reco.breakdown.spam, greeting: reco.breakdown.greeting, noText: reco.breakdown.noText,
+    newLeads: m.newLeads, ongoing: m.ongoing, medianMin: m.todayMedianMin, unanswered: m.unanswered.length,
+  };
+}
+async function saveDailySnapshot(env, snap) {
+  if (snap && snap.date) await env.PULSE_KV.put(`daily:${snap.date}`, JSON.stringify(snap), { expirationTtl: 120 * 24 * 3600 });
+}
+
+// Зарегистрированные контакты message.help по дням — один проход пагинации на канал
+// (покрывает ~последние 8–10 дней). Для строки «лидов в реестре» в периоде.
+async function fetchMhDailyCounts(env) {
+  const out = {};
+  if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) return out;
+  const token = await getMhToken(env); if (!token) return out;
+  const H = { Authorization: `Bearer ${token}` };
+  let channels = [];
+  try { const j = await (await fetch(`${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/`, { headers: H })).json(); channels = ((j && j.data) || []).filter((c) => c.uuid); }
+  catch (_) { return out; }
+  for (const c of channels) {
+    for (let page = 1; page <= 8; page++) {
+      let users = [];
+      try {
+        const j = await (await fetch(`${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/${c.uuid}/users/?limit=50&page=${page}`, { headers: H })).json();
+        users = (j && j.data) || [];
+        for (const u of users) { const cc = u.created_at ? parseTs(u.created_at) : null; if (cc != null) { const d = almatyDateStr(cc); out[d] = (out[d] || 0) + 1; } }
+        if (!j || !j.has_more || !users.length) break;
+      } catch (_) { break; }
+    }
+  }
+  return out;
+}
+
+// Диапазон дат для пресета. week=7 дн, month=30 дн (скользящие, включая сегодня).
+function periodRange(period, now) {
+  const n = period === 'week' ? 7 : period === 'month' ? 30 : 1;
+  const dates = [];
+  for (let i = n - 1; i >= 0; i--) dates.push(almatyDateStr(now - i * 86400000));
+  return { label: period === 'week' ? 'неделя' : period === 'month' ? 'месяц' : 'день', dates, from: dates[0], to: dates[dates.length - 1] };
+}
+// Произвольный диапазон из текста: «01.06.2026-07.06.2026» или «1.6-7.6».
+function parseUserDateRange(text, now) {
+  const m = String(text).match(/(\d{1,2})[.\/](\d{1,2})(?:[.\/](\d{2,4}))?\s*[-–—]\s*(\d{1,2})[.\/](\d{1,2})(?:[.\/](\d{2,4}))?/);
+  if (!m) return null;
+  const curY = parseInt(almatyDateStr(now).slice(0, 4), 10);
+  const ny = (y) => (y == null ? curY : (y < 100 ? 2000 + y : y));
+  const t1 = Date.UTC(ny(m[3] && +m[3]), +m[2] - 1, +m[1], 12);
+  const t2 = Date.UTC(ny(m[6] && +m[6]), +m[5] - 1, +m[4], 12);
+  if (!Number.isFinite(t1) || !Number.isFinite(t2) || t2 < t1) return null;
+  const dates = [];
+  for (let t = t1; t <= t2 + 1000 && dates.length <= 92; t += 86400000) dates.push(almatyDateStr(t));
+  return { label: 'период', dates, from: dates[0], to: dates[dates.length - 1] };
+}
+
+function formatSalesDay(s, mhTotal) {
+  const lines = [`📊 Отчёт «Отдел продаж» · день ${ddmmFromDate(s.date)}`];
+  lines.push(`🎯 Таргетолог: ${s.target != null ? s.target : '—'} · 📥 message.help: ${mhTotal != null ? mhTotal : '—'} · ✍️ написали: ${s.wrote} · ✅ реальных: ${s.real}`);
+  lines.push(`🆕 Новых заявок: ${s.newLeads} · ↩️ продолжений: ${s.ongoing}`);
+  lines.push(`⏱ Медиана ответа: ${s.medianMin != null ? s.medianMin + ' мин' : '—'} · 🔴 без ответа: ${s.unanswered}`);
+  const junk = [];
+  if (s.spam) junk.push(`спам ${s.spam}`);
+  if (s.greeting) junk.push(`односложные ${s.greeting}`);
+  if (s.noText) junk.push(`без текста ${s.noText}`);
+  if (junk.length) lines.push(`🗑 Отсеяно: ${junk.join(' · ')}`);
+  return lines.join('\n');
+}
+function formatSalesPeriod(range, snaps, mhDaily) {
+  const byDate = {}; for (const s of snaps) byDate[s.date] = s;
+  let sumReg = 0, sumReal = 0, sumNew = 0, sumTarget = 0, daysReg = 0, daysReal = 0, daysTarget = 0;
+  const perDay = [];
+  for (const d of range.dates) {
+    const s = byDate[d];
+    const reg = s && s.wrote != null ? (mhDaily[d] != null ? mhDaily[d] : s.wrote) : (mhDaily[d] != null ? mhDaily[d] : null);
+    const real = s ? s.real : null;
+    if (reg != null) { sumReg += reg; daysReg++; }
+    if (real != null) { sumReal += real; daysReal++; }
+    if (s) { sumNew += s.newLeads || 0; if (s.target != null) { sumTarget += s.target; daysTarget++; } }
+    if (reg != null || real != null) perDay.push(`${ddmmFromDate(d)} ${reg != null ? reg : '—'}${real != null ? '→' + real : ''}`);
+  }
+  const lines = [`📊 Отчёт «Отдел продаж» · ${range.label} (${ddmmFromDate(range.from)}–${ddmmFromDate(range.to)})`];
+  lines.push(`📥 Лидов в реестре: ${sumReg}${daysReg ? ` (${daysReg} дн)` : ''}`);
+  lines.push(`✅ Реальных диалогов: ${daysReal ? sumReal : '—'}${daysReal ? ` (${daysReal} дн с данными)` : ''}`);
+  if (daysReal) lines.push(`🆕 Новых заявок: ${sumNew}`);
+  if (daysTarget) lines.push(`🎯 Таргетолог (где указан): ${sumTarget}`);
+  if (perDay.length) lines.push('— ' + perDay.join(' · '));
+  lines.push('ℹ️ Детальная аналитика копится с запуска; за прошлые дни — число лидов из реестра message.help.');
+  return lines.join('\n');
+}
+
+async function buildSalesReport(env, period, now, custom) {
+  if (period === 'day') {
+    const snap = await buildDailySnapshot(env, now);
+    await saveDailySnapshot(env, snap);
+    const mh = await fetchMhNewContacts(env, snap.date);
+    return formatSalesDay(snap, mh.total);
+  }
+  const range = custom || periodRange(period, now);
+  const snaps = [];
+  for (const d of range.dates) { const s = await env.PULSE_KV.get(`daily:${d}`, { type: 'json' }); if (s) snaps.push(s); }
+  const today = almatyDateStr(now);
+  if (range.dates.includes(today) && !snaps.some((s) => s.date === today)) {
+    const t = await buildDailySnapshot(env, now); await saveDailySnapshot(env, t); snaps.push(t);
+  }
+  const mhDaily = await fetchMhDailyCounts(env);
+  return formatSalesPeriod(range, snaps, mhDaily);
+}
+
+/* ── Altegio: KPI администраторов (журнал записей) ──────────────────────────── */
+
+// Двойной токен Altegio: партнёр + пользователь (owner).
+function altegioHeaders(token, env) {
+  return { Authorization: `Bearer ${env.ALTEGIO_PARTNER_TOKEN}, User ${token}`, Accept: ALTEGIO_ACCEPT };
+}
+
+// Owner user_token: 1) кэш KV, 2) re-auth по логину/паролю владельца, 3) готовый секрет.
+// app-токен «Карточки клиентов» сюда НЕ годится (403 на /records) — нужен owner.
+async function altegioUserToken(env) {
+  if (env.ALTEGIO_OWNER_LOGIN && env.ALTEGIO_OWNER_PASSWORD && env.ALTEGIO_PARTNER_TOKEN) {
+    try {
+      const cached = await env.PULSE_KV.get(ALTEGIO_TOKEN_KEY);
+      if (cached) return cached;
+      const res = await fetch(`${ALTEGIO_API}/auth`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.ALTEGIO_PARTNER_TOKEN}`, Accept: ALTEGIO_ACCEPT, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login: env.ALTEGIO_OWNER_LOGIN, password: env.ALTEGIO_OWNER_PASSWORD }),
+      });
+      if (res.ok) {
+        const j = await res.json().catch(() => null);
+        const tok = j && j.data && j.data.user_token;
+        if (tok) { await env.PULSE_KV.put(ALTEGIO_TOKEN_KEY, tok, { expirationTtl: ALTEGIO_TOKEN_TTL }); return tok; }
+      } else { console.error('altegio auth:', res.status); }
+    } catch (e) { console.error('altegio auth error:', e && e.message); }
+  }
+  return env.ALTEGIO_USER_TOKEN || null; // фоллбэк: готовый owner-токен секретом
+}
+
+// Записи, СОЗДАННЫЕ в диапазоне дат (c_start_date/c_end_date — по дате оформления).
+// Пагинация по 200; страховой потолок страниц — на случай большого окна.
+async function fetchAltegioRecords(env, token, startDate, endDate) {
+  const co = env.ALTEGIO_COMPANY_ID;
+  if (!co || !token) return null;
+  const H = altegioHeaders(token, env);
+  const out = [];
+  for (let page = 1; page <= 25; page++) {
+    let r;
+    try { r = await fetch(`${ALTEGIO_API}/records/${co}?c_start_date=${startDate}&c_end_date=${endDate}&count=200&page=${page}`, { headers: H }); }
+    catch (e) { console.error('altegio records error:', e && e.message); break; }
+    if (!r.ok) { console.error('altegio records:', r.status); if (page === 1) return null; break; }
+    const j = await r.json().catch(() => null);
+    const arr = (j && j.data) || [];
+    if (!Array.isArray(arr) || !arr.length) break;
+    out.push(...arr);
+    if (arr.length < 200) break;
+  }
+  return out;
+}
+
+// Карта user_id → имя администратора (кэш сутки). Фоллбэк — ADMIN_NAMES.
+async function fetchAltegioUsers(env, token) {
+  try {
+    const cached = await env.PULSE_KV.get(ALTEGIO_USERS_KEY, { type: 'json' });
+    if (cached) return cached;
+    const r = await fetch(`${ALTEGIO_API}/company/${env.ALTEGIO_COMPANY_ID}/users`, { headers: altegioHeaders(token, env) });
+    if (!r.ok) { console.error('altegio users:', r.status); return { ...ADMIN_NAMES }; }
+    const j = await r.json().catch(() => null);
+    const map = { ...ADMIN_NAMES };
+    for (const u of (j && j.data) || []) if (u && u.id) map[u.id] = u.name || map[u.id] || `#${u.id}`;
+    await env.PULSE_KV.put(ALTEGIO_USERS_KEY, JSON.stringify(map), { expirationTtl: 86400 });
+    return map;
+  } catch (e) { console.error('altegio users error:', e && e.message); return { ...ADMIN_NAMES }; }
+}
+
+// Автор записи — интеграция/онлайн, а не человек-админ (Message.Help, формы, наши «Карточки»).
+// Их брони не относим к работе администратора, но считаем в общей воронке.
+function isAutoCreator(name) {
+  return /интеграц|message\.?help|карточк|форм|онлайн|\bapi\b|бот/i.test(String(name || ''));
+}
+
+// Воронка по администраторам: оформленные записи и их доходимость.
+// attendance: 1=пришёл, -1=не пришёл/отмена, 0=ждёт, 2=подтвердил но не отмечен →
+// «дошёл»/«неявка» считаем ТОЛЬКО по 1/-1 (2 и 0 — ещё не разрешено, в «ждут»).
+function computeAdminFunnel(records, usersMap) {
+  const by = new Map();
+  const agg = { total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0 };
+  const auto = { total: 0, attended: 0, noshow: 0, waiting: 0 };
+  for (const r of records) {
+    if (!r || r.deleted) continue;
+    const att = r.attendance === 1 ? 'attended' : r.attendance === -1 ? 'noshow' : 'waiting';
+    agg.total++; agg[att]++;
+    if (r.confirmed === 1) agg.confirmed++;
+    const uid = r.created_user_id || 0;
+    const name = (usersMap && usersMap[uid]) || ADMIN_NAMES[uid] || (uid ? `#${uid}` : 'не указан');
+    if (uid === 0 || isAutoCreator(name)) { auto.total++; auto[att]++; continue; }
+    if (!by.has(uid)) by.set(uid, { uid, name, total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0 });
+    const a = by.get(uid);
+    a.total++; a[att]++;
+    if (r.confirmed === 1) a.confirmed++;
+  }
+  return { ...agg, admins: [...by.values()].sort((x, y) => y.total - x.total), auto };
+}
+
+const pct = (num, den) => (den > 0 ? Math.round((num / den) * 100) : null);
+
+// Раздел «Администраторы» = низ воронки: записи → доходимость → неявка (только из Altegio).
+// Лиды/«сколько из лидов» живут в разделе «Отдел продаж» (Сверка лидов): записей много
+// больше лидов (повторные клиенты), поэтому «записи/лиды» — НЕ конверсия, не показываем.
+function formatAdminReport(label, range, funnel) {
+  const f = funnel;
+  const lines = [`🗂 Отчёт «Администраторы» · ${label} (${ddmmFromDate(range.from)}–${ddmmFromDate(range.to)})`];
+  const resolved = f.attended + f.noshow;                 // визиты с финальным исходом (пришёл/нет)
+  const reach = pct(f.attended, resolved);                // доходимость среди разрешённых (1/-1)
+  const bits = [`📝 записей ${f.total}`, `✅ дошли ${f.attended}`, `❌ неявка ${f.noshow}`];
+  if (f.waiting) bits.push(`⏳ ждут ${f.waiting}`);
+  lines.push(bits.join(' · '));
+  // Доходимость честна только когда визиты состоялись; если большинство впереди — помечаем «предварительно».
+  if (resolved === 0) lines.push(`Доходимость: — (все ${f.waiting} визитов ещё впереди)`);
+  else if (f.waiting > resolved) lines.push(`Доходимость (по ${resolved} состоявшимся): ${reach}% · ещё ${f.waiting} впереди`);
+  else lines.push(`Доходимость: ${reach}% · неявка ${100 - reach}%`);
+  // По администраторам (только люди).
+  if (f.admins.length) {
+    lines.push('');
+    lines.push('По администраторам (записей · дошли/неявка · доходимость):');
+    for (const a of f.admins.slice(0, 10)) {
+      const ar = pct(a.attended, a.attended + a.noshow);
+      lines.push(`• ${a.name} — ${a.total} зап · дошли ${a.attended}/неявка ${a.noshow} · ${ar != null ? ar + '%' : '—'}`);
+    }
+  }
+  // Авто/онлайн-запись (интеграции, не работа админа) — отдельной строкой, если есть.
+  if (f.auto && f.auto.total) {
+    lines.push(`🤖 Авто/онлайн-запись: ${f.auto.total} (дошли ${f.auto.attended}/неявка ${f.auto.noshow})`);
+  }
+  lines.push('');
+  lines.push('ℹ️ Записи — по дате оформления (вкл. повторных клиентов). «Ждут» = визит впереди или не отмечен в журнале.');
+  return lines.join('\n');
+}
+
+// Отчёт по администраторам за период — реальная воронка Altegio.
+async function buildAdminReport(env, period, now, custom) {
+  const range = custom || periodRange(period, now);
+  const label = range.label || (period === 'week' ? 'неделя' : period === 'month' ? 'месяц' : period === 'custom' ? 'период' : 'день');
+  const token = await altegioUserToken(env);
+  if (!token) {
+    return `🗂 Отчёт «Администраторы» · ${label}\n\n`
+      + 'Не настроен доступ к Altegio. Добавьте секреты owner-доступа:\n'
+      + 'ALTEGIO_PARTNER_TOKEN + ALTEGIO_OWNER_LOGIN + ALTEGIO_OWNER_PASSWORD\n'
+      + '(или готовый ALTEGIO_USER_TOKEN) и var ALTEGIO_COMPANY_ID.';
+  }
+  const records = await fetchAltegioRecords(env, token, range.from, range.to);
+  if (records == null) {
+    return `🗂 Отчёт «Администраторы» · ${label}\n\n`
+      + 'Altegio не отдал записи (нет прав/ошибка API). Нужен owner-токен с доступом к «Журналу записи».';
+  }
+  const usersMap = await fetchAltegioUsers(env, token);
+  const funnel = computeAdminFunnel(records, usersMap);
+  return formatAdminReport(label, range, funnel);
+}
+
+/* ============================================================
  * ФОРМАТ ОТЧЁТА (раздел 6 ТЗ)
  * ============================================================ */
 
-// Промежуточный отчёт — 08:00 / 11:00 / 14:00 / 17:00.
+// Подпись зависшего диалога: телефон (для WhatsApp), иначе имя, иначе внутренний №.
+// Телефон message.help отдаёт как wa_id (цифры E.164 без «+») — добавляем «+».
+function contactLabel(u) {
+  const digits = String(u.phone || '').replace(/\D/g, '');
+  if (digits.length >= 8) return '+' + digits;
+  if (u.name) return u.name;
+  return '№' + u.dialogId;
+}
+
+// Промежуточный отчёт — 08:00 / 11:00 / 14:00 / 17:00 / 20:00.
 function formatIntermediate(m, parts, smart) {
   const lines = [`📊 Пульс продаж · ${parts.hhmm} · ${parts.ddmm}`];
 
-  let today = `Сегодня: ${m.todayLeads} ${plural(m.todayLeads, ['заявка', 'заявки', 'заявок'])}`;
-  if (m.todayMedianMin != null) today += ` · скорость первого ответа ${m.todayMedianMin} мин`;
-  lines.push(today);
+  lines.push(`Всего за день: ${m.todayLeads} ${plural(m.todayLeads, ['обращение', 'обращения', 'обращений'])} · из них новых: ${m.newLeads}`);
 
-  let delta = `За 3 часа: +${m.deltaLeads} ${plural(m.deltaLeads, ['заявка', 'заявки', 'заявок'])}`;
-  if (m.deltaMedianMin != null) delta += ` · медиана ответа ${m.deltaMedianMin} мин`;
-  lines.push(delta);
+  let l2 = `За час: +${m.deltaNew} новых`;
+  if (m.todayMedianMin != null) l2 += ` · скорость первого ответа ${m.todayMedianMin} мин`;
+  lines.push(l2);
 
   if (m.unanswered.length) {
     lines.push('🔴 Сейчас без ответа:');
     for (const u of m.unanswered.slice(0, 5)) {
-      lines.push(`• №${u.dialogId} — ждёт ${u.waitedMin} мин`);
+      const tag = u.isNew ? '🆕' : '↩️';
+      const why = u.aiReason ? `${u.aiReason} · ` : '';
+      lines.push(`• ${tag} ${contactLabel(u)} — ${why}ждёт ${u.waitedMin} мин`);
     }
     if (m.unanswered.length > 5) lines.push(`…и ещё ${m.unanswered.length - 5}`);
   }
@@ -476,18 +1243,19 @@ function formatIntermediate(m, parts, smart) {
   return lines.join('\n');
 }
 
-// Итоговый отчёт дня — 20:00.
+// Итоговый отчёт дня — 21:00 (конец рабочего дня).
 function formatFinal(m, parts, smart) {
   const lines = [`📊 Пульс продаж · Итог дня · ${parts.ddmm}`];
 
-  let day = `За день: ${m.todayLeads} ${plural(m.todayLeads, ['заявка', 'заявки', 'заявок'])}`;
+  let day = `Всего за день: ${m.todayLeads} ${plural(m.todayLeads, ['обращение', 'обращения', 'обращений'])} · из них новых: ${m.newLeads}`;
   if (m.todayMedianMin != null) day += ` · скорость первого ответа ${m.todayMedianMin} мин`;
   lines.push(day);
 
   if (m.unanswered.length) {
     const top = m.unanswered[0];
+    const why = top.aiReason ? `${top.aiReason}, ` : '';
     lines.push(`🔴 Без ответа на конец дня: ${m.unanswered.length} `
-      + `(дольше всех №${top.dialogId} — ${top.waitedMin} мин)`);
+      + `(дольше всех ${top.isNew ? '🆕 ' : '↩️ '}${contactLabel(top)} — ${why}${top.waitedMin} мин)`);
   }
 
   // callPersona для итога возвращает «вывод дня\nдействие на завтра».
@@ -529,24 +1297,25 @@ function buildIntermediatePrompt(m, parts) {
     `сообщений WhatsApp/Instagram в CRM (живые обращения, без комментариев и реакций).`,
     '',
     'Цифры:',
-    `- новых заявок с утра: ${m.todayLeads}`,
+    `- новых заявок с утра (первое обращение): ${m.newLeads}`,
+    `- продолжений диалогов (действующие, писали раньше): ${m.ongoing}`,
     m.todayMedianMin != null
       ? `- медиана первого ответа за день: ${m.todayMedianMin} мин`
       : '- медиана первого ответа за день: данных нет',
-    `- за последние 3 часа: +${m.deltaLeads} заявок`
+    `- за последний час: +${m.deltaNew} новых заявок`
       + (m.deltaMedianMin != null ? `, медиана ответа ${m.deltaMedianMin} мин` : ''),
   ];
   if (m.unanswered.length) {
     lines.push(`- сейчас без ответа дольше порога: ${m.unanswered.length}`);
     for (const u of m.unanswered.slice(0, 5)) {
-      lines.push(`  • диалог №${u.dialogId} — клиент ждёт ${u.waitedMin} мин`);
+      lines.push(`  • ${contactLabel(u)} — ${u.aiReason ? u.aiReason + ', ' : ''}клиент ждёт ${u.waitedMin} мин`);
     }
   } else {
     lines.push('- зависших без ответа сейчас нет');
   }
   lines.push(
     '',
-    'Это короткий пульс в рабочий чат отдела, выходит 5 раз в день. Дай блок «на что',
+    'Это короткий пульс в рабочий чат отдела, выходит каждый час. Дай блок «на что',
     'смотреть»: 1–2 приоритетных действия голосом РОП — конкретно, по делу, без',
     'вступления и заголовков, максимум 2 коротких предложения. Начинай с глагола. Не',
     'называй сотрудников по именам — пиши «в работе», «подхватите». Не выдумывай цифр',
@@ -562,7 +1331,8 @@ function buildFinalPrompt(m, parts) {
     'сообщений WhatsApp/Instagram в CRM.',
     '',
     'Цифры за день:',
-    `- всего живых заявок: ${m.todayLeads}`,
+    `- новых заявок (новые контакты): ${m.newLeads}`,
+    `- продолжений диалогов (действующие): ${m.ongoing}`,
     m.todayMedianMin != null
       ? `- медиана первого ответа: ${m.todayMedianMin} мин`
       : '- медиана первого ответа: данных нет',
@@ -593,19 +1363,19 @@ function fallbackAction(m, isFinal) {
 }
 
 // Вызов Claude API: raw fetch, кэш системного промпта, retry на 429/5xx.
-async function callClaude(env, userPrompt) {
+async function callClaude(env, userPrompt, opts = {}) {
   const payload = {
     model: env.ANTHROPIC_MODEL || DEFAULT_MODEL,
-    max_tokens: CLAUDE_MAX_TOKENS,
-    temperature: CLAUDE_TEMPERATURE,
-    system: [{ type: 'text', text: PERSONA_PROMPT, cache_control: { type: 'ephemeral' } }],
+    max_tokens: opts.maxTokens || CLAUDE_MAX_TOKENS,
+    temperature: opts.temperature != null ? opts.temperature : CLAUDE_TEMPERATURE,
+    system: [{ type: 'text', text: opts.system || PERSONA_PROMPT, cache_control: { type: 'ephemeral' } }],
     messages: [{ role: 'user', content: userPrompt }],
   };
 
   for (let attempt = 0; attempt < 3; attempt++) {
     let res;
     try {
-      res = await fetch(ANTHROPIC_URL, {
+      res = await fetch(anthropicUrl(env), {
         method: 'POST',
         headers: {
           'x-api-key': env.ANTHROPIC_API_KEY,
@@ -644,6 +1414,123 @@ async function callClaude(env, userPrompt) {
 }
 
 /* ============================================================
+ * ИИ-СУДЬЯ «без ответа» — бот сам читает диалог и решает
+ * ============================================================ */
+
+// Системный промпт классификатора: НЕ персона РОП, а сухой контролёр.
+const JUDGE_PROMPT = `Ты — контролёр чата отдела продаж бьюти-студии M&M. На входе несколько диалогов с клиентами: реплики «Клиент»/«Менеджер» по времени (история ~2 дня, текст может быть обрезан).
+
+Для КАЖДОГО диалога реши: нужен ли СЕЙЧАС ответ менеджера клиенту.
+
+needs_reply = false (отвечать НЕ нужно), если:
+- менеджер уже ответил на вопрос/запрос, и сейчас ход за клиентом (ждём его решения/прихода);
+- клиент завершил вежливо: «спасибо», «хорошо», «договорились», «приду», смайлик/реакция;
+- клиент УЖЕ ЗАПИСАН (в истории было «Вы записаны»/«Подтвердите запись»/«Ждём вас», клиент подтвердил) и пишет бытовое: «опаздываю», «подтверждаю», «еду», «буду позже», «спасибо» — это не потерянный лид;
+- это спам/реклама/B2B-предложение (отзывы, продвижение, сотрудничество, бренд пишет первым);
+- это не клиент: сотрудник, тест, авто-сообщение, подтверждение записи.
+
+needs_reply = true (нужен ответ), если клиент задал вопрос или ждёт конкретного действия (записать, цена, адрес, время), а менеджер на это не ответил.
+
+Если сомневаешься — ставь true (лучше показать лишнее, чем спрятать живого клиента).
+
+reason — КОРОТКО, 2-4 слова, суть. БЕЗ слов «клиент», «ждёт», «нет ответа» (это и так понятно).
+- если true — что нужно клиенту: «спросил цену», «прислал файлы», «просит записать», «уточняет адрес», «просит перезвонить».
+- если false — почему не нужно: «подтвердил приход», «уже пришёл», «спам-бренд», «входящий звонок», «поблагодарил».
+
+Верни СТРОГО JSON-массив по всем idx, без текста вокруг:
+[{"idx":0,"needs_reply":true,"reason":"спросил цену"}, ...]`;
+
+// Бот читает транскрипты зависших диалогов (из событий KV) и сам решает, какие реально
+// без ответа. Консервативно: сбой/нет вердикта → диалог ОСТАЁТСЯ в списке (не прячем).
+async function judgeUnanswered(env, metrics, events) {
+  const items = metrics.unanswered;
+  if (!items.length) return;
+
+  // Контекст за 48 ч (вчера+сегодня): чтобы видеть, что клиент уже записан/подтвердил —
+  // подтверждение записи могло прийти вчера, а сегодня клиент пишет «опаздываю».
+  let ctx = events;
+  try {
+    const yRaw = (await env.PULSE_KV.get(`events:${almatyDateStr(Date.now() - 86400000)}`, { type: 'json' })) || [];
+    if (yRaw.length) ctx = yRaw.concat(events);
+  } catch (_) { /* нет вчерашнего бакета — работаем по сегодня */ }
+  const byDialog = new Map();
+  for (const e of ctx) { const a = byDialog.get(e.dialog_id) || []; a.push(e); byDialog.set(e.dialog_id, a); }
+
+  const audit = [];
+  // Детерминированный отсев: клиент УЖЕ записан (был шаблон «Вы записаны/Подтвердите»),
+  // а пишет бытовое (опаздываю/подтверждаю/еду/спасибо) → не потерянный лид, отработан.
+  const afterBooked = [];
+  for (const u of items) {
+    const evs = byDialog.get(u.dialogId) || [];
+    const booked = evs.some((e) => e.direction === 'operator' && BOOKING_CONFIRM.test(e.text || ''));
+    const lastClient = evs.filter((e) => e.direction === 'client' && e.text).slice(-1)[0];
+    if (booked && lastClient && LOGISTICS_HINT.test(lastClient.text || '')) {
+      audit.push({ label: contactLabel(u), needs_reply: false, reason: 'записан, бытовое' });
+    } else {
+      afterBooked.push(u);
+    }
+  }
+
+  // ИИ-судья по оставшимся (с 48-часовым транскриптом).
+  let kept = afterBooked;
+  if (afterBooked.length && env.ANTHROPIC_API_KEY && env.AI_JUDGE !== '0') {
+    const judged = afterBooked.slice(0, 20);
+    const cases = judged.map((u, idx) => {
+      const evs = (byDialog.get(u.dialogId) || []).slice().sort((a, b) => a.ts - b.ts).slice(-14);
+      const transcript = evs.map((e) => {
+        const who = e.direction === 'client' ? 'Клиент' : 'Менеджер';
+        const body = e.text ? e.text : `[${e.message_type || 'вложение'}]`;
+        return `${who} ${almatyParts(e.ts).hhmm}: ${body}`;
+      }).join('\n');
+      return { idx, label: contactLabel(u), transcript };
+    });
+    const userPrompt = [
+      'Диалоги с клиентами (история ~2 дня). Для каждого реши, нужен ли сейчас ответ менеджера.',
+      '',
+      ...cases.map((c) => `### idx=${c.idx} (${c.label})\n${c.transcript || '(текста сообщений нет)'}`),
+      '',
+      'Верни строго JSON-массив по всем idx.',
+    ].join('\n');
+    const raw = await callClaude(env, userPrompt, { system: JUDGE_PROMPT, maxTokens: 1200, temperature: 0 });
+    const verdicts = parseVerdicts(raw);
+    if (verdicts) {
+      const keep = [];
+      judged.forEach((u, i) => {
+        const v = verdicts.get(i);
+        const needs = v ? v.needs_reply : true;
+        audit.push({ label: contactLabel(u), needs_reply: needs, reason: v ? v.reason : 'не оценён' });
+        if (needs) { u.aiReason = v ? v.reason : ''; keep.push(u); }
+      });
+      kept = keep.concat(afterBooked.slice(20)); // сверх лимита 20 — оставляем как есть
+    } else {
+      console.log('[judge] ответ ИИ не разобран — оставляю список');
+    }
+  }
+
+  metrics.unanswered = kept;
+  metrics.aiVerdicts = audit;
+  metrics.aiDropped = items.length - kept.length;
+  if (metrics.aiDropped) console.log(`[judge] убрано из «без ответа»: ${metrics.aiDropped}`);
+}
+
+// Разбор JSON-массива вердиктов. Возвращает Map idx→{needs_reply,reason} или null.
+function parseVerdicts(raw) {
+  if (!raw) return null;
+  const s = raw.indexOf('['); const e = raw.lastIndexOf(']');
+  if (s < 0 || e <= s) return null;
+  let arr;
+  try { arr = JSON.parse(raw.slice(s, e + 1)); } catch { return null; }
+  if (!Array.isArray(arr)) return null;
+  const m = new Map();
+  for (const o of arr) {
+    if (o && typeof o.idx === 'number') {
+      m.set(o.idx, { needs_reply: o.needs_reply !== false, reason: String(o.reason || '').slice(0, 40) });
+    }
+  }
+  return m.size ? m : null;
+}
+
+/* ============================================================
  * TELEGRAM
  * ============================================================ */
 
@@ -663,6 +1550,379 @@ async function sendTelegram(env, text) {
     const t = await res.text();
     throw new Error(`telegram sendMessage ${res.status}: ${t.slice(0, 200)}`);
   }
+}
+
+/* ============================================================
+ * TELEGRAM — кнопки и приём апдейтов (СМЕНЫ ПРОДАВЦОВ)
+ * ============================================================ */
+
+// Общий вызов Telegram Bot API. Не бросает — логирует и возвращает разобранный ответ.
+async function tgCall(env, method, payload) {
+  try {
+    const res = await fetch(`${TELEGRAM_API}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const j = await res.json().catch(() => null);
+    if (!j || !j.ok) console.error(`telegram ${method} failed:`, JSON.stringify(j).slice(0, 200));
+    return j;
+  } catch (e) {
+    console.error(`telegram ${method} error:`, e && e.message);
+    return null;
+  }
+}
+
+// ── Сотрудники: список в KV (управляют управляющие) ──────────────────────────
+async function loadSellers(env) {
+  try {
+    const v = await env.PULSE_KV.get(SELLERS_KEY, { type: 'json' });
+    if (Array.isArray(v)) return v;
+  } catch (_) { /* ignore */ }
+  return seedSellers(env); // KV пуст — seed из env.SELLERS (обычно пусто)
+}
+async function saveSellers(env, list) {
+  await env.PULSE_KV.put(SELLERS_KEY, JSON.stringify(list)); // без TTL — список постоянный
+}
+// Добавить сотрудника (строка «Фамилия Имя»). Дубли (без учёта регистра) не плодим.
+async function addSeller(env, name) {
+  const clean = String(name).replace(/\s+/g, ' ').trim();
+  const list = await loadSellers(env);
+  const exists = list.some((s) => s.toLowerCase() === clean.toLowerCase());
+  if (clean && !exists) { list.push(clean); await saveSellers(env, list); }
+  return { list, name: clean, added: !!clean && !exists };
+}
+async function removeSeller(env, idx) {
+  const list = await loadSellers(env);
+  let removed = null;
+  if (idx >= 0 && idx < list.length) { removed = list[idx]; list.splice(idx, 1); await saveSellers(env, list); }
+  return { list, removed };
+}
+
+// Клавиатура «кто на смене»: кнопка на каждого сотрудника + «закончить смену».
+// callback_data компактный: sh:s:<idx> (индекс в списке сотрудников), sh:e — закрыть.
+function shiftKeyboard(sellers) {
+  const rows = sellers.map((name, i) => [{ text: `🟢 ${name}`, callback_data: `sh:s:${i}` }]);
+  rows.push([{ text: '🔚 Закончить смену', callback_data: 'sh:e' }]);
+  return { inline_keyboard: rows };
+}
+
+// Панель сотрудников (для управляющих): список + кнопки удаления и добавления.
+function teamPanelText(sellers) {
+  const lines = sellers.length ? sellers.map((s, i) => `${i + 1}. ${s}`).join('\n') : '— пока нет сотрудников —';
+  return `👥 Сотрудники (${sellers.length}):\n${lines}\n\n🗑 — удалить · ➕ — добавить (или: /add Фамилия Имя)`;
+}
+function teamKeyboard(sellers) {
+  const rows = sellers.map((s, i) => [{ text: `🗑 ${s}`, callback_data: `emp:rm:${i}` }]);
+  rows.push([{ text: '➕ Добавить сотрудника', callback_data: 'emp:add' }]);
+  return { inline_keyboard: rows };
+}
+
+// ── Главное меню руководителя (две ветки: Отдел продаж / Администраторы) ──────
+const MENU_MAIN_TEXT = '🏠 Главное меню. Выберите раздел:';
+const MENU_SALES_TEXT = '📊 Отдел продаж — выберите действие:';
+const MENU_ADMINS_TEXT = '🗂 Администраторы (работа в Altegio):';
+function mainMenuKb() {
+  return { inline_keyboard: [
+    [{ text: '📊 Отдел продаж', callback_data: 'menu:sales' }],
+    [{ text: '🗂 Администраторы', callback_data: 'menu:admins' }],
+  ] };
+}
+function salesMenuKb() {
+  return { inline_keyboard: [
+    [{ text: '📄 Сформировать отчёт', callback_data: 'sales:report' }],
+    [{ text: '📋 Сверка лидов дня', callback_data: 'sales:sverka' }],
+    [{ text: '🎯 Ввести лиды таргетолога', callback_data: 'sales:target' }],
+    [{ text: '👥 Сотрудники (продавцы)', callback_data: 'sales:team' }],
+    [{ text: '⬅️ Назад', callback_data: 'menu:main' }],
+  ] };
+}
+function adminsMenuKb() {
+  return { inline_keyboard: [
+    [{ text: '📄 Сформировать отчёт', callback_data: 'admins:report' }],
+    [{ text: '⬅️ Назад', callback_data: 'menu:main' }],
+  ] };
+}
+// Выбор периода отчёта (sec = 'sales' | 'admins').
+function reportPeriodKb(sec) {
+  return { inline_keyboard: [
+    [{ text: 'День', callback_data: `rep:${sec}:day` }, { text: 'Неделя', callback_data: `rep:${sec}:week` }],
+    [{ text: 'Месяц', callback_data: `rep:${sec}:month` }, { text: 'Период', callback_data: `rep:${sec}:custom` }],
+    [{ text: '⬅️ Назад', callback_data: `menu:${sec}` }],
+  ] };
+}
+const reportPrompt = (sec) => `${REPORT_PROMPT_MARK} (${sec === 'sales' ? 'продажи' : 'админы'})\n`
+  + 'Ответьте на ЭТО сообщение диапазоном дат: ДД.ММ.ГГГГ-ДД.ММ.ГГГГ (например 01.06.2026-07.06.2026).';
+
+
+// Текст карточки в зависимости от текущей открытой смены.
+function shiftCardText(open) {
+  if (open && open.manager) {
+    return `🟢 На смене: ${open.manager} (с ${almatyParts(open.start).hhmm})\n`
+      + 'Сменяетесь — нажмите своё имя. Уходите — «Закончить смену».';
+  }
+  return '👋 Кто открывает смену? Нажмите своё имя.\n'
+    + 'Ответы клиентам в вашу смену засчитываются вам.';
+}
+
+async function getOpenShift(env) {
+  try { return await env.PULSE_KV.get(SHIFT_OPEN_KEY, { type: 'json' }); }
+  catch { return null; }
+}
+
+// Закрыть текущую открытую смену (если есть): дописать в журнал дня, очистить shift:open.
+async function closeOpenShift(env, endTs) {
+  const open = await getOpenShift(env);
+  if (!open || !open.manager) return null;
+  const end = endTs || Date.now();
+  const key = shiftsKey(almatyDateStr(open.start));
+  const log = (await env.PULSE_KV.get(key, { type: 'json' })) || [];
+  log.push({ manager: open.manager, start: open.start, end, by: open.by || '' });
+  await env.PULSE_KV.put(key, JSON.stringify(log), { expirationTtl: EVENTS_TTL });
+  await env.PULSE_KV.delete(SHIFT_OPEN_KEY);
+  return { ...open, end };
+}
+
+// Открыть смену продавца. Предыдущую (если была) сперва закрываем — смены не пересекаются.
+async function openShift(env, manager, startTs, by) {
+  await closeOpenShift(env, startTs);
+  const open = { manager, start: startTs || Date.now(), by: by || '' };
+  await env.PULSE_KV.put(SHIFT_OPEN_KEY, JSON.stringify(open), { expirationTtl: EVENTS_TTL });
+  return open;
+}
+
+// Опубликовать карточку смены в рабочий чат (утром авто либо вручную ?shiftcard=).
+async function postShiftCard(env) {
+  const sellers = await loadSellers(env);
+  if (!sellers.length) {
+    console.log('[shift] список сотрудников пуст — карточку не публикуем');
+    return { ok: false, reason: 'no_sellers' };
+  }
+  const open = await getOpenShift(env);
+  const j = await tgCall(env, 'sendMessage', {
+    chat_id: env.TELEGRAM_CHAT_ID,
+    text: shiftCardText(open),
+    reply_markup: shiftKeyboard(sellers),
+    disable_web_page_preview: true,
+  });
+  return { ok: !!(j && j.ok), message_id: j && j.result && j.result.message_id };
+}
+
+// Обновить текст+клавиатуру сообщения (карточка смены / панель сотрудников).
+async function editTgMessage(env, chatId, msgId, text, keyboard) {
+  if (!chatId || !msgId) return;
+  await tgCall(env, 'editMessageText', {
+    chat_id: chatId, message_id: msgId, text,
+    reply_markup: keyboard, disable_web_page_preview: true,
+  });
+}
+// Короткий ответ в чат (DM или группа).
+async function tgReply(env, chatId, text) {
+  if (chatId) await tgCall(env, 'sendMessage', { chat_id: chatId, text, disable_web_page_preview: true });
+}
+
+// Приём апдейта Telegram: кнопки (callback) и команды/ответы (message).
+async function handleTelegramUpdate(update, env) {
+  if (update && update.callback_query) return handleCallback(env, update.callback_query);
+  if (update && update.message) return handleMessage(env, update.message);
+}
+
+// Нажатия кнопок. Смены — для всех сотрудников; управление сотрудниками — только управляющие.
+async function handleCallback(env, cq) {
+  const data = String(cq.data || '');
+  const chatId = cq.message && cq.message.chat && cq.message.chat.id;
+  const msgId = cq.message && cq.message.message_id;
+  const fromId = cq.from && cq.from.id;
+  const by = (cq.from && (cq.from.first_name || cq.from.username)) || '';
+  const answer = (text) => tgCall(env, 'answerCallbackQuery',
+    text ? { callback_query_id: cq.id, text } : { callback_query_id: cq.id });
+  const now = Date.now();
+
+  if (data.startsWith('sh:s:')) {
+    const sellers = await loadSellers(env);
+    const name = sellers[parseInt(data.slice(5), 10)];
+    if (!name) { await answer('Сотрудник не найден'); return; }
+    const open = await openShift(env, name, now, by);
+    await editTgMessage(env, chatId, msgId, shiftCardText(open), shiftKeyboard(sellers));
+    await answer(`✅ Смена открыта: ${name}`);
+    return;
+  }
+  if (data === 'sh:e') {
+    const sellers = await loadSellers(env);
+    const closed = await closeOpenShift(env, now);
+    await editTgMessage(env, chatId, msgId, shiftCardText(null), shiftKeyboard(sellers));
+    await answer(closed ? `✅ Смена закрыта: ${closed.manager}` : 'Открытой смены не было');
+    return;
+  }
+  if (data === 'emp:add' || data.startsWith('emp:rm:')) {
+    if (!isAdmin(env, fromId)) { await answer('Только для управляющих'); return; }
+    if (data === 'emp:add') {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: ADD_PROMPT, reply_markup: { force_reply: true } });
+      await answer();
+      return;
+    }
+    const { list, removed } = await removeSeller(env, parseInt(data.slice(7), 10));
+    await editTgMessage(env, chatId, msgId, teamPanelText(list), teamKeyboard(list));
+    await answer(removed ? `🗑 Удалён: ${removed}` : 'Не найдено');
+    return;
+  }
+
+  // Главное меню (Отдел продаж / Администраторы) — только руководители.
+  if (data.startsWith('menu:') || data.startsWith('sales:') || data.startsWith('admins:') || data.startsWith('rep:')) {
+    if (!isAdmin(env, fromId)) { await answer('Только для руководителей'); return; }
+    if (data === 'menu:main') { await editTgMessage(env, chatId, msgId, MENU_MAIN_TEXT, mainMenuKb()); await answer(); return; }
+    if (data === 'menu:sales') { await editTgMessage(env, chatId, msgId, MENU_SALES_TEXT, salesMenuKb()); await answer(); return; }
+    if (data === 'menu:admins') { await editTgMessage(env, chatId, msgId, MENU_ADMINS_TEXT, adminsMenuKb()); await answer(); return; }
+    // «Сформировать отчёт» → меню выбора периода (обе ветки).
+    if (data === 'sales:report') { await editTgMessage(env, chatId, msgId, '📄 Отчёт «Отдел продаж» — за какой период?', reportPeriodKb('sales')); await answer(); return; }
+    if (data === 'admins:report') { await editTgMessage(env, chatId, msgId, '📄 Отчёт «Администраторы» — за какой период?', reportPeriodKb('admins')); await answer(); return; }
+    if (data === 'sales:team') {
+      const sellers = await loadSellers(env);
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: teamPanelText(sellers), reply_markup: teamKeyboard(sellers) });
+      await answer(); return;
+    }
+    if (data === 'sales:target') {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: TARGET_PROMPT, reply_markup: { force_reply: true } });
+      await answer(); return;
+    }
+    if (data === 'sales:sverka') {
+      await answer('Считаю…');
+      const r = await buildReco(env, Date.now());
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: r.text, disable_web_page_preview: true });
+      return;
+    }
+    // rep:<sec>:<period> — сформировать отчёт за период.
+    if (data.startsWith('rep:')) {
+      const parts = data.split(':'); const sec = parts[1]; const per = parts[2];
+      if (per === 'custom') {
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: reportPrompt(sec), reply_markup: { force_reply: true } });
+        await answer(); return;
+      }
+      await answer('Формирую…');
+      const text = sec === 'admins'
+        ? await buildAdminReport(env, per, Date.now())
+        : await buildSalesReport(env, per, Date.now());
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text, disable_web_page_preview: true });
+      return;
+    }
+    await answer(); return;
+  }
+  await answer();
+}
+
+// Текстовые команды и ответ на приглашение «введите ФИО».
+async function handleMessage(env, msg) {
+  const text = (msg.text || '').trim();
+  const chatId = msg.chat && msg.chat.id;
+  const fromId = msg.from && msg.from.id;
+  if (!text) return;
+
+  // Ответ на приглашение «введите ФИО» → добавить сотрудника (только управляющий).
+  const rt = msg.reply_to_message;
+  if (rt && rt.from && rt.from.is_bot && typeof rt.text === 'string' && rt.text.startsWith(ADD_PROMPT_MARK)) {
+    if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
+    await addEmployee(env, chatId, text);
+    return;
+  }
+  // Ответ на приглашение «введите число лидов таргетолога» → записать в сверку.
+  if (rt && rt.from && rt.from.is_bot && typeof rt.text === 'string' && rt.text.startsWith(TARGET_PROMPT_MARK)) {
+    if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для руководителей.'); return; }
+    const n = parseInt(text.replace(/\D/g, ''), 10);
+    if (!Number.isFinite(n)) { await tgReply(env, chatId, 'Нужно число. Пример: 55'); return; }
+    const r = await buildReco(env, Date.now(), { setTarget: n });
+    await tgReply(env, chatId, r.text);
+    return;
+  }
+  // Ответ на приглашение «период отчёта» → отчёт за произвольный диапазон.
+  if (rt && rt.from && rt.from.is_bot && typeof rt.text === 'string' && rt.text.startsWith(REPORT_PROMPT_MARK)) {
+    if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для руководителей.'); return; }
+    const sec = rt.text.includes('админы') ? 'admins' : 'sales';
+    const range = parseUserDateRange(text, Date.now());
+    if (!range) { await tgReply(env, chatId, 'Не понял период. Пример: 01.06.2026-07.06.2026'); return; }
+    const out = sec === 'admins'
+      ? await buildAdminReport(env, 'custom', Date.now(), range)
+      : await buildSalesReport(env, 'custom', Date.now(), range);
+    await tgReply(env, chatId, out);
+    return;
+  }
+
+  if (text[0] !== '/') return;
+  const m = text.match(/^\/([a-zA-Z_]+)(?:@\w+)?(?:\s+([\s\S]+))?$/);
+  if (!m) return;
+  const cmd = m[1].toLowerCase();
+  const arg = (m[2] || '').trim();
+
+  if (cmd === 'id' || cmd === 'myid') {
+    await tgReply(env, chatId, `Ваш Telegram ID: ${fromId}`
+      + (isAdmin(env, fromId) ? '\n🔑 Вы — управляющий.' : ''));
+    return;
+  }
+  if (cmd === 'start' || cmd === 'help' || cmd === 'menu') {
+    if (isAdmin(env, fromId)) {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: MENU_MAIN_TEXT, reply_markup: mainMenuKb() });
+    } else {
+      await tgReply(env, chatId, `Бот «Пульс продаж».\nВаш Telegram ID: ${fromId}\nУправление — у руководителей.`);
+    }
+    return;
+  }
+  if (cmd === 'team' || cmd === 'sotrudniki' || cmd === 'remove' || cmd === 'rm') {
+    if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
+    const sellers = await loadSellers(env);
+    await tgCall(env, 'sendMessage', { chat_id: chatId, text: teamPanelText(sellers), reply_markup: teamKeyboard(sellers) });
+    return;
+  }
+  if (cmd === 'add') {
+    if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
+    if (!arg) { await tgReply(env, chatId, 'Укажите: /add Фамилия Имя'); return; }
+    await addEmployee(env, chatId, arg);
+    return;
+  }
+  // Сверка лидов дня: /sverka — показать; /target N — записать число таргетолога и показать.
+  if (cmd === 'sverka' || cmd === 'leads' || cmd === 'target') {
+    if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
+    const setTarget = cmd === 'target' ? parseInt(arg, 10) : null;
+    if (cmd === 'target' && !Number.isFinite(setTarget)) { await tgReply(env, chatId, 'Укажите число: /target 55'); return; }
+    const r = await buildReco(env, Date.now(), { setTarget });
+    await tgCall(env, 'sendMessage', { chat_id: chatId, text: r.text, disable_web_page_preview: true });
+  }
+}
+
+async function addEmployee(env, chatId, raw) {
+  const clean = String(raw).replace(/\s+/g, ' ').trim();
+  if (clean.length < 2) { await tgReply(env, chatId, 'Слишком коротко. Пример: Иванова Кристина'); return; }
+  const { list, name, added } = await addSeller(env, clean);
+  await tgReply(env, chatId, added
+    ? `✅ Сотрудник добавлен: ${name}\nВсего сотрудников: ${list.length}`
+    : `ℹ️ «${name}» уже в списке. Всего: ${list.length}`);
+}
+
+// setWebhook: направить апдейты бота на наш воркер (?tg=<DIGEST_SECRET>). Разовая настройка.
+async function setupTelegramWebhook(env, origin) {
+  const url = `${origin}/?tg=${env.DIGEST_SECRET}`;
+  const j = await tgCall(env, 'setWebhook', {
+    url,
+    allowed_updates: ['callback_query', 'message'],
+    drop_pending_updates: true,
+  });
+  // Кнопка «Меню» в Telegram — список команд для руководителей.
+  await tgCall(env, 'setMyCommands', { commands: [
+    { command: 'menu', description: 'Главное меню' },
+    { command: 'sverka', description: 'Сверка лидов дня' },
+    { command: 'team', description: 'Сотрудники (продавцы)' },
+    { command: 'id', description: 'Мой Telegram ID' },
+  ] });
+  return { ok: !!(j && j.ok), url, response: j };
+}
+
+// Журнал смен за день + текущая открытая (для расчёта KPI по продавцам — следующий этап).
+async function loadDayShifts(env, dateStr, clipTo) {
+  const closed = (await env.PULSE_KV.get(shiftsKey(dateStr), { type: 'json' })) || [];
+  const all = closed.slice();
+  const open = await getOpenShift(env);
+  if (open && open.manager && almatyDateStr(open.start) === dateStr) {
+    all.push({ manager: open.manager, start: open.start, end: clipTo || Date.now(), open: true });
+  }
+  return all.sort((a, b) => a.start - b.start);
 }
 
 /* ============================================================
@@ -726,11 +1986,87 @@ async function getMhToken(env) {
 }
 
 /* ============================================================
+ * MESSAGE.HELP — телефоны зависших диалогов (enrichment)
+ * ============================================================ */
+
+// channel_id → uuid (нужен, чтобы дёрнуть карточку юзера). Кэш в KV на сутки.
+async function getChannelMap(env) {
+  try {
+    const cached = await env.PULSE_KV.get('mh:channels', { type: 'json' });
+    if (cached) return cached;
+  } catch (_) { /* ignore */ }
+  const token = await getMhToken(env);
+  if (!token) return {};
+  let res;
+  try {
+    res = await fetch(`${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) { return {}; }
+  if (!res.ok) return {};
+  const j = await res.json().catch(() => null);
+  const list = (j && j.data) || [];
+  const map = {};
+  for (const c of list) if (c && c.id != null && c.uuid) map[String(c.id)] = c.uuid;
+  try { await env.PULSE_KV.put('mh:channels', JSON.stringify(map), { expirationTtl: 86400 }); } catch (_) { /* ignore */ }
+  return map;
+}
+
+// Проставляет phone зависшим диалогам, у которых он не сохранён в событии (старые
+// события до захвата телефона / Instagram без телефона). По одному GET user на диалог;
+// если канал диалога неизвестен — перебираем каналы проекта. Best-effort: сбой не
+// роняет дайджест — у кого не вышло, в отчёте останется имя или внутренний №.
+// Дотягивает телефоны зависших И ОТСЕИВАЕТ заблокированные диалоги по АКТУАЛЬНОМУ
+// статусу. Если контакт заблокирован в message.help, отдел продаж его чат не видит
+// («в хелпе не высвечивается») и физически не может ответить → флагать «без ответа» =
+// ложняк. Карточка диалога несёт поле `blocked`. Один GET на диалог; проверяем до
+// `limit` зависших (остальные оставляем как есть). Best-effort: сбой не роняет дайджест.
+async function refineUnanswered(env, metrics, limit) {
+  const items = metrics.unanswered;
+  if (!items.length || !env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) return 0;
+  const token = await getMhToken(env);
+  if (!token) return 0;
+  const map = await getChannelMap(env);
+  const allUuids = Object.values(map);
+  const cap = Math.min(items.length, limit || 50);
+  const keep = [];
+  let blocked = 0;
+  for (let i = 0; i < items.length; i++) {
+    const u = items[i];
+    if (i >= cap) { keep.push(u); continue; } // сверх лимита — не проверяем
+    const tryUuids = (u.channelId != null && map[String(u.channelId)]) ? [map[String(u.channelId)]] : allUuids;
+    let card = null;
+    for (const uuid of tryUuids) {
+      try {
+        const r = await fetch(
+          `${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/${uuid}/users/${u.dialogId}`,
+          { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) continue;
+        const j = await r.json().catch(() => null);
+        if (j && j.data) { card = j.data; break; }
+      } catch (_) { /* best-effort */ }
+    }
+    if (card) {
+      if (!u.phone && card.phone) u.phone = String(card.phone);
+      if (card.blocked === true) { blocked++; continue; } // заблокирован — отдел не видит, не флагуем
+    }
+    keep.push(u);
+  }
+  metrics.unanswered = keep;
+  metrics.blockedSkipped = (metrics.blockedSkipped || 0) + blocked;
+  if (blocked) console.log(`[digest] отброшено заблокированных «без ответа»: ${blocked}`);
+  return blocked;
+}
+
+/* ============================================================
  * УТИЛИТЫ
  * ============================================================ */
 
-// created_at message.help — формат не подтверждён (epoch sec/ms или ISO-строка).
-// Разбираем терпимо, при неудаче — текущее время.
+// created_at message.help — подтверждено на проде: строка "YYYY-MM-DD HH:MM:SS"
+// БЕЗ таймзоны, в МОСКОВСКОМ времени (UTC+3). Date.parse в воркере (TZ=UTC) принял бы
+// её за UTC и завысил время на 3 часа — все метрики (скорость ответа, «за 3 часа»,
+// «зависшие») поехали бы. Поэтому naive-строку парсим явно как MSK и приводим к UTC.
+// Epoch-числа (если когда-нибудь придут) — абсолютны, смещение к ним не применяем.
 function parseTs(raw) {
   if (raw == null || raw === '') return Date.now();
   if (typeof raw === 'number') return raw < 1e12 ? raw * 1000 : raw;
@@ -739,6 +2075,13 @@ function parseTs(raw) {
     const n = parseInt(s, 10);
     return n < 1e12 ? n * 1000 : n;
   }
+  // Naive datetime без таймзоны (формат message.help) → трактуем как UTC+3 (MSK).
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (m) {
+    const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+    return ms - MH_TZ_OFFSET * 3600 * 1000;
+  }
+  // Строка с явной таймзоной (ISO с Z или ±hh:mm) — Date.parse корректен.
   const t = Date.parse(s);
   return Number.isNaN(t) ? Date.now() : t;
 }

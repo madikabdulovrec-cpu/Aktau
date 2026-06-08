@@ -10,22 +10,31 @@ compatibility_date = "2025-05-01"
 account_id = "650cb2300c9e29301178d3e5998be3b4"
 
 # Cron — Cloudflare использует UTC. Алматы = UTC+5, перевода часов в Казахстане нет.
-# 3,6,9,12,15 UTC = 08:00 / 11:00 / 14:00 / 17:00 / 20:00 Алматы. Студия работает 7 дней.
+# 3-16 UTC = ежечасно 08:00–20:00 (пульс) + 21:00 (итог дня) Алматы. Ночью молчим. 7 дней.
 [triggers]
-crons = ["0 3,6,9,12,15 * * *"]
+crons = ["0 3-16 * * *"]
 
 # KV namespace — бакеты событий дня (events:YYYY-MM-DD) + кэш токена message.help.
 # ЗАПОЛНИТЬ id перед деплоем:  wrangler kv namespace create mm-pulse-kv
 [[kv_namespaces]]
 binding = "PULSE_KV"
-id = ""
+id = "100bb068db2f410b8da6f760f9ad3970"
 
 # Plaintext-переменные (НЕ секреты). Заполнить перед деплоем.
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
+AI_JUDGE = "1"                          # ИИ сам читает диалоги и решает, кто реально «без ответа». "0" — выключить.
+AI_GATEWAY = "mm-pulse"                 # имя Cloudflare AI Gateway. Пусто = прямой вызов (блокируется 403).
+DEBUG_RAW = "0"                         # Диагностика: пишет сырые вебхуки в KV (?rawdump=). Включать только на время отладки.
 MH_PROJECT_ID = "220763"                # id проекта message.help — ПОДТВЕРДИТЬ
-TELEGRAM_CHAT_ID = ""                   # id рабочего чата отдела (для группы отрицательный, -100…)
 UNANSWERED_THRESHOLD_MIN = "20"         # порог «без ответа сейчас», мин
+EVENTS_SINCE_TS = "1780387034760"       # отсечка: игнор событий до фикса операторов (02.06 12:57 Алматы). Убрать после 03.06.
+SELLERS = ""                            # seed-список сотрудников (только если KV пуст). Дальше список ведут управляющие из бота → KV cfg:sellers.
+ALTEGIO_COMPANY_ID = "1330174"          # id филиала Altegio — для KPI администраторов (кнопка «Администраторы»).
+# PII — НЕ в git (репозиторий публичный), хранятся СЕКРЕТАМИ. Значения — в worker/pulse-deploy.local.txt:
+#   TELEGRAM_CHAT_ID  — id рабочего чата отдела (для группы отрицательный)
+#   INTERNAL_PHONES   — телефоны сотрудников/внутренние номера, через запятую (отсев из метрик)
+#   ADMIN_IDS         — Telegram ID управляющих, через запятую (узнать: /id боту)
 
 # Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
 #   wrangler secret put ANTHROPIC_API_KEY  --config worker/wrangler-mm-pulse-bot.toml
@@ -34,8 +43,21 @@ UNANSWERED_THRESHOLD_MIN = "20"         # порог «без ответа се�
 #   wrangler secret put WEBHOOK_SECRET     --config worker/wrangler-mm-pulse-bot.toml
 #   wrangler secret put MH_LOGIN           --config worker/wrangler-mm-pulse-bot.toml
 #   wrangler secret put MH_PASSWORD        --config worker/wrangler-mm-pulse-bot.toml
+#   --- PII (репо публичный — только секретами, значения в pulse-deploy.local.txt) ---
+#   wrangler secret put TELEGRAM_CHAT_ID   --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put INTERNAL_PHONES    --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put ADMIN_IDS          --config worker/wrangler-mm-pulse-bot.toml
+#   --- Altegio (кнопка «Администраторы», только чтение журнала записей) ---
+#   значения секретов — в worker/pulse-deploy.local.txt (gitignored):
+#   wrangler secret put ALTEGIO_PARTNER_TOKEN  --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put ALTEGIO_OWNER_LOGIN    --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put ALTEGIO_OWNER_PASSWORD --config worker/wrangler-mm-pulse-bot.toml  (пароль владельца — для POST /auth, самообновление токена)
+#   # ИЛИ вместо логина/пароля — готовый owner-токен напрямую (протухает при смене пароля):
+#   wrangler secret put ALTEGIO_USER_TOKEN     --config worker/wrangler-mm-pulse-bot.toml
 #
 # После деплоя:
 #   вебхук для message.help —  https://mm-pulse-bot.<account>.workers.dev/?secret=<WEBHOOK_SECRET>
 #   ручной триггер дайджеста — https://mm-pulse-bot.<account>.workers.dev/?secret=<DIGEST_SECRET>
 #   регистрация вебхука —      https://mm-pulse-bot.<account>.workers.dev/?register=<DIGEST_SECRET>
+#   приём кнопок (setWebhook) — https://mm-pulse-bot.<account>.workers.dev/?tgsetup=<DIGEST_SECRET>   (разово)
+#   карточка смены вручную —    https://mm-pulse-bot.<account>.workers.dev/?shiftcard=<DIGEST_SECRET>
