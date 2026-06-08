@@ -402,21 +402,23 @@ async function processMessage(msg, env) {
   if (await env.BOT_KV.get(seenKey)) return;
 
   // Ответ клиента на подтверждение записи — НЕЗАВИСИМО от часа суток.
-  // Днём бот вообще не отвечает на лиды, но если человек получил наше
-  // напоминание о записи и пишет «Да / Нет» — мы обязаны довести цепочку:
-  // помечаем attendance=2 или передаём менеджеру при отказе. Длинный или
-  // непонятный ответ → fall-through в обычный диалоговый flow (а там
-  // ночное окно и op-пауза уже отфильтруют что нужно).
+  // Цепочка должна быть доведена в любом случае: «Да» → attendance=2,
+  // «Нет» → передача менеджеру, любой другой ответ («можно перенести?»,
+  // «во сколько было?», «не уверена пока») → ТАКЖЕ передача менеджеру.
+  // Раньше «другой» ответ проваливался в Claude-flow, а днём бот его
+  // скипал по night-window → клиент оставался без ответа.
   const pendingRaw = await env.BOT_KV.get(`confirm_pending:user:${msg.userId}`);
   if (pendingRaw) {
+    let pending = null;
+    try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
     const kind = classifyConfirmationResponse(msg.text);
-    if (kind) {
-      let pending = null;
-      try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
-      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+    await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+    if (kind === 'yes' || kind === 'no') {
       await handleConfirmationResponse(env, msg, kind, pending);
-      return;
+    } else {
+      await handleConfirmationFollowUp(env, msg, pending);
     }
+    return;
   }
 
   // Ночное окно лидов: бот ведёт диалог только в BOT_HOUR_START..BOT_HOUR_END
@@ -1564,6 +1566,36 @@ async function handleConfirmationResponse(env, msg, kind, pending) {
     await assignToManager(env, msg);
     console.log(`confirm reply NO u${msg.userId} record=${pending && pending.recordId}`);
   }
+}
+
+// Клиент ответил на подтверждение НЕ короткое «Да/Нет», а вопросом или
+// просьбой («можно перенести?», «во сколько было?», «не уверена пока»,
+// «у меня плохое самочувствие»). Бот сам не отвечает — это не его уровень
+// компетенции; нужно довести до менеджера. Работает в ЛЮБОЕ время суток.
+async function handleConfirmationFollowUp(env, msg, pending) {
+  await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
+
+  await sendMessage(env, msg,
+    'Поняла вас 🌷 Передаю менеджеру — он(а) свяжется в ближайшее время и поможет с записью.');
+
+  if (msg.userId) {
+    await env.BOT_KV.put(`op:${msg.userId}`, '1',
+      { expirationTtl: OPERATOR_PAUSE_TTL });
+  }
+
+  await env.BOT_KV.put(`confirm_done:${pending && pending.recordId}`,
+    JSON.stringify({
+      kind: 'followup_to_manager',
+      recordId: pending && pending.recordId,
+      clientText: String(msg.text || '').slice(0, 300),
+      at: new Date().toISOString(),
+      userId: msg.userId,
+    }), { expirationTtl: LEAD_TTL });
+
+  await assignToManager(env, msg);
+  console.log(`confirm reply FOLLOWUP u${msg.userId} `
+    + `record=${pending && pending.recordId} `
+    + `text="${String(msg.text || '').slice(0, 60)}"`);
 }
 
 // ── Парсеры даты Altegio (локальное время Almaty) ──────────────────────────
