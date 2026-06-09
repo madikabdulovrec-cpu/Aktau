@@ -118,7 +118,12 @@ const seedSellers = (env) => String(env.SELLERS || '').split(',').map((s) => s.t
 
 // Маркер приглашения «введите ФИО»: ответ управляющего на это сообщение = добавить сотрудника.
 const ADD_PROMPT_MARK = '➕ Добавление сотрудника';
-const ADD_PROMPT = `${ADD_PROMPT_MARK}\nОтветьте на ЭТО сообщение: Фамилия Имя (например: Иванова Кристина).`;
+// Приглашение ввести ФИО для КОНКРЕТНОЙ роли (продавцы/администраторы): роль зашита
+// в текст, чтобы обработчик ответа знал, в какой список добавлять.
+function addPrompt(role) {
+  const label = role === 'admins' ? 'администраторы' : 'продавцы';
+  return `${ADD_PROMPT_MARK} (${label})\nОтветьте на ЭТО сообщение: Фамилия Имя (например: Иванова Кристина).`;
+}
 
 // Маркер приглашения «введите число лидов таргетолога» (ответ → записать в сверку).
 const TARGET_PROMPT_MARK = '🎯 Лиды таргетолога';
@@ -335,7 +340,7 @@ export default {
       const nowTs = Date.now();
       const open = await getOpenShift(env);
       const day = await loadDayShifts(env, almatyDateStr(nowTs), nowTs);
-      return json({ ok: true, sellers: await loadSellers(env), admins: [...adminIds(env)], open, day });
+      return json({ ok: true, sellers: await loadStaff(env, 'sellers'), administrators: await loadStaff(env, 'admins'), admins: [...adminIds(env)], open, day });
     }
 
     // Сброс смен (исправить ошибочный клик): чистит открытую смену и журнал за сегодня.
@@ -1587,31 +1592,41 @@ async function tgCall(env, method, payload) {
   }
 }
 
-// ── Сотрудники: список в KV (управляют управляющие) ──────────────────────────
-async function loadSellers(env) {
+// ── Сотрудники по ролям (управляют управляющие) ──────────────────────────────
+// Два РАЗДЕЛЬНЫХ списка в KV: продавцы (cfg:sellers — отмечают смену) и администраторы
+// (cfg:administrators — раздел «Администраторы»). Данные разделов не смешиваются.
+const STAFF = {
+  sellers: { key: SELLERS_KEY, label: 'продавцы' },
+  admins: { key: 'cfg:administrators', label: 'администраторы' },
+};
+const staffRole = (r) => (r === 'admins' ? 'admins' : 'sellers');
+async function loadStaff(env, role) {
+  const r = staffRole(role);
   try {
-    const v = await env.PULSE_KV.get(SELLERS_KEY, { type: 'json' });
+    const v = await env.PULSE_KV.get(STAFF[r].key, { type: 'json' });
     if (Array.isArray(v)) return v;
   } catch (_) { /* ignore */ }
-  return seedSellers(env); // KV пуст — seed из env.SELLERS (обычно пусто)
+  return r === 'admins' ? [] : seedSellers(env); // продавцы — seed из env.SELLERS; админы стартуют пустыми
 }
-async function saveSellers(env, list) {
-  await env.PULSE_KV.put(SELLERS_KEY, JSON.stringify(list)); // без TTL — список постоянный
+async function saveStaff(env, role, list) {
+  await env.PULSE_KV.put(STAFF[staffRole(role)].key, JSON.stringify(list)); // без TTL — список постоянный
 }
-// Добавить сотрудника (строка «Фамилия Имя»). Дубли (без учёта регистра) не плодим.
-async function addSeller(env, name) {
+// Добавить сотрудника в список роли (строка «Фамилия Имя»). Дубли (без регистра) не плодим.
+async function addStaff(env, role, name) {
   const clean = String(name).replace(/\s+/g, ' ').trim();
-  const list = await loadSellers(env);
+  const list = await loadStaff(env, role);
   const exists = list.some((s) => s.toLowerCase() === clean.toLowerCase());
-  if (clean && !exists) { list.push(clean); await saveSellers(env, list); }
+  if (clean && !exists) { list.push(clean); await saveStaff(env, role, list); }
   return { list, name: clean, added: !!clean && !exists };
 }
-async function removeSeller(env, idx) {
-  const list = await loadSellers(env);
+async function removeStaff(env, role, idx) {
+  const list = await loadStaff(env, role);
   let removed = null;
-  if (idx >= 0 && idx < list.length) { removed = list[idx]; list.splice(idx, 1); await saveSellers(env, list); }
+  if (idx >= 0 && idx < list.length) { removed = list[idx]; list.splice(idx, 1); await saveStaff(env, role, list); }
   return { list, removed };
 }
+// Смены продавцов используют именно список продавцов.
+async function loadSellers(env) { return loadStaff(env, 'sellers'); }
 
 // Клавиатура «кто на смене»: кнопка на каждого сотрудника + «закончить смену».
 // callback_data компактный: sh:s:<idx> (индекс в списке сотрудников), sh:e — закрыть.
@@ -1621,14 +1636,16 @@ function shiftKeyboard(sellers) {
   return { inline_keyboard: rows };
 }
 
-// Панель сотрудников (для управляющих): список + кнопки удаления и добавления.
-function teamPanelText(sellers) {
-  const lines = sellers.length ? sellers.map((s, i) => `${i + 1}. ${s}`).join('\n') : '— пока нет сотрудников —';
-  return `👥 Сотрудники (${sellers.length}):\n${lines}\n\n🗑 — удалить · ➕ — добавить (или: /add Фамилия Имя)`;
+// Панель сотрудников роли (для управляющих): список + кнопки удаления и добавления.
+function teamPanelText(role, list) {
+  const what = role === 'admins' ? 'Администраторы' : 'Сотрудники (продавцы)';
+  const body = list.length ? list.map((s, i) => `${i + 1}. ${s}`).join('\n') : '— пока никого —';
+  return `👥 ${what} (${list.length}):\n${body}\n\n🗑 — удалить · ➕ — добавить`;
 }
-function teamKeyboard(sellers) {
-  const rows = sellers.map((s, i) => [{ text: `🗑 ${s}`, callback_data: `emp:rm:${i}` }]);
-  rows.push([{ text: '➕ Добавить сотрудника', callback_data: 'emp:add' }]);
+function teamKeyboard(role, list) {
+  const r = staffRole(role);
+  const rows = list.map((s, i) => [{ text: `🗑 ${s}`, callback_data: `emp:rm:${r}:${i}` }]);
+  rows.push([{ text: '➕ Добавить', callback_data: `emp:add:${r}` }]);
   return { inline_keyboard: rows };
 }
 
@@ -1647,13 +1664,14 @@ function salesMenuKb() {
     [{ text: '📄 Сформировать отчёт', callback_data: 'sales:report' }],
     [{ text: '📋 Сверка лидов дня', callback_data: 'sales:sverka' }],
     [{ text: '🎯 Ввести лиды таргетолога', callback_data: 'sales:target' }],
-    [{ text: '👥 Сотрудники (продавцы)', callback_data: 'sales:team' }],
+    [{ text: '👥 Сотрудники (продавцы)', callback_data: 'team:sellers' }],
     [{ text: '⬅️ Назад', callback_data: 'menu:main' }],
   ] };
 }
 function adminsMenuKb() {
   return { inline_keyboard: [
     [{ text: '📄 Сформировать отчёт', callback_data: 'admins:report' }],
+    [{ text: '👥 Сотрудники (администраторы)', callback_data: 'team:admins' }],
     [{ text: '⬅️ Назад', callback_data: 'menu:main' }],
   ] };
 }
@@ -1768,17 +1786,28 @@ async function handleCallback(env, cq) {
     await answer(closed ? `✅ Смена закрыта: ${closed.manager}` : 'Открытой смены не было');
     return;
   }
-  if (data === 'emp:add' || data.startsWith('emp:rm:')) {
+  // Управление сотрудниками по ролям (продавцы/администраторы) — только управляющие.
+  if (data.startsWith('team:') || data.startsWith('emp:')) {
     if (!isAdmin(env, fromId)) { await answer('Только для управляющих'); return; }
-    if (data === 'emp:add') {
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: ADD_PROMPT, reply_markup: { force_reply: true } });
-      await answer();
+    if (data.startsWith('team:')) {
+      const role = staffRole(data.slice(5));
+      const list = await loadStaff(env, role);
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: teamPanelText(role, list), reply_markup: teamKeyboard(role, list) });
+      await answer(); return;
+    }
+    if (data.startsWith('emp:add:')) {
+      const role = staffRole(data.slice(8));
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: addPrompt(role), reply_markup: { force_reply: true } });
+      await answer(); return;
+    }
+    if (data.startsWith('emp:rm:')) {
+      const p = data.split(':'); const role = staffRole(p[2]); const idx = parseInt(p[3], 10);
+      const { list, removed } = await removeStaff(env, role, idx);
+      await editTgMessage(env, chatId, msgId, teamPanelText(role, list), teamKeyboard(role, list));
+      await answer(removed ? `🗑 Удалён: ${removed}` : 'Не найдено');
       return;
     }
-    const { list, removed } = await removeSeller(env, parseInt(data.slice(7), 10));
-    await editTgMessage(env, chatId, msgId, teamPanelText(list), teamKeyboard(list));
-    await answer(removed ? `🗑 Удалён: ${removed}` : 'Не найдено');
-    return;
+    await answer(); return;
   }
 
   // Главное меню (Отдел продаж / Администраторы) — только руководители.
@@ -1790,11 +1819,6 @@ async function handleCallback(env, cq) {
     // «Сформировать отчёт» → меню выбора периода (обе ветки).
     if (data === 'sales:report') { await editTgMessage(env, chatId, msgId, '📄 Отчёт «Отдел продаж» — за какой период?', reportPeriodKb('sales')); await answer(); return; }
     if (data === 'admins:report') { await editTgMessage(env, chatId, msgId, '📄 Отчёт «Администраторы» — за какой период?', reportPeriodKb('admins')); await answer(); return; }
-    if (data === 'sales:team') {
-      const sellers = await loadSellers(env);
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: teamPanelText(sellers), reply_markup: teamKeyboard(sellers) });
-      await answer(); return;
-    }
     if (data === 'sales:target') {
       await tgCall(env, 'sendMessage', { chat_id: chatId, text: TARGET_PROMPT, reply_markup: { force_reply: true } });
       await answer(); return;
@@ -1835,7 +1859,8 @@ async function handleMessage(env, msg) {
   const rt = msg.reply_to_message;
   if (rt && rt.from && rt.from.is_bot && typeof rt.text === 'string' && rt.text.startsWith(ADD_PROMPT_MARK)) {
     if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
-    await addEmployee(env, chatId, text);
+    const role = rt.text.includes('администратор') ? 'admins' : 'sellers'; // роль зашита в текст приглашения
+    await addEmployee(env, chatId, role, text);
     return;
   }
   // Ответ на приглашение «введите число лидов таргетолога» → записать в сверку.
@@ -1881,14 +1906,14 @@ async function handleMessage(env, msg) {
   }
   if (cmd === 'team' || cmd === 'sotrudniki' || cmd === 'remove' || cmd === 'rm') {
     if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
-    const sellers = await loadSellers(env);
-    await tgCall(env, 'sendMessage', { chat_id: chatId, text: teamPanelText(sellers), reply_markup: teamKeyboard(sellers) });
+    const list = await loadStaff(env, 'sellers');
+    await tgCall(env, 'sendMessage', { chat_id: chatId, text: teamPanelText('sellers', list), reply_markup: teamKeyboard('sellers', list) });
     return;
   }
   if (cmd === 'add') {
     if (!isAdmin(env, fromId)) { await tgReply(env, chatId, 'Только для управляющих.'); return; }
     if (!arg) { await tgReply(env, chatId, 'Укажите: /add Фамилия Имя'); return; }
-    await addEmployee(env, chatId, arg);
+    await addEmployee(env, chatId, 'sellers', arg);
     return;
   }
   // Сверка лидов дня: /sverka — показать; /target N — записать число таргетолога и показать.
@@ -1901,12 +1926,13 @@ async function handleMessage(env, msg) {
   }
 }
 
-async function addEmployee(env, chatId, raw) {
+async function addEmployee(env, chatId, role, raw) {
   const clean = String(raw).replace(/\s+/g, ' ').trim();
   if (clean.length < 2) { await tgReply(env, chatId, 'Слишком коротко. Пример: Иванова Кристина'); return; }
-  const { list, name, added } = await addSeller(env, clean);
+  const { list, name, added } = await addStaff(env, role, clean);
+  const what = role === 'admins' ? 'Администратор' : 'Сотрудник';
   await tgReply(env, chatId, added
-    ? `✅ Сотрудник добавлен: ${name}\nВсего сотрудников: ${list.length}`
+    ? `✅ ${what} добавлен: ${name}\nВсего: ${list.length}`
     : `ℹ️ «${name}» уже в списке. Всего: ${list.length}`);
 }
 
