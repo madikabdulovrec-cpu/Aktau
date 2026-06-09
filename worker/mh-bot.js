@@ -1,37 +1,59 @@
 /**
  * mh-bot.js — Бот первичной обработки заявок M&M Fabrica
- * Cloudflare Worker: message.help webhook (channel.message.created) -> Claude API -> ответ клиенту.
+ * Cloudflare Worker, интегрируется напрямую с message.help.
  *
- * Заменяет Wazzup-прототип mm-bot.js: канал WhatsApp и отдел продаж студии живут
- * в message.help, поэтому бот интегрируется напрямую с message.help — один номер,
- * один аггрегатор. Бот ведёт ТОЛЬКО новых лидов; действующих клиентов не трогает.
+ * ДВЕ ФУНКЦИИ:
+ *   1) Ночью (21:00–07:00 Almaty) — приём вебхуков от новых лидов в WhatsApp,
+ *      ответ через Claude API. Действующих клиентов не трогает (гейт через
+ *      Altegio + сигналы оператора).
+ *   2) Днём  (09:00–20:59 Almaty) — cron (раз в 30 мин) рассылает напоминания
+ *      о записи за 24 часа клиентам с активной записью в Altegio. Ответ «Да»
+ *      → attendance=2 (единственный write в Altegio). Ответ «Нет» / любой
+ *      другой текст → передача менеджеру.
  *
- * ── ENV (Cloudflare -> Worker -> Settings -> Variables) ────────────────────
- *  Secrets:
- *   ANTHROPIC_API_KEY  — ключ Claude API (console.anthropic.com)
- *   MH_LOGIN           — email аккаунта message.help (для получения токена)
- *   MH_PASSWORD        — пароль аккаунта message.help
- *   WEBHOOK_SECRET     — произвольная строка 32+ симв. message.help не подписывает
- *                        вебхуки, поэтому секрет зашивается в URL вебхука:
- *                        https://<worker>/?secret=<значение>
- *  Plaintext vars:
- *   ANTHROPIC_MODEL    — модель. По умолчанию claude-sonnet-4-6.
+ * Ответы клиентов на confirmation обрабатываются КРУГЛОСУТОЧНО — даже когда
+ * лид-flow закрыт ночным окном.
+ *
+ * ── ENV (Cloudflare → Worker → Settings → Variables) ──────────────────────
+ *  Secrets (через `wrangler secret put`):
+ *   ANTHROPIC_API_KEY  — ключ Claude API
+ *   MH_LOGIN           — email аккаунта message.help
+ *   MH_PASSWORD        — пароль message.help
+ *   WEBHOOK_SECRET     — произвольная строка 32+ симв. (зашивается в URL
+ *                        вебхука: https://<worker>/?secret=<значение>)
+ *   ALTEGIO_PARTNER_TOKEN — bearer-токен партнёра Altegio (опц.)
+ *   ALTEGIO_USER_TOKEN    — user-токен Altegio с правами «Журнал: ред.» (опц.)
+ *
+ *  Plaintext vars (в wrangler-mh-bot.toml [vars]):
+ *   ANTHROPIC_MODEL    — модель Claude (default claude-sonnet-4-6)
  *   MH_PROJECT_ID      — id проекта message.help
- *   MH_CHANNEL_UUID    — uuid WhatsApp-канала message.help (куда бот шлёт ответы)
- *   MANAGER_OPERATOR_ID — (опц.) id оператора message.help для передачи лида
- *  Altegio (опционально — гейт «новый/действующий» и реальные слоты;
- *  бот Altegio только ЧИТАЕТ, ничего не пишет):
- *   ALTEGIO_PARTNER_TOKEN — bearer-токен партнёра Altegio
- *   ALTEGIO_USER_TOKEN    — user-токен Altegio
- *   ALTEGIO_COMPANY_ID    — id филиала Altegio
- *   ALTEGIO_CONSULT_SERVICE_ID — (опц.) id услуги-консультации для чтения слотов
+ *   MH_CHANNELS        — JSON {channelId: channelUuid} для всех обслуживаемых
+ *                        WhatsApp-каналов. Незнакомые каналы (Instagram и т.п.)
+ *                        молча пропускаются.
+ *   MH_CHANNEL_HOURLY_OVERRIDE — JSON {channelId: maxPerHour} (опц.) для
+ *                        канал-специфичных потолков (например свежий после
+ *                        реактивации Meta: {"17222": 2}).
+ *   MANAGER_OPERATOR_ID — id оператора message.help для assignToManager (опц.)
+ *   ALTEGIO_COMPANY_ID — id филиала Altegio (опц.)
+ *
  *  KV namespace:
- *   BOT_KV             — история диалогов, дедуп, кэш токена, карточки лидов
+ *   BOT_KV — диалоги, дедуп, кэш токена, счётчики анти-бана, pending-confirm
  *
- * Деплой: wrangler deploy (см. wrangler-mh-bot.toml).
+ * ── АНТИ-БАН (после инцидента 03.06.2026) ─────────────────────────────────
+ * Все confirmation-сообщения идут под жёсткими лимитами по рекомендациям
+ * message.help bulk-messaging FAQ:
+ *   • до 3 отправок за cron-tick
+ *   • пауза 90–150 сек между сообщениями
+ *   • потолок CONFIRM_PER_CHANNEL_HOURLY_MAX/час (override в env)
+ *   • потолок CONFIRM_PER_CHANNEL_DAILY_MAX/день (страховка под рекомендованные 300)
+ *   • 3 шаблона текста с ротацией (record_id mod 3)
+ *   • только клиенты с last_message ≤ CONFIRM_COLD_DAYS дней
+ *   • строго через тот канал, на котором клиент уже писал
+ *   • per-record и per-phone-per-day дедуп
  *
- * ВАЖНО: SYSTEM_PROMPT ниже — рабочая копия docs/sales/05_bot_system_prompt.md
- * (Часть A). При правках синхронизировать оба места.
+ * ── ВАЖНО ─────────────────────────────────────────────────────────────────
+ * SYSTEM_PROMPT ниже — рабочая копия docs/sales/05_bot_system_prompt.md.
+ * При правках синхронизировать оба места.
  */
 
 // ── Системный промпт (источник правды по фактам: docs/sales/Для бота.md) ────
@@ -268,6 +290,30 @@ const OPERATOR_PAUSE_TTL = 604800; // 7 дней — подключился со
 // SLOTS_CACHE_TTL удалён 05.06.2026 — слоты больше не показываются клиенту.
 const TOKEN_KEY = 'mh:token';
 const ALMATY_UTC_OFFSET = 5;       // Алматы = UTC+5
+
+// Текущее время Almaty в одном месте — чтобы по всему файлу не плодить
+// `new Date(Date.now() + 5*3600000)`. Возвращает объект с распространёнными
+// представлениями.
+function almatyNow() {
+  const ms = Date.now();
+  const d = new Date(ms + ALMATY_UTC_OFFSET * 3600000);
+  return {
+    ms,
+    date: d,
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    ymd: `${d.getUTCFullYear()}-`
+      + `${String(d.getUTCMonth() + 1).padStart(2, '0')}-`
+      + `${String(d.getUTCDate()).padStart(2, '0')}`,
+    ymdh: `${d.getUTCFullYear()}-`
+      + `${String(d.getUTCMonth() + 1).padStart(2, '0')}-`
+      + `${String(d.getUTCDate()).padStart(2, '0')}-`
+      + `${String(d.getUTCHours()).padStart(2, '0')}`,
+  };
+}
 // Ночное окно работы бота (Almaty time): отвечает клиентам только в эти часы,
 // днём диалоги ведут менеджеры. Для круглосуточной работы — start=0, end=24.
 // Окно «через полночь» поддерживается (start > end → 21..23 + 0..6).
@@ -279,7 +325,6 @@ const BOT_HOUR_END = 7;
 const CONFIRM_HOUR_START = 9;
 const CONFIRM_HOUR_END = 21;       // последний разрешённый час — 20 (по 20:59)
 const CONFIRM_LATE_FALLBACK_H = 20; // если идеал > 20:00 — слот = 20:00 сегодня
-const CONFIRM_WINDOW_MIN = 15;     // ширина «срабатывания» вокруг идеального слота, мин.
 const CONFIRM_DEDUP_TTL = 172800;  // 48 ч — пометка отправленных record_id (анти-дубль)
 const CONFIRM_PENDING_TTL = 129600;// 36 ч — ждём ответ клиента «Да/Нет»
 
@@ -311,21 +356,15 @@ const CONFIRM_HOUR_COUNTER_TTL = 7200;   // KV TTL счётчика «сколь
 const CONFIRM_DAY_COUNTER_TTL = 90000;   // KV TTL счётчика «сколько ушло за день с канала» (25ч)
 
 // ── Резолв канала ──────────────────────────────────────────────────────────
-// Project webhook message.help ловит сообщения со ВСЕХ каналов проекта (WhatsApp 1,
-// WhatsApp 2, Instagram, …). Мы обслуживаем только те, что прописаны в MH_CHANNELS
-// (JSON-карта channel_id → channel_uuid). Для неизвестного канала функция вернёт
-// null — processMessage в таком случае молча скипает сообщение.
+// Project webhook message.help ловит сообщения со ВСЕХ каналов проекта
+// (WhatsApp 1, WhatsApp 2, Instagram, …). Мы обслуживаем только те, что
+// прописаны в MH_CHANNELS (JSON-карта channelId → channelUuid). Для
+// незнакомого канала функция вернёт null — processMessage молча скипает.
 function resolveChannelUuid(env, channelId) {
-  if (env.MH_CHANNELS) {
-    try {
-      const map = JSON.parse(env.MH_CHANNELS);
-      const uuid = map[String(channelId)] || map[channelId];
-      if (uuid) return uuid;
-    } catch (e) {
-      console.error('MH_CHANNELS parse error:', e && e.message);
-    }
-  }
-  // Backward-compat: один канал через MH_CHANNEL_UUID (без проверки channel_id).
+  const map = parseKnownChannelMap(env);
+  const uuid = map.get(String(channelId));
+  if (uuid) return uuid;
+  // Backward-compat: один канал через MH_CHANNEL_UUID (без проверки channelId).
   return env.MH_CHANNEL_UUID || null;
 }
 
@@ -363,7 +402,8 @@ export default {
       return json({ ok: false, error: 'bad_json' }, 400);
     }
 
-    // [DEBUG] сырой webhook — убрать после диагностики формата на проде (task#8)
+    // Сырой webhook в лог — компактно, для дебага и аудита поведения.
+    // Если объём логов станет проблемой — обернуть в `if (env.LOG_RAW === '1')`.
     console.log('RAW_WEBHOOK ' + JSON.stringify(body).slice(0, 1500));
 
     const msg = parseWebhook(body);
@@ -376,7 +416,7 @@ export default {
   },
 
   // Cron-handler: подтверждение записей за ~24 часа.
-  // Триггер `*/15 * * * *` из wrangler-mh-bot.toml. Внутри сам себя пропускает
+  // Триггер `*/30 * * * *` из wrangler-mh-bot.toml. Внутри сам себя пропускает
   // вне дневного окна (09:00–20:59 по Алматы). Запускается параллельно с fetch.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runConfirmationJob(env).catch((e) =>
@@ -468,12 +508,12 @@ async function processMessage(msg, env) {
   // (Almaty). Днём диалоги ведут менеджеры — бот молчит. Эхо-защита,
   // операторская пауза и обработка ответа на confirmation — выше, работают
   // всегда: учёт ownership и завершение confirmation-цепочки идут круглосуточно.
-  const almatyHour = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600 * 1000).getUTCHours();
+  const hour = almatyNow().hour;
   const inWindow = BOT_HOUR_START < BOT_HOUR_END
-    ? (almatyHour >= BOT_HOUR_START && almatyHour < BOT_HOUR_END)
-    : (almatyHour >= BOT_HOUR_START || almatyHour < BOT_HOUR_END);
+    ? (hour >= BOT_HOUR_START && hour < BOT_HOUR_END)
+    : (hour >= BOT_HOUR_START || hour < BOT_HOUR_END);
   if (!inWindow) {
-    console.log(`outside bot hours (h=${almatyHour}, window=${BOT_HOUR_START}-${BOT_HOUR_END}), skip ${tag}`);
+    console.log(`outside bot hours (h=${hour}, window=${BOT_HOUR_START}-${BOT_HOUR_END}), skip ${tag}`);
     return;
   }
 
@@ -570,9 +610,7 @@ async function classifyContact(msg, env) {
 }
 
 // Телефон клиента по user_id из message.help. Используем uuid того канала,
-// откуда пришёл вебхук (msg.channelUuid), — этим путём message.help резолвит
-// конкретного пользователя.
-// VERIFY (task#8): точное имя поля телефона в ответе get-user — на первом тесте.
+// откуда пришёл вебхук (msg.channelUuid).
 async function getContactPhone(env, msg) {
   const token = await getMhToken(env);
   if (!token) return null;
@@ -597,7 +635,7 @@ async function getContactPhone(env, msg) {
 }
 
 // Есть ли у телефона история визитов в Altegio (= действующий клиент).
-// Бот только читает. VERIFY (task#8): эндпоинт поиска и поле числа визитов.
+// Бот только читает.
 async function altegioHasVisitHistory(env, phone) {
   const url = `${ALTEGIO_API}/company/${env.ALTEGIO_COMPANY_ID}/clients/search`;
   let res;
@@ -656,10 +694,7 @@ async function callClaude(env, history) {
   // в последнее сообщение, чтобы системный префикс и старые ходы остались
   // стабильными для prompt cache.
   const apiMessages = history.map((m) => ({ role: m.role, content: m.content }));
-  const almatyNow = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600000);
-  const todayStr = `${almatyNow.getUTCFullYear()}-`
-    + `${String(almatyNow.getUTCMonth() + 1).padStart(2, '0')}-`
-    + `${String(almatyNow.getUTCDate()).padStart(2, '0')}`;
+  const todayStr = almatyNow().ymd;
   for (let i = apiMessages.length - 1; i >= 0; i--) {
     if (apiMessages[i].role === 'user') {
       apiMessages[i] = {
@@ -840,7 +875,6 @@ async function sendMessage(env, msg, text) {
 // Назначить чат закреплённому менеджеру в message.help (best-effort).
 // Надёжная часть handoff (бот сказал «передаю», встал на паузу, карточка в KV)
 // уже сделана — assignToManager лишь адресует чат конкретному оператору.
-// VERIFY (task#8): updateOperator и резолв contact_id.
 async function assignToManager(env, msg) {
   if (!env.MANAGER_OPERATOR_ID) return;
   try {
@@ -863,7 +897,6 @@ async function assignToManager(env, msg) {
 }
 
 // contact_id message.help по user_id канала (через телефон + contact_by_phone).
-// VERIFY (task#8): поле id в ответе contact_by_phone.
 async function getContactId(env, msg) {
   const phone = await getContactPhone(env, msg);
   if (!phone) return null;
@@ -922,104 +955,124 @@ async function handleBooking(env, msg, booking) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // ПОДТВЕРЖДЕНИЕ ЗАПИСЕЙ ЗА 24 ЧАСА
-// Дневная функция: запускается cron'ом */15 мин, в окне 09:00–20:59 Almaty
-// читает Altegio, шлёт клиенту скрипт-напоминание, ловит ответ «Да/Нет»,
-// ставит attendance=2 в Altegio (единственная write-операция). При «Нет» —
-// передаёт менеджеру. Дедуп по record_id защищает от повторов даже если
-// мастер перекинул клиента на другого мастера/время (id записи не меняется).
+// Дневная функция: запускается cron'ом раз в 30 мин, в окне 09:00–20:59
+// Almaty читает Altegio, шлёт клиенту скрипт-напоминание, ловит ответ
+// «Да/Нет», ставит attendance=2 в Altegio (единственная write-операция).
+// При «Нет» / уточняющем вопросе — передаёт менеджеру. Дедуп по record_id
+// защищает от повторов даже если мастер перекинул клиента (id записи
+// не меняется).
 // ════════════════════════════════════════════════════════════════════════════
 
+// Cron-job (вызывается каждые 30 минут из scheduled). Тонкий orchestrator —
+// вся логика разнесена по helper'ам ниже для читаемости. Поток:
+//   1. preflight — токены/секреты есть?
+//   2. часовое окно (09:00–20:59 Almaty)?
+//   3. fetch Altegio записей на завтра
+//   4. collectConfirmCandidates — фильтры (attendance, окно 24-32ч, slot ≤ now…)
+//   5. groupCandidatesByPhone — один клиент = одно сообщение со всеми слотами
+//   6. processConfirmGroups — фактическая отправка с темпом, лимитами, дедупом
 async function runConfirmationJob(env) {
-  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
-    || !env.ALTEGIO_COMPANY_ID) {
-    console.log('confirm: altegio not configured, skip');
-    return;
-  }
-  if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) {
-    console.log('confirm: message.help not configured, skip');
+  if (!confirmPreflightOk(env)) return;
+
+  const now = almatyNow();
+  if (now.hour < CONFIRM_HOUR_START || now.hour >= CONFIRM_HOUR_END) {
+    console.log(`confirm: outside window (h=${now.hour}), skip`);
     return;
   }
 
-  // Окно работы
-  const nowMs = Date.now();
-  const almaty = new Date(nowMs + ALMATY_UTC_OFFSET * 3600000);
-  const hour = almaty.getUTCHours();
-  if (hour < CONFIRM_HOUR_START || hour >= CONFIRM_HOUR_END) {
-    console.log(`confirm: outside window (h=${hour}), skip`);
-    return;
-  }
-
-  // Дата «завтра» по Almaty — YYYY-MM-DD
-  const tomorrowAlmaty = new Date(almaty.getTime() + 86400000);
-  const yyyy = tomorrowAlmaty.getUTCFullYear();
-  const mm = String(tomorrowAlmaty.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(tomorrowAlmaty.getUTCDate()).padStart(2, '0');
-  const tomorrowStr = `${yyyy}-${mm}-${dd}`;
-
-  let records;
-  try {
-    records = await altegioFetchRecords(env, tomorrowStr, tomorrowStr);
-  } catch (e) {
-    console.error('confirm: altegio fetch failed:', e && e.message);
-    return;
-  }
-  if (!Array.isArray(records) || !records.length) {
+  const tomorrowStr = ymdDaysAhead(now, 1);
+  const records = await fetchTomorrowRecordsSafe(env, tomorrowStr);
+  if (records === null) return;
+  if (!records.length) {
     console.log(`confirm: no records for ${tomorrowStr}`);
     return;
   }
 
-  // Сегодняшние границы Almaty в ms (для clamp)
-  const todayCalAlmaty = new Date(Date.UTC(
-    almaty.getUTCFullYear(), almaty.getUTCMonth(), almaty.getUTCDate(), 0, 0, 0));
-  const todayCalUtcMs = todayCalAlmaty.getTime() - ALMATY_UTC_OFFSET * 3600000;
+  const candidates = await collectConfirmCandidates(env, records, now);
+  if (!candidates.length) {
+    console.log(`confirm: ${records.length} tomorrow, 0 ready in this tick`);
+    return;
+  }
+
+  const groups = groupCandidatesByPhone(candidates);
+  shuffleInPlace(groups);
+
+  const stats = await processConfirmGroups(env, groups, now.ymd);
+  console.log(`confirm tick: ${records.length} tomorrow, ${candidates.length} cand, `
+    + `${groups.length} groups, ${stats.ok} sent ${JSON.stringify(stats.channels)}, `
+    + `${stats.dedup} dedup, ${stats.phoneDup} phone-day-dup, `
+    + `${stats.cold} cold, ${stats.cap} cap`);
+}
+
+// Pre-flight проверки конфигурации для confirmation job.
+function confirmPreflightOk(env) {
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
+    || !env.ALTEGIO_COMPANY_ID) {
+    console.log('confirm: altegio not configured, skip');
+    return false;
+  }
+  if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) {
+    console.log('confirm: message.help not configured, skip');
+    return false;
+  }
+  return true;
+}
+
+// YYYY-MM-DD в Almaty через N дней от текущей даты.
+function ymdDaysAhead(now, days) {
+  const t = new Date(now.date.getTime() + days * 86400000);
+  return `${t.getUTCFullYear()}-`
+    + `${String(t.getUTCMonth() + 1).padStart(2, '0')}-`
+    + `${String(t.getUTCDate()).padStart(2, '0')}`;
+}
+
+// Обёртка над altegioFetchRecords с дружелюбной обработкой ошибки.
+// Возвращает массив записей или null (при ошибке fetch).
+async function fetchTomorrowRecordsSafe(env, tomorrowStr) {
+  try {
+    const recs = await altegioFetchRecords(env, tomorrowStr, tomorrowStr);
+    return Array.isArray(recs) ? recs : [];
+  } catch (e) {
+    console.error('confirm: altegio fetch failed:', e && e.message);
+    return null;
+  }
+}
+
+// Фильтры по записям. Возвращает массив {record, phone, parts, dedupKey, slotMs}
+// готовых к отправке. Сбрасывает записи в прошлом, без телефона, со статусом
+// уже отработанным, вне окна 24-32ч до визита, со слотом в будущем.
+async function collectConfirmCandidates(env, records, now) {
+  // Сегодняшние границы Almaty для clamp слота: 09:00 и CONFIRM_LATE_FALLBACK_H
+  const todayCalUtcMs = Date.UTC(now.year, now.month - 1, now.day, 0, 0, 0)
+    - ALMATY_UTC_OFFSET * 3600000;
   const today09Ms = todayCalUtcMs + CONFIRM_HOUR_START * 3600000;
   const todayLateMs = todayCalUtcMs + CONFIRM_LATE_FALLBACK_H * 3600000;
 
-  const candidates = [];
+  const out = [];
   for (const r of records) {
-    // Уже подтверждена / клиент пришёл / не пришёл — пропускаем.
-    const att = Number(r.attendance);
-    if (att !== 0) continue;
-
-    // ВАЖНО: поле `confirmed` НЕ используем для скипа. В этом кабинете
-    // Altegio оно проставляется автоматически при создании записи (все
-    // 50/50 на завтра имеют confirmed=1) и не означает «клиент подтвердил
-    // через мессенджер». Единственный надёжный признак подтверждения от
-    // клиента — attendance=2, его и проверяем выше.
-
-    // Кандидат на удаление в Altegio (deleted/cancelled) — пропускаем.
+    if (Number(r.attendance) !== 0) continue; // уже отработана
     if (r.deleted) continue;
+    // Поле `confirmed` в этом кабинете Altegio проставляется автоматически у
+    // ВСЕХ записей при создании — не используем как сигнал. Признак ответа
+    // клиента — только attendance=2.
 
-    // Телефон клиента
     const rawPhone = (r.client && (r.client.phone || r.client.surname_with_phone))
       || r.client_phone || '';
     const phone = normalizePhone(rawPhone);
     if (!phone) continue;
 
-    // Дата/время записи
     const parts = parseAltegioParts(r.date || r.datetime);
     if (!parts) continue;
     const apptMs = partsToAlmatyMs(parts);
-    if (!apptMs || apptMs < nowMs + 60000) continue; // запись в прошлом — мимо
+    if (!apptMs || apptMs < now.ms + 60000) continue; // запись в прошлом — мимо
 
-    // ──────────────────────────────────────────────────────────────────────
     // ОКНО ОТПРАВКИ: 32ч ≥ время-до-визита ≥ 24ч.
-    //
-    // Нижняя граница 24ч — политика отмены студии: «менее 24ч до визита
-    // = услуга считается выполненной». Слать в зоне <24ч несправедливо к
-    // клиенту — он получил наше предупреждение «отмена за 24ч» пост-фактум.
-    //
-    // Верхняя граница 32ч — анти-бан + UX: не слать слишком заранее, чтобы
-    // выглядеть «человеческим» напоминанием (накануне), а не маркетинговым
-    // блока. Также распределяет нагрузку — записи на завтра вечером сегодня
-    // утром ещё подождут, отправятся ближе к 24ч.
-    //
-    // Запись вне окна — skip с одноразовым логом по record_id (через KV
-    // confirm_late_notice), чтобы лог не повторялся каждые 30 минут.
-    // ──────────────────────────────────────────────────────────────────────
-    const apptToNowMs = apptMs - nowMs;
-    if (apptToNowMs > 32 * 3600000) continue; // ещё рано, ждём следующих tick'ов
-    if (apptToNowMs < 24 * 3600000) {
+    // < 24ч — нарушает политику отмены студии (клиент уже не успевает
+    //         отменить без штрафа). Skip с одноразовым логом.
+    // > 32ч — ещё рано, ждём следующих cron-тиков.
+    const apptToNow = apptMs - now.ms;
+    if (apptToNow > 32 * 3600000) continue;
+    if (apptToNow < 24 * 3600000) {
       const noticeKey = `confirm_late_notice:${r.id}`;
       if (!(await env.BOT_KV.get(noticeKey))) {
         console.log(`confirm: skip rec ${r.id} — appt ${r.date} осталось `
@@ -1029,35 +1082,29 @@ async function runConfirmationJob(env) {
       continue;
     }
 
-    // Идеальный слот = appointment - 24h. Без jitter в будущее, иначе
-    // отправка может попасть в зону <24ч и нарушить политику студии.
-    // Если идеал в окне 09:00–20:00 сегодня — шлём ровно по нему.
-    // Если идеал раньше 09:00 (запись очень рано утром завтра) — это
-    // запись с appointment < 9+24=33ч от полуночи сегодня, она ловится
-    // фильтром выше. Сюда не попадёт.
+    // Идеальный слот = appt-24ч, ограничен дневным окном [09:00, 20:00].
+    // Никакого jitter в будущее — иначе слот может уплыть в зону <24ч.
     const idealMs = apptMs - 24 * 3600000;
     let slotMs;
     if (idealMs < today09Ms) slotMs = today09Ms;
     else if (idealMs > todayLateMs) slotMs = todayLateMs;
     else slotMs = idealMs;
 
-    // Слот ещё не настал (> минуты впереди) — ждём следующих cron-тиков
-    if (slotMs > nowMs + 60000) continue;
+    if (slotMs > now.ms + 60000) continue; // слот ещё впереди — следующий tick
 
-    // Дедуп по record_id (мастер перекинул клиента → id не меняется)
-    const dedupKey = `confirm_sent:${r.id}`;
-    candidates.push({ record: r, phone, parts, dedupKey, slotMs });
+    out.push({
+      record: r, phone, parts,
+      dedupKey: `confirm_sent:${r.id}`,
+      slotMs,
+    });
   }
+  return out;
+}
 
-  if (!candidates.length) {
-    console.log(`confirm: ${records.length} tomorrow, 0 ready in this tick`);
-    return;
-  }
-
-  // Группировка: если у одного телефона несколько записей на «завтра»
-  // (3 процедуры подряд), мы шлём ОДНО сообщение со списком всех слотов,
-  // а не N отдельных. В группе слоты сортируем по времени; общий slotMs
-  // группы = самый ранний (раньше всех «созревает» к отправке).
+// Группировка кандидатов: один клиент → одно сообщение со всеми слотами дня.
+// `slotMs` группы = минимум по входящим (раньше всех «созревает»). Записи
+// внутри группы сортируются по времени визита для красивого отображения.
+function groupCandidatesByPhone(candidates) {
   const byPhone = new Map();
   for (const c of candidates) {
     if (!byPhone.has(c.phone)) byPhone.set(c.phone, []);
@@ -1075,44 +1122,32 @@ async function runConfirmationJob(env) {
       firstRecord: list[0].record,
     });
   }
+  return groups;
+}
 
-  // Анти-бан: перетасовка групп + жёсткие ограничения на темп.
-  shuffleInPlace(groups);
-
-  // Дата «сегодня» в Almaty — для per-phone-day дедупа.
-  const todayStr = `${almaty.getUTCFullYear()}-`
-    + `${String(almaty.getUTCMonth() + 1).padStart(2, '0')}-`
-    + `${String(almaty.getUTCDate()).padStart(2, '0')}`;
-
-  let okCount = 0;
-  let skipCount = 0;
-  let phoneDupCount = 0;
-  let coldCount = 0;
-  let capCount = 0;
-  const sentChannels = []; // лог для контроля чередования
+// Основной цикл отправки. Идёт по перетасованным группам, проверяет каждый
+// слой защиты (per-record дедуп, per-phone-day, часовой/дневной потолок,
+// холодные), шлёт и инкрементит счётчики. Возвращает агрегированную
+// статистику для общего лога tick.
+async function processConfirmGroups(env, groups, todayStr) {
+  const stats = {
+    ok: 0, dedup: 0, phoneDup: 0, cold: 0, cap: 0,
+    channels: [],
+  };
 
   for (const g of groups) {
-    if (okCount >= CONFIRM_TICK_MAX) break;
+    if (stats.ok >= CONFIRM_TICK_MAX) break;
 
-    // Per-record дедуп: если хотя бы одна запись группы уже отправлялась,
-    // считаем что клиента уже трогали (значит ему уже шло) — skip всей группы.
-    let alreadySent = false;
-    for (const k of g.dedupKeys) {
-      if (await env.BOT_KV.get(k)) { alreadySent = true; break; }
-    }
-    if (alreadySent) { skipCount++; continue; }
+    // Per-record дедуп — если хотя бы одна запись группы уже шла, skip всей
+    if (await anyKeyExists(env, g.dedupKeys)) { stats.dedup++; continue; }
 
-    // Per-phone-per-day дедуп: один номер — максимум одно сообщение от
-    // нашего бота в сутки. Защита от ситуации «у клиента записи на 4 и 5
-    // числа, ему пришло вчера за 4-е, сегодня собираемся за 5-е».
+    // Per-phone-per-day дедуп — один номер не получает > 1 сообщения в сутки
     const phoneDayKey = `confirm_phone_day:${g.phone}:${todayStr}`;
-    if (await env.BOT_KV.get(phoneDayKey)) {
-      phoneDupCount++;
-      continue;
-    }
+    if (await env.BOT_KV.get(phoneDayKey)) { stats.phoneDup++; continue; }
 
     const r = g.firstRecord;
-    // 3 шаблона текста — точно по правилу message.help «1–3 шаблона текста»
+    // 3 шаблона текста с ротацией record_id mod 3 — точно по правилу
+    // message.help «1–3 шаблона текста на рассылку».
     const variant = Math.abs(Number(r.id) || 0) % 3;
     const text = buildConfirmationText(g.partsList, variant);
 
@@ -1124,65 +1159,70 @@ async function runConfirmationJob(env) {
     }
 
     if (!sent || !sent.ok) {
-      if (sent && sent.reason === 'cold') coldCount++;
-      else if (sent && sent.reason === 'hour_cap') capCount++;
-      else if (sent && sent.reason === 'day_cap') capCount++;
+      if (sent && sent.reason === 'cold') stats.cold++;
+      else if (sent && (sent.reason === 'hour_cap'
+        || sent.reason === 'day_cap')) stats.cap++;
       continue;
     }
 
-    okCount++;
-    sentChannels.push(sent.channelId || '?');
+    stats.ok++;
+    stats.channels.push(sent.channelId || '?');
+    await markGroupSent(env, g, phoneDayKey, sent);
+    await persistPending(env, g, r, sent);
 
-    // Пометить ВСЕ записи группы как уже отправленные — чтобы они не
-    // подгрузились в следующий tick по отдельности.
-    const payload = JSON.stringify({
-      recordIds: g.recordIds, phone: g.phone,
-      sentAt: new Date().toISOString(), channelId: sent.channelId,
-    });
-    for (const k of g.dedupKeys) {
-      await env.BOT_KV.put(k, payload, { expirationTtl: CONFIRM_DEDUP_TTL });
-    }
-    // Per-phone-day отметка
-    await env.BOT_KV.put(phoneDayKey, payload,
-      { expirationTtl: CONFIRM_DEDUP_TTL });
-
-    // Инкремент часового и дневного счётчиков на канале
-    if (sent.channelId != null) {
-      await incChannelHourCount(env, sent.channelId);
-      await incChannelDayCount(env, sent.channelId);
-    }
-
-    // Ждём короткий ответ Да/Нет — pending по user_id канала. В записи
-    // группы кладём первый record_id (его пометит attendance=2 если клиент
-    // ответит «Да»). По остальным запискам клиент уже фактически на радаре;
-    // если их нужно тоже пометить attendance=2, менеджер сделает в кабинете.
-    if (sent.userId) {
-      await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
-        recordId: r.id, recordIds: g.recordIds, phone: g.phone,
-        channelUuid: sent.channelUuid,
-      }), { expirationTtl: CONFIRM_PENDING_TTL });
-    }
-
-    // Темп: 60..120 сек между сообщениями
-    if (okCount < CONFIRM_TICK_MAX) {
+    // Темп 90..150 сек между сообщениями
+    if (stats.ok < CONFIRM_TICK_MAX) {
       await sleep(CONFIRM_TICK_PAUSE_MIN
-        + Math.floor(Math.random() * (CONFIRM_TICK_PAUSE_MAX - CONFIRM_TICK_PAUSE_MIN)));
+        + Math.floor(Math.random()
+          * (CONFIRM_TICK_PAUSE_MAX - CONFIRM_TICK_PAUSE_MIN)));
     }
   }
-  console.log(`confirm tick: ${records.length} tomorrow, ${candidates.length} cand, `
-    + `${groups.length} groups, ${okCount} sent ${JSON.stringify(sentChannels)}, `
-    + `${skipCount} dedup, ${phoneDupCount} phone-day-dup, `
-    + `${coldCount} cold, ${capCount} hour-cap`);
+
+  return stats;
+}
+
+// True, если хотя бы один ключ из массива есть в KV.
+async function anyKeyExists(env, keys) {
+  for (const k of keys) {
+    if (await env.BOT_KV.get(k)) return true;
+  }
+  return false;
+}
+
+// Помечает в KV ВСЕ записи группы как «отправлено» + per-phone-day отметку.
+// Инкрементит часовой и дневной счётчики канала.
+async function markGroupSent(env, g, phoneDayKey, sent) {
+  const payload = JSON.stringify({
+    recordIds: g.recordIds, phone: g.phone,
+    sentAt: new Date().toISOString(), channelId: sent.channelId,
+  });
+  for (const k of g.dedupKeys) {
+    await env.BOT_KV.put(k, payload, { expirationTtl: CONFIRM_DEDUP_TTL });
+  }
+  await env.BOT_KV.put(phoneDayKey, payload,
+    { expirationTtl: CONFIRM_DEDUP_TTL });
+  if (sent.channelId != null) {
+    await incChannelHourCount(env, sent.channelId);
+    await incChannelDayCount(env, sent.channelId);
+  }
+}
+
+// Сохраняет pending для ответа клиента «Да/Нет/уточняющий вопрос». Бот
+// перехватит следующее входящее сообщение пользователя и направит в
+// handleConfirmationResponse / handleConfirmationFollowUp.
+async function persistPending(env, g, firstRecord, sent) {
+  if (!sent.userId) return;
+  await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
+    recordId: firstRecord.id,
+    recordIds: g.recordIds,
+    phone: g.phone,
+    channelUuid: sent.channelUuid,
+  }), { expirationTtl: CONFIRM_PENDING_TTL });
 }
 
 // Часовой счётчик исходящих на канал — для CONFIRM_PER_CHANNEL_HOURLY_MAX.
 function channelHourKey(channelId) {
-  const almaty = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600000);
-  const y = almaty.getUTCFullYear();
-  const m = String(almaty.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(almaty.getUTCDate()).padStart(2, '0');
-  const h = String(almaty.getUTCHours()).padStart(2, '0');
-  return `confirm_hour:${channelId}:${y}-${m}-${d}-${h}`;
+  return `confirm_hour:${channelId}:${almatyNow().ymdh}`;
 }
 
 async function getChannelHourCount(env, channelId) {
@@ -1200,11 +1240,7 @@ async function incChannelHourCount(env, channelId) {
 // Дневной счётчик исходящих на канал — глобальная страховка под лимит
 // message.help «не более 300/день на номер».
 function channelDayKey(channelId) {
-  const almaty = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600000);
-  const y = almaty.getUTCFullYear();
-  const m = String(almaty.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(almaty.getUTCDate()).padStart(2, '0');
-  return `confirm_day:${channelId}:${y}-${m}-${d}`;
+  return `confirm_day:${channelId}:${almatyNow().ymd}`;
 }
 
 async function getChannelDayCount(env, channelId) {
@@ -1475,6 +1511,9 @@ function extractContactChannel(data, channelMap) {
     }
   }
 
+  // Прекомпилируем Set наших uuid для O(1) lookup по cuuid.
+  const knownUuids = new Set(map.values());
+
   // Сначала ищем связку на нашем канале (по channel_id из MH_CHANNELS).
   for (const x of candidates) {
     if (!x.uid || x.blocked) continue;
@@ -1485,7 +1524,7 @@ function extractContactChannel(data, channelMap) {
         userId: x.uid, lastMessageAt: x.lastMessageAt,
       };
     }
-    if (x.cuuid && Array.from(map.values()).includes(String(x.cuuid))) {
+    if (x.cuuid && knownUuids.has(String(x.cuuid))) {
       return {
         channelUuid: String(x.cuuid), channelId: x.cid != null ? Number(x.cid) : null,
         userId: x.uid, lastMessageAt: x.lastMessageAt,
@@ -1494,7 +1533,7 @@ function extractContactChannel(data, channelMap) {
   }
 
   // Связки есть, но НИ ОДНА не из MH_CHANNELS (например только Instagram).
-  // Это и есть «контакт на чужом канале» — шлём null, в mhSendByPhone лог.
+  // Это «контакт на чужом канале» — null, в mhSendByPhone отметится в логе.
   return null;
 }
 
