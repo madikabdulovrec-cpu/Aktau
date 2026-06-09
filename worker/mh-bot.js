@@ -295,12 +295,20 @@ const CONFIRM_TICK_MAX = 3;             // макс. отправок за од�
 const CONFIRM_TICK_PAUSE_MIN = 90000;   // 90 сек между сообщениями (минимум)
 const CONFIRM_TICK_PAUSE_MAX = 150000;  // 150 сек (с рандомом)
 const CONFIRM_PER_CHANNEL_HOURLY_MAX = 4; // потолок исходящих с одного канала в час
+// Дневной потолок на канал — глобальная страховка под официальную рекомендацию
+// message.help: «не более 300 сообщений в день — иначе риск блокировки за
+// жалобы на спам». Ставим консервативные 200, чтобы даже при ошибке в часовых
+// лимитах не выйти за пределы. По текущим часовым лимитам реально достижимо
+// 4×12 = 48/канал (или 2×12 = 24 для каналов с override). Это запас на случай
+// если параметры случайно расслабятся.
+const CONFIRM_PER_CHANNEL_DAILY_MAX = 200;
 const CONFIRM_COLD_DAYS = 30;           // клиент не писал ≥ N дней → не дёргаем
 // CONFIRM_SLOT_JITTER_HOURS — раньше использовался для +0..3ч jitter после
 // идеального слота. Убран 05.06.2026: jitter в БУДУЩЕЕ нарушал политику
 // студии «отмена за 24ч». Размазывание теперь обеспечивается shuffle +
 // темпом 90–150 сек + потолком 4/час на канал.
-const CONFIRM_HOUR_COUNTER_TTL = 7200;  // KV TTL счётчика «сколько ушло за час с канала»
+const CONFIRM_HOUR_COUNTER_TTL = 7200;   // KV TTL счётчика «сколько ушло за час с канала»
+const CONFIRM_DAY_COUNTER_TTL = 90000;   // KV TTL счётчика «сколько ушло за день с канала» (25ч)
 
 // ── Резолв канала ──────────────────────────────────────────────────────────
 // Project webhook message.help ловит сообщения со ВСЕХ каналов проекта (WhatsApp 1,
@@ -1104,7 +1112,8 @@ async function runConfirmationJob(env) {
     }
 
     const r = g.firstRecord;
-    const variant = Math.abs(Number(r.id) || 0) % 6;
+    // 3 шаблона текста — точно по правилу message.help «1–3 шаблона текста»
+    const variant = Math.abs(Number(r.id) || 0) % 3;
     const text = buildConfirmationText(g.partsList, variant);
 
     let sent = null;
@@ -1117,6 +1126,7 @@ async function runConfirmationJob(env) {
     if (!sent || !sent.ok) {
       if (sent && sent.reason === 'cold') coldCount++;
       else if (sent && sent.reason === 'hour_cap') capCount++;
+      else if (sent && sent.reason === 'day_cap') capCount++;
       continue;
     }
 
@@ -1136,9 +1146,10 @@ async function runConfirmationJob(env) {
     await env.BOT_KV.put(phoneDayKey, payload,
       { expirationTtl: CONFIRM_DEDUP_TTL });
 
-    // Инкремент часового счётчика на канале
+    // Инкремент часового и дневного счётчиков на канале
     if (sent.channelId != null) {
       await incChannelHourCount(env, sent.channelId);
+      await incChannelDayCount(env, sent.channelId);
     }
 
     // Ждём короткий ответ Да/Нет — pending по user_id канала. В записи
@@ -1184,6 +1195,28 @@ async function incChannelHourCount(env, channelId) {
   const cur = Number(await env.BOT_KV.get(key)) || 0;
   await env.BOT_KV.put(key, String(cur + 1),
     { expirationTtl: CONFIRM_HOUR_COUNTER_TTL });
+}
+
+// Дневной счётчик исходящих на канал — глобальная страховка под лимит
+// message.help «не более 300/день на номер».
+function channelDayKey(channelId) {
+  const almaty = new Date(Date.now() + ALMATY_UTC_OFFSET * 3600000);
+  const y = almaty.getUTCFullYear();
+  const m = String(almaty.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(almaty.getUTCDate()).padStart(2, '0');
+  return `confirm_day:${channelId}:${y}-${m}-${d}`;
+}
+
+async function getChannelDayCount(env, channelId) {
+  const v = await env.BOT_KV.get(channelDayKey(channelId));
+  return Number(v) || 0;
+}
+
+async function incChannelDayCount(env, channelId) {
+  const key = channelDayKey(channelId);
+  const cur = Number(await env.BOT_KV.get(key)) || 0;
+  await env.BOT_KV.put(key, String(cur + 1),
+    { expirationTtl: CONFIRM_DAY_COUNTER_TTL });
 }
 
 // Эффективный часовой потолок для канала: дефолт CONFIRM_PER_CHANNEL_HOURLY_MAX,
@@ -1319,6 +1352,20 @@ async function mhSendByPhone(env, phone, text) {
       console.log(`confirm: hour-cap ${resolved.channelId} (${used}/${cap}), `
         + `skip ${maskPhone(phone)}`);
       return { ok: false, reason: 'hour_cap' };
+    }
+  }
+
+  // Анти-бан #3: ДНЕВНОЙ потолок на канал. Глобальная страховка под
+  // официальную рекомендацию message.help «не более 300 в день на номер»;
+  // у нас лимит CONFIRM_PER_CHANNEL_DAILY_MAX (=200). По текущим часовым
+  // лимитам реально достижимо 24–48/день, дневной потолок защищает на
+  // случай ошибки в логике или ручной правки часовых лимитов.
+  if (resolved.channelId != null) {
+    const dayUsed = await getChannelDayCount(env, resolved.channelId);
+    if (dayUsed >= CONFIRM_PER_CHANNEL_DAILY_MAX) {
+      console.log(`confirm: day-cap ${resolved.channelId} `
+        + `(${dayUsed}/${CONFIRM_PER_CHANNEL_DAILY_MAX}), skip ${maskPhone(phone)}`);
+      return { ok: false, reason: 'day_cap' };
     }
   }
 
@@ -1471,10 +1518,11 @@ function parseKnownChannelMap(env) {
 
 // Текст подтверждения. partsList — список записей клиента на «завтра»
 // (если у него несколько процедур подряд, шлём ОДНО сообщение со всеми
-// временами). 6 микро-вариантов приветствия/интро/CTA + в половине случаев
-// без 2gis-ссылки. Вариант выбирается детерминированно по record_id mod 6.
+// временами). 3 микро-варианта приветствия/интро/CTA — точно по правилу
+// message.help «1–3 шаблона текста на рассылку». Вариант детерминирован
+// по record_id mod 3.
 function buildConfirmationText(partsList, variant) {
-  const v = ((Number(variant) || 0) % 6 + 6) % 6;
+  const v = ((Number(variant) || 0) % 3 + 3) % 3;
   // Совместимость: можно передать одну parts вместо массива
   const list = Array.isArray(partsList) ? partsList : [partsList];
 
@@ -1487,28 +1535,19 @@ function buildConfirmationText(partsList, variant) {
   const greet = [
     'Добрый день 🌷',
     'Здравствуйте 🌷',
-    'Добрый день!',
-    'Здравствуйте!',
     'Добрый день, M&M на связи ✨',
-    'Здравствуйте! M&M на связи',
   ][v];
 
   const intro = [
     'Это автоматическое напоминание о вашей записи. Если в данных будут неточности — ответьте, и менеджер всё уточнит.',
     'Напоминаем о вашей записи. Если в деталях что-то не так — просто напишите, исправим.',
     'Это напоминание о записи. Если детали не совпадают — ответьте сообщением, поправим.',
-    'Напоминаем о записи. Если в данных будут неточности — напишите, менеджер уточнит.',
-    'Автоматическое напоминание о записи. Если детали не совпадают — ответьте, разберёмся.',
-    'Это напоминание о вашей записи. Если в деталях есть неточность — напишите нам.',
   ][v];
 
   const ask = [
     'Подтвердите, пожалуйста, запись ❤️',
     'Подтвердите, пожалуйста, что придёте ❤️',
     'Подтвердите запись, пожалуйста',
-    'Подтвердите, пожалуйста, что вы будете',
-    'Будем ждать! Подтвердите, пожалуйста, запись',
-    'Подтвердите, пожалуйста, придёте?',
   ][v];
 
   const lines = [greet, '', intro, ''];
@@ -1550,7 +1589,7 @@ function buildConfirmationText(partsList, variant) {
     'При отмене менее чем за 24 часа предоплата/посещение сгорает.',
     '', 'M & M');
 
-  // Ссылка 2gis — только в 1 из 6 вариантов (~17%). Длинная URL в каждом
+  // Ссылка 2gis — только в 1 из 3 вариантов (~33%). Длинная URL в каждом
   // сообщении читается Meta как маркетинг и повышает шанс спам-флага. Адрес
   // и так есть в тексте — клиент найдёт по нему.
   if (v === 0) {
