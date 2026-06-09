@@ -1120,6 +1120,36 @@ async function fetchAltegioRecords(env, token, startDate, endDate) {
   return out;
 }
 
+// Доходные транзакции за период → выручка с разрезом курсы/услуги + привязка к записи.
+// sold_item_type: 'goods_transaction' (курсы/абонементы — обычно НЕ привязаны к записи-броне,
+// продаются на консультации) · 'service' (услуга — привязана к записи через record_id).
+async function fetchAltegioTransactions(env, token, from, to) {
+  const co = env.ALTEGIO_COMPANY_ID;
+  if (!co || !token) return null;
+  const H = altegioHeaders(token, env);
+  const byRecord = new Map();
+  let total = 0, goods = 0, service = 0, count = 0;
+  for (let page = 1; page <= 30; page++) {
+    let r;
+    try { r = await fetch(`${ALTEGIO_API}/transactions/${co}?start_date=${from}&end_date=${to}&count=200&page=${page}`, { headers: H }); }
+    catch (e) { console.error('altegio txn error:', e && e.message); break; }
+    if (!r.ok) { console.error('altegio txn:', r.status); break; }
+    const j = await r.json().catch(() => null);
+    const arr = (j && j.data) || [];
+    if (!Array.isArray(arr) || !arr.length) break;
+    for (const t of arr) {
+      const amt = Number(t.amount) || 0;
+      if (t.expense === 1 || amt <= 0) continue; // только доход (расходы/возвраты пропускаем)
+      total += amt; count++;
+      if (t.sold_item_type === 'goods_transaction') goods += amt;
+      else if (t.sold_item_type === 'service') service += amt;
+      if (t.record_id) byRecord.set(t.record_id, (byRecord.get(t.record_id) || 0) + amt);
+    }
+    if (arr.length < 200) break;
+  }
+  return { byRecord, total, goods, service, count };
+}
+
 // Карта user_id → имя администратора (кэш сутки). Фоллбэк — ADMIN_NAMES.
 async function fetchAltegioUsers(env, token) {
   try {
@@ -1144,7 +1174,8 @@ function isAutoCreator(name) {
 // Воронка по администраторам: оформленные записи и их доходимость.
 // attendance: 1=пришёл, -1=не пришёл/отмена, 0=ждёт, 2=подтвердил но не отмечен →
 // «дошёл»/«неявка» считаем ТОЛЬКО по 1/-1 (2 и 0 — ещё не разрешено, в «ждут»).
-function computeAdminFunnel(records, usersMap) {
+function computeAdminFunnel(records, usersMap, txn) {
+  const byRecord = (txn && txn.byRecord) || null;
   const by = new Map();
   const agg = { total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0 };
   const auto = { total: 0, attended: 0, noshow: 0, waiting: 0 };
@@ -1156,12 +1187,26 @@ function computeAdminFunnel(records, usersMap) {
     const uid = r.created_user_id || 0;
     const name = (usersMap && usersMap[uid]) || ADMIN_NAMES[uid] || (uid ? `#${uid}` : 'не указан');
     if (uid === 0 || isAutoCreator(name)) { auto.total++; auto[att]++; continue; }
-    if (!by.has(uid)) by.set(uid, { uid, name, total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0 });
+    if (!by.has(uid)) by.set(uid, { uid, name, total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0, revenue: 0, paidVisits: 0, paid: 0, priceFull: 0, pricePay: 0, paidSvc: 0, zeroSvc: 0, services: {} });
     const a = by.get(uid);
     a.total++; a[att]++;
     if (r.confirmed === 1) a.confirmed++;
+    // Выручка (привязанные оплаты по record_id) — реальные деньги за услуги этого админа.
+    if (byRecord) { const rv = byRecord.get(r.id) || 0; if (rv > 0) { a.revenue += rv; a.paidVisits++; } }
+    // Услуги записи: цена-прайс (first_cost) vs к оплате (cost_to_pay) → скидка; 0₸-записи.
+    const svcs = r.services || [];
+    a.priceFull += svcs.reduce((s, v) => s + (v.first_cost || v.cost || 0), 0);
+    a.pricePay += svcs.reduce((s, v) => s + (v.cost_to_pay || v.cost || 0), 0);
+    if (svcs.some((v) => (v.cost_to_pay || v.cost || 0) > 0)) { a.paidSvc++; if (r.paid_full === 1) a.paid++; }
+    else a.zeroSvc++;
+    for (const v of svcs) if (v.title) a.services[v.title] = (a.services[v.title] || 0) + 1;
   }
-  return { ...agg, admins: [...by.values()].sort((x, y) => y.total - x.total), auto };
+  for (const a of by.values()) {
+    a.topServices = Object.entries(a.services).sort((x, y) => y[1] - x[1]).slice(0, 3).map((e) => e[0]);
+    a.avgCheck = a.revenue && a.paidVisits ? Math.round(a.revenue / a.paidVisits) : null;
+    a.discount = a.priceFull > 0 ? Math.round((1 - a.pricePay / a.priceFull) * 100) : null;
+  }
+  return { ...agg, admins: [...by.values()].sort((x, y) => y.total - x.total), auto, money: txn || null };
 }
 
 const pct = (num, den) => (den > 0 ? Math.round((num / den) * 100) : null);
@@ -1169,6 +1214,7 @@ const pct = (num, den) => (den > 0 ? Math.round((num / den) * 100) : null);
 // Раздел «Администраторы» = низ воронки: записи → доходимость → неявка (только из Altegio).
 // Лиды/«сколько из лидов» живут в разделе «Отдел продаж» (Сверка лидов): записей много
 // больше лидов (повторные клиенты), поэтому «записи/лиды» — НЕ конверсия, не показываем.
+const fmtTg = (n) => Number(n || 0).toLocaleString('ru-RU'); // 12150270 → «12 150 270»
 function formatAdminReport(label, range, funnel) {
   const f = funnel;
   const lines = [`🗂 Отчёт «Администраторы» · ${label} (${ddmmFromDate(range.from)}–${ddmmFromDate(range.to)})`];
@@ -1181,13 +1227,26 @@ function formatAdminReport(label, range, funnel) {
   if (resolved === 0) lines.push(`Доходимость: — (все ${f.waiting} визитов ещё впереди)`);
   else if (f.waiting > resolved) lines.push(`Доходимость (по ${resolved} состоявшимся): ${reach}% · ещё ${f.waiting} впереди`);
   else lines.push(`Доходимость: ${reach}% · неявка ${100 - reach}%`);
-  // По администраторам (только люди).
+  // Деньги компании за период: курсы (товары) vs услуги.
+  if (f.money && f.money.total) {
+    lines.push(`💰 Выручка периода: ${fmtTg(f.money.total)}₸ (курсы ${pct(f.money.goods, f.money.total)}% · услуги ${pct(f.money.service, f.money.total)}%)`);
+  }
+  // По администраторам — расширенно (2–3 строки на каждого).
   if (f.admins.length) {
     lines.push('');
-    lines.push('По администраторам (записей · дошли/неявка · доходимость):');
+    lines.push('По администраторам:');
     for (const a of f.admins.slice(0, 10)) {
       const ar = pct(a.attended, a.attended + a.noshow);
-      lines.push(`• ${a.name} — ${a.total} зап · дошли ${a.attended}/неявка ${a.noshow} · ${ar != null ? ar + '%' : '—'}`);
+      lines.push(`• ${a.name} — ${a.total} зап · дошли ${a.attended}/неявка ${a.noshow} · доход. ${ar != null ? ar + '%' : '—'}`);
+      const money = [];
+      if (a.revenue) money.push(`💰 услуг ${fmtTg(a.revenue)}₸`);
+      if (a.avgCheck) money.push(`ср.чек ${fmtTg(a.avgCheck)}₸`);
+      if (a.discount != null) money.push(`скидка ${a.discount}%`);
+      if (money.length) lines.push(`   ${money.join(' · ')}`);
+      const extra = [];
+      if (a.zeroSvc) extra.push(`0₸-записей ${pct(a.zeroSvc, a.total)}%`);
+      if (a.topServices && a.topServices.length) extra.push(`топ: ${a.topServices.join(', ')}`);
+      if (extra.length) lines.push(`   ${extra.join(' · ')}`);
     }
   }
   // Авто/онлайн-запись (интеграции, не работа админа) — отдельной строкой, если есть.
@@ -1195,7 +1254,7 @@ function formatAdminReport(label, range, funnel) {
     lines.push(`🤖 Авто/онлайн-запись: ${f.auto.total} (дошли ${f.auto.attended}/неявка ${f.auto.noshow})`);
   }
   lines.push('');
-  lines.push('ℹ️ Записи — по дате оформления (вкл. повторных клиентов). «Ждут» = визит впереди или не отмечен в журнале.');
+  lines.push('ℹ️ Записи — по дате оформления (вкл. повторных). «Выручка услуг» — привязанные оплаты (часть транзакций); деньги за курс атрибутируются мастеру, не админу. «0₸» = консультации/отработка курса/услуга не проставлена. Скидка = прайс vs к оплате.');
   return lines.join('\n');
 }
 
@@ -1216,7 +1275,8 @@ async function buildAdminReport(env, period, now, custom) {
       + 'Altegio не отдал записи (нет прав/ошибка API). Нужен owner-токен с доступом к «Журналу записи».';
   }
   const usersMap = await fetchAltegioUsers(env, token);
-  const funnel = computeAdminFunnel(records, usersMap);
+  const txn = await fetchAltegioTransactions(env, token, range.from, range.to);
+  const funnel = computeAdminFunnel(records, usersMap, txn);
   return formatAdminReport(label, range, funnel);
 }
 
