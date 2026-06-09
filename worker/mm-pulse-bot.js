@@ -420,7 +420,14 @@ export default {
     // [DEBUG] метрики летней рассылки — GET ?broadcast=<DIGEST_SECRET>.
     if (env.DIGEST_SECRET && url.searchParams.get('broadcast') === env.DIGEST_SECRET) {
       const m = await computeBroadcastMetrics(env, Date.now());
-      return json({ ok: true, active: broadcastActive(Date.now()), ...m, broadcastByHour: Object.fromEntries(m.broadcastByHour) });
+      const preview = formatBroadcast(m, almatyParts(Date.now()));
+      return json({ ok: true, active: broadcastActive(Date.now()), ...m, broadcastByHour: Object.fromEntries(m.broadcastByHour), preview });
+    }
+
+    // Отправить ТОЛЬКО письмо по рассылке в чат сейчас (ops/тест) — GET ?broadcastsend=<DIGEST_SECRET>.
+    if (env.DIGEST_SECRET && url.searchParams.get('broadcastsend') === env.DIGEST_SECRET) {
+      await maybeSendBroadcast(env, Date.now());
+      return json({ ok: true, sent: 'broadcast' });
     }
 
     // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
@@ -649,6 +656,7 @@ async function runDigest(env, meta) {
         + `Тихо: 0 новых за час, все диалоги отвечены.\n`
         + `Всего за день: ${metrics.todayLeads} ${plural(metrics.todayLeads, ['обращение', 'обращения', 'обращений'])}, из них новых: ${metrics.newLeads}.`;
       await sendTelegram(env, text);
+      await maybeSendBroadcast(env, now); // отдельное письмо по летней рассылке
       console.log('[digest] quiet', { ...metricsSummary(metrics), ...meta });
       return { sent: 1, quiet: true, ...metricsSummary(metrics) };
     }
@@ -658,6 +666,7 @@ async function runDigest(env, meta) {
       ? formatFinal(metrics, parts, smart)
       : formatIntermediate(metrics, parts, smart);
     await sendTelegram(env, text);
+    await maybeSendBroadcast(env, now); // отдельное письмо по летней рассылке
     // В «Итоге дня» — сохраняем лёгкий снимок дня для отчётов за неделю/месяц/период.
     if (isFinal) {
       try { await saveDailySnapshot(env, await buildDailySnapshot(env, now)); }
@@ -857,12 +866,11 @@ function medianMinutes(diffsMs) {
 // Метрики рассылки за день: отправки, шаблоны, темп по часам, ответы (24ч),
 // конверсия, брони после рассылки (Altegio, +72ч), риск-сигналы в ответах.
 async function computeBroadcastMetrics(env, now) {
-  // События за сегодня + вчера (24ч-окно ответов и часть отправок могут пересекать полночь).
+  // Только сегодняшний бакет: «отправлено сегодня» без 2-дневного двойного счёта;
+  // ответы на сегодняшние отправки приходят в этот же бакет.
   const seen = new Set(); const events = [];
-  for (const ds of [almatyDateStr(now), almatyDateStr(now - 86400000)]) {
-    const raw = (await env.PULSE_KV.get(`events:${ds}`, { type: 'json' })) || [];
-    for (const e of raw) { if (!e || !e.dialog_id) continue; if (e.message_id) { if (seen.has(e.message_id)) continue; seen.add(e.message_id); } events.push(e); }
-  }
+  const raw = (await env.PULSE_KV.get(`events:${almatyDateStr(now)}`, { type: 'json' })) || [];
+  for (const e of raw) { if (!e || !e.dialog_id) continue; if (e.message_id) { if (seen.has(e.message_id)) continue; seen.add(e.message_id); } events.push(e); }
 
   // 1) Отправки рассылки: оператор + канал 20916 + текст-префикс.
   const sends = events.filter((e) => e.direction === 'operator'
@@ -931,6 +939,44 @@ async function computeBroadcastMetrics(env, now) {
 // Блок рассылки виден только в период акции (по дате Алматы).
 function broadcastActive(now) {
   return almatyDateStr(now) <= BROADCAST_END_DATE;
+}
+
+// Отдельное письмо в чат по рассылке (НЕ врезка в пульс — по просьбе заказчика).
+function formatBroadcast(m, parts) {
+  const lines = [];
+  // Критичный риск (≥3 жалоб за час) — баннером в начало письма.
+  if (m.broadcastRisks && m.broadcastRisks.critical) {
+    lines.push(`🚨 РИСК РАССЫЛКИ: ${m.broadcastRisks.count} жалоб/сигналов за короткое время!`);
+    for (const r of m.broadcastRisks.list.slice(0, 5)) lines.push(`• ${contactLabel({ phone: r.phone, name: r.name })}: «${r.text}»`);
+    lines.push('');
+  }
+  lines.push(`📣 Летняя рассылка «Экспресс-программы» · ${parts.hhmm} · ${parts.ddmm}`);
+  const t = m.broadcastByTemplate;
+  lines.push(`📤 Отправлено сегодня: ${m.broadcastSent} · 🔥A ${t.A} · 🌷B ${t.B} · 🌸C ${t.C}`);
+  if (m.broadcastByHour && m.broadcastByHour.size) {
+    const hrs = [...m.broadcastByHour.entries()].sort((a, b) => a[0] - b[0]).map(([h, n]) => `${h}ч·${n}`).join(' ');
+    lines.push(`🕐 Темп: ${hrs}`);
+  }
+  lines.push(`💬 Ответили: ${m.broadcastReplies} (${Math.round(m.broadcastConversionRate * 100)}%) · 🗓 Броней: ${m.broadcastBookings}`);
+  // Некритичные риски — строкой со списком; ноль — спокойная отметка.
+  if (!m.broadcastRisks.critical) {
+    if (m.broadcastRisks.count) {
+      lines.push(`⚠️ Рисков: ${m.broadcastRisks.count}`);
+      for (const r of m.broadcastRisks.list.slice(0, 3)) lines.push(`• ${contactLabel({ phone: r.phone, name: r.name })}: «${r.text}»`);
+    } else {
+      lines.push('✅ Рисков: 0 — жалоб нет');
+    }
+  }
+  return lines.join('\n');
+}
+
+// Шлёт отдельное письмо по рассылке, если акция активна и сегодня были отправки.
+async function maybeSendBroadcast(env, now) {
+  if (!broadcastActive(now)) return;
+  try {
+    const m = await computeBroadcastMetrics(env, now);
+    if (m.broadcastSent > 0) await sendTelegram(env, formatBroadcast(m, almatyParts(now)));
+  } catch (e) { console.error('[broadcast] send failed:', e && e.message); }
 }
 
 /* ============================================================
