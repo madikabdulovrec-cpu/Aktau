@@ -355,6 +355,135 @@ const CONFIRM_COLD_DAYS = 30;           // клиент не писал ≥ N д
 const CONFIRM_HOUR_COUNTER_TTL = 7200;   // KV TTL счётчика «сколько ушло за час с канала»
 const CONFIRM_DAY_COUNTER_TTL = 90000;   // KV TTL счётчика «сколько ушло за день с канала» (25ч)
 
+// ── РАССЫЛКА (broadcast) ──────────────────────────────────────────────────
+// Запускается только при env.BROADCAST_ACTIVE === '1'. Шлёт строго через
+// WA2 (channel 20916) клиентам Altegio с активной перепиской ≤90 дней.
+const BROADCAST_CHANNEL_ID = 20916;
+const BROADCAST_CHANNEL_UUID = '71608151-e312-48d2-b103-524c8b2e146e';
+const BROADCAST_PER_HOUR = 30;            // hard cap в час
+const BROADCAST_TICK_MAX = 8;             // макс. отправок за один cron-tick (15 мин)
+const BROADCAST_TICK_PAUSE_MIN = 90000;   // 90 сек минимум
+const BROADCAST_TICK_PAUSE_MAX = 120000;  // 120 сек максимум
+const BROADCAST_COLD_DAYS = 90;           // не дёргаем кто молчит >90 дней
+const BROADCAST_END_HOUR = 21;            // до 21:00 Almaty
+const BROADCAST_DEDUP_TTL = 2592000;      // 30 дней — один номер не задвоится
+const BROADCAST_BASE_CACHE_TTL = 21600;   // 6 ч — кеш базы из Altegio
+const BROADCAST_HOUR_COUNTER_TTL = 7200;  // KV TTL часового счётчика broadcast
+
+// Три шаблона текста (ротация по часу). Цены/составы/срок идентичны во всех
+// трёх, отличаются стилистика, приветствие, эмодзи-маркеры — чтобы Meta не
+// видела одинаковый шаблон у разных получателей.
+const BROADCAST_TEMPLATES = [
+  // ── Шаблон 1 (близко к исходнику) ──
+`🔥 Летние экспресс-программы M&M 🔥
+
+Всего 5 посещений — и видимые изменения этим летом уже к зеркалу.
+
+✨ Экспресс «Антицеллюлит»
+Подойдёт, если беспокоят:
+✔️ целлюлит
+✔️ рыхлость кожи
+✔️ снижение тонуса тканей
+
+В программу входит:
+✅ ручной антицеллюлитный массаж
+✅ мадеротерапия
+✅ вакуумный массаж
+✅ турбо-массаж
+✅ 3D-моделирование тела
+
+5 посещений по 1,5 часа.
+67 000 тг вместо 107 000 тг
+
+✨ Экспресс «Антиотёк»
+Подойдёт при:
+✔️ отёчности
+✔️ тяжести в ногах
+✔️ лишних объёмах
+✔️ ощущении «налитого» тела
+
+В программу входит:
+✅ INDIBA + прессотерапия
+✅ LPG + Roll Shaper
+✅ лимфокоррекция
+✅ биботинг + Impuls
+✅ термоодеяло + торнадо
+
+5 посещений по 2 часа.
+75 000 тг вместо 172 500 тг
+
+✨ Экспресс «Плоский живот»
+Подойдёт, если беспокоят:
+✔️ выпирающий живот
+✔️ бока
+✔️ отсутствие талии
+✔️ локальные жировые отложения
+
+В программу входит:
+✅ дефляция живота
+✅ криолиполиз
+✅ липокоррекция
+✅ медовый массаж + биботинг + турбо-массаж
+✅ вакуумная кавитация + 3D-моделирование
+
+5 посещений по 1,5 часа.
+95 000 тг вместо 203 500 тг
+
+🎁 Каждому участнику в подарок:
+✔️ анализ состава тела
+✔️ персональные рекомендации специалиста
+
+⚡ Предложение действует до 15 июня`,
+
+  // ── Шаблон 2 (деловой) ──
+`Здравствуйте 🌷
+
+В M&M стартовали летние экспресс-программы — 5 посещений, чтобы уже к концу июня почувствовать лёгкость и заметить разницу в зеркале.
+
+🟢 «Антицеллюлит»
+Работаем с целлюлитом, рыхлостью кожи и сниженным тонусом.
+Внутри: ручной антицеллюлитный массаж, мадеротерапия, вакуумный массаж, турбо-массаж, 3D-моделирование тела.
+5 визитов × 1,5 часа → 67 000 ₸ (вместо 107 000 ₸)
+
+🟢 «Антиотёк»
+Для тех, у кого тяжесть в ногах, отёки, лишний объём, ощущение «налитого» тела.
+Внутри: INDIBA + прессотерапия, LPG + Roll Shaper, лимфокоррекция, биботинг + Impuls, термоодеяло + торнадо.
+5 визитов × 2 часа → 75 000 ₸ (вместо 172 500 ₸)
+
+🟢 «Плоский живот»
+Если беспокоит выпирающий живот, бока, размытая талия и локальные жировые отложения.
+Внутри: дефляция живота, криолиполиз, липокоррекция, медовый массаж + биботинг + турбо-массаж, вакуумная кавитация + 3D-моделирование.
+5 визитов × 1,5 часа → 95 000 ₸ (вместо 203 500 ₸)
+
+🎁 Бонусом каждому участнику: анализ состава тела + персональные рекомендации специалиста.
+
+⏳ Записаться можно до 15 июня`,
+
+  // ── Шаблон 3 (тёплый) ──
+`Добрый день 🌸
+
+В M&M открыли набор на летние экспресс-программы. Короткий формат из 5 посещений — чтобы войти в лето в комфортной форме без долгих курсов.
+
+🌿 «Антицеллюлит»
+Если волнуют целлюлит, рыхлость кожи, снижение тонуса.
+Что делаем: ручной антицеллюлитный массаж, мадеротерапия, вакуумный массаж, турбо-массаж, 3D-моделирование тела.
+5 визитов по 1,5 часа — 67 000 тг (вместо 107 000 тг).
+
+🌿 «Антиотёк»
+Если знакомы отёчность, тяжесть в ногах, лишние объёмы и ощущение «налитого» тела.
+Что делаем: INDIBA + прессотерапия, LPG + Roll Shaper, лимфокоррекция, биботинг + Impuls, термоодеяло + торнадо.
+5 визитов по 2 часа — 75 000 тг (вместо 172 500 тг).
+
+🌿 «Плоский живот»
+Если хочется убрать выпирающий живот, бока, вернуть талию и поработать с локальными жировыми отложениями.
+Что делаем: дефляция живота, криолиполиз, липокоррекция, медовый массаж + биботинг + турбо-массаж, вакуумная кавитация + 3D-моделирование.
+5 визитов по 1,5 часа — 95 000 тг (вместо 203 500 тг).
+
+🎁 Дополнительно каждому: анализ состава тела и персональные рекомендации специалиста.
+
+⚡ Успейте записаться до 15 июня`,
+];
+
 // ── Резолв канала ──────────────────────────────────────────────────────────
 // Project webhook message.help ловит сообщения со ВСЕХ каналов проекта
 // (WhatsApp 1, WhatsApp 2, Instagram, …). Мы обслуживаем только те, что
@@ -415,12 +544,14 @@ export default {
     return json({ ok: true });
   },
 
-  // Cron-handler: подтверждение записей за ~24 часа.
-  // Триггер `*/30 * * * *` из wrangler-mh-bot.toml. Внутри сам себя пропускает
-  // вне дневного окна (09:00–20:59 по Алматы). Запускается параллельно с fetch.
+  // Cron-handler. Триггер `*/15 * * * *` запускает оба job'a параллельно;
+  // каждый сам пропускает «не свой» тик (confirmation — каждые 30 мин,
+  // broadcast — каждый тик пока BROADCAST_ACTIVE=1).
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runConfirmationJob(env).catch((e) =>
       console.error('confirmation job failed:', e && e.message)));
+    ctx.waitUntil(runBroadcastJob(env).catch((e) =>
+      console.error('broadcast job failed:', e && e.message)));
   },
 };
 
@@ -979,6 +1110,9 @@ async function runConfirmationJob(env) {
     console.log(`confirm: outside window (h=${now.hour}), skip`);
     return;
   }
+  // Cron теперь */15 (broadcast'у нужна частота), но confirmation хочет */30:
+  // запускаемся только на минутах 0 и 30.
+  if (now.minute !== 0 && now.minute !== 30) return;
 
   const tomorrowStr = ymdDaysAhead(now, 1);
   const records = await fetchTomorrowRecordsSafe(env, tomorrowStr);
@@ -1771,6 +1905,280 @@ function shuffleInPlace(arr) {
     const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
   }
   return arr;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// РАССЫЛКА (BROADCAST)
+// Активируется через env.BROADCAST_ACTIVE='1'. Шлёт акции по базе активных
+// клиентов Altegio строго через WA2 (channel 20916). Темплейты ротируются
+// по часу. Полностью отдельный поток от confirmation: свой dedup, свой
+// часовой счётчик, свой sleep.
+// ════════════════════════════════════════════════════════════════════════════
+
+async function runBroadcastJob(env) {
+  if (env.BROADCAST_ACTIVE !== '1') return;
+  if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) {
+    console.log('broadcast: message.help not configured, skip');
+    return;
+  }
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
+    || !env.ALTEGIO_COMPANY_ID) {
+    console.log('broadcast: altegio not configured, skip');
+    return;
+  }
+
+  const now = almatyNow();
+  if (now.hour >= BROADCAST_END_HOUR) {
+    console.log(`broadcast: ended (h=${now.hour} >= ${BROADCAST_END_HOUR})`);
+    return;
+  }
+  if (now.hour < CONFIRM_HOUR_START) {
+    console.log(`broadcast: before start (h=${now.hour})`);
+    return;
+  }
+
+  // startedAt — записываем в KV при первом tick'е дня
+  const startedKey = `broadcast:started:${now.ymd}`;
+  let startedAt = await env.BOT_KV.get(startedKey);
+  if (!startedAt) {
+    startedAt = new Date(now.ms).toISOString();
+    await env.BOT_KV.put(startedKey, startedAt, { expirationTtl: 90000 });
+    console.log(`broadcast: started at ${startedAt} (Almaty ${now.ymd} ${now.hour}:${String(now.minute).padStart(2,'0')})`);
+  }
+  const startedMs = new Date(startedAt).getTime();
+  const hoursSinceStart = Math.floor((now.ms - startedMs) / 3600000);
+  const templateIdx = ((hoursSinceStart % 3) + 3) % 3;
+
+  // Часовой счётчик — hard cap 30/час
+  const hourKey = `broadcast_hour:${now.ymdh}`;
+  const hourUsed = Number(await env.BOT_KV.get(hourKey)) || 0;
+  if (hourUsed >= BROADCAST_PER_HOUR) {
+    console.log(`broadcast: hour cap reached (${hourUsed}/${BROADCAST_PER_HOUR}) at h=${now.hour}`);
+    return;
+  }
+  const remainingThisHour = BROADCAST_PER_HOUR - hourUsed;
+  const tickQuota = Math.min(BROADCAST_TICK_MAX, remainingThisHour);
+
+  // База клиентов Altegio (кеш в KV на 6ч)
+  const base = await fetchBroadcastBase(env);
+  if (!base || !base.length) {
+    console.log('broadcast: empty base, skip');
+    return;
+  }
+
+  const token = await getMhToken(env);
+  if (!token) {
+    console.error('broadcast: no MH token');
+    return;
+  }
+
+  shuffleInPlace(base);
+  const text = BROADCAST_TEMPLATES[templateIdx];
+
+  let sent = 0;
+  let dedupSkip = 0;
+  let noContactSkip = 0;
+  let coldSkip = 0;
+  let pendingSkip = 0;
+  let opSkip = 0;
+
+  for (const client of base) {
+    if (sent >= tickQuota) break;
+
+    const phone = normalizePhone(client.phone);
+    if (!phone) continue;
+
+    if (await env.BOT_KV.get(`broadcast_sent:${phone}`)) { dedupSkip++; continue; }
+
+    const resolved = await mhResolveContactStrict(env, token, phone,
+      BROADCAST_CHANNEL_ID, BROADCAST_CHANNEL_UUID);
+    if (!resolved) { noContactSkip++; continue; }
+
+    // Фильтр холодных (>90 дней без сообщений)
+    if (resolved.lastMessageAt) {
+      const last = parseAltegioParts(resolved.lastMessageAt);
+      const lastMs = last ? partsToAlmatyMs(last) : null;
+      if (lastMs && (Date.now() - lastMs) > BROADCAST_COLD_DAYS * 86400000) {
+        coldSkip++;
+        continue;
+      }
+    }
+
+    // Не лезем в чат, где клиент ждёт ответ на подтверждение
+    if (await env.BOT_KV.get(`confirm_pending:user:${resolved.userId}`)) {
+      pendingSkip++;
+      continue;
+    }
+    // Не лезем в чат, где менеджер уже работает
+    if (await env.BOT_KV.get(`op:${resolved.userId}`)) {
+      opSkip++;
+      continue;
+    }
+
+    const ok = await mhSendDirect(env, token,
+      BROADCAST_CHANNEL_UUID, resolved.userId, text);
+    if (!ok) {
+      console.error(`broadcast: send failed phone=${maskPhone(phone)}`);
+      continue;
+    }
+
+    sent++;
+    await env.BOT_KV.put(`broadcast_sent:${phone}`, JSON.stringify({
+      sentAt: new Date().toISOString(),
+      templateIdx, userId: resolved.userId,
+    }), { expirationTtl: BROADCAST_DEDUP_TTL });
+    await env.BOT_KV.put(hourKey, String(hourUsed + sent),
+      { expirationTtl: BROADCAST_HOUR_COUNTER_TTL });
+
+    if (sent < tickQuota) {
+      await sleep(BROADCAST_TICK_PAUSE_MIN
+        + Math.floor(Math.random()
+          * (BROADCAST_TICK_PAUSE_MAX - BROADCAST_TICK_PAUSE_MIN)));
+    }
+  }
+
+  console.log(`broadcast tick: base=${base.length}, h=${now.hour}:${String(now.minute).padStart(2,'0')}, `
+    + `template=${templateIdx + 1}, hour_used=${hourUsed + sent}/${BROADCAST_PER_HOUR}, `
+    + `this_tick=${sent}, dedup=${dedupSkip}, no_contact=${noContactSkip}, `
+    + `cold=${coldSkip}, pending=${pendingSkip}, op=${opSkip}`);
+}
+
+// Выгрузка активной базы клиентов из Altegio с кешем в KV на BASE_CACHE_TTL.
+// Берём всех у кого visit_count > 0 и есть телефон. Источник: clients/search
+// с пагинацией. Один tick загружает базу за ~10-30 сек, потом 6ч из кеша.
+async function fetchBroadcastBase(env) {
+  const cacheKey = `broadcast:base:${almatyNow().ymd}`;
+  const cached = await env.BOT_KV.get(cacheKey, { type: 'json' });
+  if (cached && Array.isArray(cached) && cached.length) return cached;
+
+  const out = [];
+  for (let page = 1; page <= 30; page++) {
+    const url = `${ALTEGIO_API}/company/${env.ALTEGIO_COMPANY_ID}/clients/search`;
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: altegioHeaders(env),
+        body: JSON.stringify({
+          page,
+          page_size: 200,
+          fields: ['id', 'phone', 'name', 'visit_count', 'last_visit_date'],
+          filters: [],
+        }),
+      });
+    } catch (e) {
+      console.error(`broadcast base page ${page}:`, e && e.message);
+      break;
+    }
+    if (!res.ok) {
+      console.error(`broadcast base page ${page}: HTTP ${res.status}`);
+      break;
+    }
+    const data = await res.json().catch(() => null);
+    const list = (data && data.data) || [];
+    if (!list.length) break;
+    for (const c of list) {
+      if (!c || !c.phone) continue;
+      if (Number(c.visit_count) === 0) continue;
+      out.push({ phone: c.phone, name: c.name });
+    }
+    if (list.length < 200) break;
+  }
+
+  console.log(`broadcast: base fetched ${out.length} clients`);
+  await env.BOT_KV.put(cacheKey, JSON.stringify(out),
+    { expirationTtl: BROADCAST_BASE_CACHE_TTL });
+  return out;
+}
+
+// Строгий резолв контакта по телефону: ТОЛЬКО на канале BROADCAST_CHANNEL_ID.
+// Если клиент на нём не писал — возвращает null (не открываем новый чат).
+async function mhResolveContactStrict(env, token, phone,
+  targetChannelId, targetChannelUuid) {
+  let res;
+  try {
+    res = await fetch(
+      `${MH_API}/app/projects/${env.MH_PROJECT_ID}/contacts/contact_by_phone`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`,
+          'content-type': 'application/json' },
+        body: JSON.stringify({ phone, need_create: false }),
+      });
+  } catch (e) {
+    console.error('broadcast contact_by_phone:', e && e.message);
+    return null;
+  }
+  if (!res.ok) {
+    if (res.status === 404 || res.status === 400) return null;
+    console.error(`broadcast contact_by_phone ${res.status}:`,
+      (await res.text()).slice(0, 200));
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  if (!data) return null;
+  const c = data.data || data;
+  if (!c) return null;
+
+  for (const list of [c.users, c.channels, c.channel_links, c.contact_channels]) {
+    if (!Array.isArray(list)) continue;
+    for (const x of list) {
+      if (!x) continue;
+      const uid = x.user_id || x.id;
+      const cid = x.channel_id;
+      if (!uid) continue;
+      if (Number(cid) !== Number(targetChannelId)) continue;
+      if (x.blocked) continue;
+      return {
+        channelUuid: targetChannelUuid,
+        channelId: Number(targetChannelId),
+        userId: uid,
+        lastMessageAt: x.last_message || null,
+      };
+    }
+  }
+  return null;
+}
+
+// Прямая отправка в message.help send_message без cold-фильтра / hour-cap.
+// Эти проверки делает runBroadcastJob выше — нам нужен «тонкий» send.
+async function mhSendDirect(env, token, channelUuid, userId, text) {
+  const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
+    + `/channels/${channelUuid}/send_message/${userId}`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let res;
+    try {
+      const form = new FormData();
+      form.append('text', text);
+      form.append('destination', 'from_operator');
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+    } catch (e) {
+      console.error('broadcast send fetch:', e && e.message);
+      await sleep(500 * (attempt + 1));
+      continue;
+    }
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      const sentId = data && data.data && data.data.id;
+      if (sentId) {
+        await env.BOT_KV.put(`sent:${sentId}`, '1',
+          { expirationTtl: SENT_TTL });
+      }
+      return true;
+    }
+    if (res.status !== 429 && res.status < 500) {
+      console.error(`broadcast send ${res.status}:`,
+        (await res.text()).slice(0, 200));
+      return false;
+    }
+    const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+    await sleep(retryAfter ? retryAfter * 1000 : 600 * (attempt + 1));
+  }
+  return false;
 }
 
 // ── Утилиты ────────────────────────────────────────────────────────────────
