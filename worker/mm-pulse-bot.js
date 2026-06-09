@@ -171,6 +171,29 @@ const LOGISTICS_HINT = /опазд|задерж|выезжа|уже\s*еду|\b�
 // этого («да»/«хорошо») = согласие на запись, а НЕ закрытие диалога (ответ нужен).
 const BOOKING_ASK = /записыва|запиш|запис[аыо]|удобн|когда\s*вам|во\s*сколько|какой\s*день|како[ей]\s*врем|подойд[её]т\s*ли/i;
 
+// ── Летняя акция «Экспресс-программы M&M» (рассылка mh-bot, до 15.06.2026) ────
+// Мониторим рассылку в отчётах пульса: отправки, ответы, брони, риски (жалобы/спам).
+// Сообщение рассылки в потоке: channel_id 20916 + destination from_operator (у нас
+// direction='operator') + текст начинается с одного из трёх префиксов-шаблонов.
+const BROADCAST_CHANNEL = 20916;            // «Новый канал WhatsApp» (WA2, 77003131515)
+const BROADCAST_END_DATE = '2026-06-15';    // после этой даты (Алматы) блок в отчёте скрывается
+const BROADCAST_PREFIXES = [
+  '🔥 Летние экспресс-программы M&M',                                    // A
+  'Здравствуйте 🌷\n\nВ M&M стартовали летние экспресс-программы',        // B
+  'Добрый день 🌸\n\nВ M&M открыли набор на летние экспресс-программы',   // C
+];
+// Сигналы риска в ответах клиентов на рассылку (жалоба/спам/«откуда номер»…).
+const BROADCAST_RISK = /(спам|не пишите|удалите|откуда (у вас )?мой номер|отписать|жалоб|это что|зачем)/iu;
+function isBroadcastMessage(text) {
+  const s = String(text || '').trimStart();
+  return BROADCAST_PREFIXES.some((p) => s.startsWith(p));
+}
+function broadcastTemplate(text) {
+  const s = String(text || '').trimStart();
+  const i = BROADCAST_PREFIXES.findIndex((p) => s.startsWith(p));
+  return i < 0 ? null : ['A', 'B', 'C'][i];
+}
+
 // Для дайджеста обязательны. KV и MH_* проверяются отдельно по месту.
 const REQUIRED_ENV = ['ANTHROPIC_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
 
@@ -392,6 +415,12 @@ export default {
       return json({ ok: true, from: range.from, to: range.to, fetched: records.length, users: Object.keys(usersMap).length,
         funnel: { total: funnel.total, attended: funnel.attended, noshow: funnel.noshow, waiting: funnel.waiting, confirmed: funnel.confirmed },
         admins: funnel.admins.map((a) => ({ name: a.name, total: a.total, attended: a.attended, noshow: a.noshow })) });
+    }
+
+    // [DEBUG] метрики летней рассылки — GET ?broadcast=<DIGEST_SECRET>.
+    if (env.DIGEST_SECRET && url.searchParams.get('broadcast') === env.DIGEST_SECRET) {
+      const m = await computeBroadcastMetrics(env, Date.now());
+      return json({ ok: true, active: broadcastActive(Date.now()), ...m, broadcastByHour: Object.fromEntries(m.broadcastByHour) });
     }
 
     // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
@@ -819,6 +848,89 @@ function medianMinutes(diffsMs) {
   const mid = Math.floor(arr.length / 2);
   const med = arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
   return Math.max(1, Math.round(med / 60000));
+}
+
+/* ============================================================
+ * ЛЕТНЯЯ РАССЫЛКА — мониторинг акции «Экспресс-программы M&M» (до 15.06.2026)
+ * ============================================================ */
+
+// Метрики рассылки за день: отправки, шаблоны, темп по часам, ответы (24ч),
+// конверсия, брони после рассылки (Altegio, +72ч), риск-сигналы в ответах.
+async function computeBroadcastMetrics(env, now) {
+  // События за сегодня + вчера (24ч-окно ответов и часть отправок могут пересекать полночь).
+  const seen = new Set(); const events = [];
+  for (const ds of [almatyDateStr(now), almatyDateStr(now - 86400000)]) {
+    const raw = (await env.PULSE_KV.get(`events:${ds}`, { type: 'json' })) || [];
+    for (const e of raw) { if (!e || !e.dialog_id) continue; if (e.message_id) { if (seen.has(e.message_id)) continue; seen.add(e.message_id); } events.push(e); }
+  }
+
+  // 1) Отправки рассылки: оператор + канал 20916 + текст-префикс.
+  const sends = events.filter((e) => e.direction === 'operator'
+    && Number(e.channel_id) === BROADCAST_CHANNEL && isBroadcastMessage(e.text));
+  const broadcastByTemplate = { A: 0, B: 0, C: 0 };
+  const broadcastByHour = new Map();
+  const sendByDialog = new Map();   // dialog_id → самая ранняя ts отправки
+  const phoneByDialog = new Map();  // dialog_id → телефон получателя (последние 10 цифр)
+  const norm = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 10 ? d.slice(-10) : ''; };
+  for (const s of sends) {
+    const t = broadcastTemplate(s.text); if (t) broadcastByTemplate[t]++;
+    const h = almatyParts(s.ts).hour; broadcastByHour.set(h, (broadcastByHour.get(h) || 0) + 1);
+    if (!sendByDialog.has(s.dialog_id) || s.ts < sendByDialog.get(s.dialog_id)) sendByDialog.set(s.dialog_id, s.ts);
+    const ph = norm(s.phone); if (ph) phoneByDialog.set(s.dialog_id, ph);
+  }
+  const broadcastSent = sends.length;
+
+  // 2) Ответы клиентов в диалог рассылки в течение 24ч после отправки (1 диалог = 1 ответ).
+  const repliedDialogs = new Set();
+  const risks = [];
+  for (const e of events) {
+    if (e.direction !== 'client' || Number(e.channel_id) !== BROADCAST_CHANNEL) continue;
+    const sendTs = sendByDialog.get(e.dialog_id);
+    if (sendTs == null || e.ts < sendTs || e.ts > sendTs + 24 * 3600 * 1000) continue;
+    repliedDialogs.add(e.dialog_id);
+    const ph = norm(e.phone); if (ph && !phoneByDialog.has(e.dialog_id)) phoneByDialog.set(e.dialog_id, ph);
+    if (BROADCAST_RISK.test(e.text || '')) {
+      risks.push({ name: e.contact_name || '', phone: e.phone || '', text: String(e.text || '').slice(0, 100), hour: almatyParts(e.ts).hour });
+    }
+  }
+  const broadcastReplies = repliedDialogs.size;
+  const broadcastConversionRate = broadcastSent ? broadcastReplies / broadcastSent : 0;
+
+  // Риск критичен, если ≥3 матчей за один час.
+  const riskByHour = new Map();
+  for (const r of risks) riskByHour.set(r.hour, (riskByHour.get(r.hour) || 0) + 1);
+  const riskCritical = [...riskByHour.values()].some((c) => c >= 3);
+
+  // 3) Брони после рассылки: Altegio-запись, телефон получателя, create_date в (отправка, +72ч].
+  const sendTsByPhone = new Map();
+  for (const [dialog, ts] of sendByDialog) { const ph = phoneByDialog.get(dialog); if (ph) { if (!sendTsByPhone.has(ph) || ts < sendTsByPhone.get(ph)) sendTsByPhone.set(ph, ts); } }
+  let broadcastBookings = 0;
+  if (sendTsByPhone.size) {
+    const token = await altegioUserToken(env);
+    if (token) {
+      const recs = await fetchAltegioRecords(env, token, almatyDateStr(now - 4 * 86400000), almatyDateStr(now));
+      const booked = new Set();
+      for (const r of (recs || [])) {
+        const ph = norm(r.client && r.client.phone); if (!ph) continue;
+        const sendTs = sendTsByPhone.get(ph); if (sendTs == null) continue;
+        const created = parseTs(r.create_date);
+        if (created > sendTs && created <= sendTs + 72 * 3600 * 1000) booked.add(ph);
+      }
+      broadcastBookings = booked.size;
+    }
+  }
+
+  return {
+    broadcastSent, broadcastByTemplate, broadcastByHour,
+    broadcastReplies, broadcastConversionRate, broadcastBookings,
+    broadcastRisks: { count: risks.length, critical: riskCritical, list: risks.map(({ name, phone, text }) => ({ name, phone, text })) },
+    phoneCoverage: { known: sendTsByPhone.size, total: sendByDialog.size }, // диагностика покрытия телефонов для броней
+  };
+}
+
+// Блок рассылки виден только в период акции (по дате Алматы).
+function broadcastActive(now) {
+  return almatyDateStr(now) <= BROADCAST_END_DATE;
 }
 
 /* ============================================================
