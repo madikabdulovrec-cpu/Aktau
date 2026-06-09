@@ -162,6 +162,9 @@ const SPAM_HINT = /2\s?гис|\b2gis\b|напишем[^?\n]{0,15}отзыв|на
 const BOOKING_CONFIRM = /вы\s*записаны|подтвердите[^?\n]{0,15}запис|жд[её]м\s*вас|ваша\s*запись|вы\s*записан\b/i;
 // Бытовое сообщение записанного клиента (опаздываю/подтверждаю/еду) — не потерянный лид.
 const LOGISTICS_HINT = /опазд|задерж|выезжа|уже\s*еду|\bеду\b|буду\s*(через|позже)|подтвержда|приду|подъед|договорил|спасиб|хорошо|\bок\b/i;
+// Оператор предложил записаться / спросил время — короткое согласие клиента после
+// этого («да»/«хорошо») = согласие на запись, а НЕ закрытие диалога (ответ нужен).
+const BOOKING_ASK = /записыва|запиш|запис[аыо]|удобн|когда\s*вам|во\s*сколько|какой\s*день|како[ей]\s*врем|подойд[её]т\s*ли/i;
 
 // Для дайджеста обязательны. KV и MH_* проверяются отдельно по месту.
 const REQUIRED_ENV = ['ANTHROPIC_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
@@ -410,10 +413,9 @@ async function recordEvent(body, env) {
     return;
   }
 
-  // [DEBUG] сырой webhook — убрать после диагностики формата на проде.
-  console.log('RAW_WEBHOOK ' + JSON.stringify(body).slice(0, 1200));
-
   // [DEBUG] захват сырых вебхуков в KV для диагностики (включается DEBUG_RAW=1).
+  // Раньше тут был безусловный console.log полного вебхука — убран: писал PII всех
+  // клиентов (текст+телефон) в логи на каждый запрос. Нужна диагностика — DEBUG_RAW=1.
   if (env.DEBUG_RAW === '1') {
     try {
       const p = (body && body.payload) || {};
@@ -444,12 +446,6 @@ async function recordEvent(body, env) {
   // Дедуп — message.help может повторить доставку вебхука.
   if (ev.message_id && bucket.some((e) => e.message_id === ev.message_id)) return;
 
-  // is_first_client_msg — первое сообщение клиента этого диалога в бакете дня.
-  if (ev.direction === 'client') {
-    ev.is_first_client_msg = !bucket.some(
-      (e) => e.dialog_id === ev.dialog_id && e.direction === 'client');
-  }
-
   bucket.push(ev);
   // Read-modify-write: два одновременных вебхука в одном ~50 мс окне могут
   // редко потерять одно событие. Для потока бьюти-студии и допуска ±10–15%
@@ -473,18 +469,24 @@ async function handleDeletion(env, p) {
   const mid = p.id != null ? String(p.id) : '';
   const dialog = p.user_id != null ? String(p.user_id) : '';
   if (!mid && !dialog) return;
-  const dateKey = `events:${almatyDateStr(Date.now())}`;
-  const bucket = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
-  let idx = mid ? bucket.findIndex((e) => e.message_id === mid) : -1;
-  if (idx < 0 && dialog) {
-    for (let i = bucket.length - 1; i >= 0; i--) {
-      if (bucket[i].dialog_id === dialog && bucket[i].direction === 'client') { idx = i; break; }
+  // Ищем в сегодняшнем бакете, затем во вчерашнем (удаление могло прийти после полуночи Алматы).
+  for (const ts of [Date.now(), Date.now() - 86400000]) {
+    const dateKey = `events:${almatyDateStr(ts)}`;
+    const bucket = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
+    let idx = mid ? bucket.findIndex((e) => e.message_id === mid) : -1;
+    if (idx < 0 && dialog) {
+      for (let i = bucket.length - 1; i >= 0; i--) {
+        if (bucket[i].dialog_id === dialog && bucket[i].direction === 'client') { idx = i; break; }
+      }
+    }
+    if (idx >= 0) {
+      bucket.splice(idx, 1);
+      await env.PULSE_KV.put(dateKey, JSON.stringify(bucket), { expirationTtl: EVENTS_TTL });
+      console.log(`[deleted] убрано удалённое сообщение dialog=${dialog} mid=${mid} bucket=${dateKey}`);
+      return;
     }
   }
-  if (idx < 0) { console.log(`[deleted] нечего убирать dialog=${dialog} mid=${mid}`); return; }
-  bucket.splice(idx, 1);
-  await env.PULSE_KV.put(dateKey, JSON.stringify(bucket), { expirationTtl: EVENTS_TTL });
-  console.log(`[deleted] убрано удалённое сообщение dialog=${dialog} mid=${mid}`);
+  console.log(`[deleted] нечего убирать dialog=${dialog} mid=${mid}`);
 }
 
 // Разбор вебхука message.help: { action: "channel.message.created", payload }.
@@ -530,7 +532,6 @@ function parseWebhook(body) {
     message_type: p.message_type || 'text',
     text: typeof p.message === 'string' ? p.message.slice(0, 280) : '',
     ts: parseTs(p.created_at),
-    is_first_client_msg: false,
   };
 }
 
@@ -569,18 +570,11 @@ async function runDigest(env, meta) {
 
     const dateKey = `events:${almatyDateStr(now)}`;
     const rawDayEvents = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
-    // Отсечка по времени (EVENTS_SINCE_TS, epoch ms): игнорируем события, записанные
-    // ДО фикса распознавания операторов (02.06). Старые события в сегодняшнем бакете
-    // не содержат ответов менеджеров (тогда 'from_whatsapp' отбрасывался) и давали
-    // ложные «без ответа». Очистить KV-бакет надёжно нельзя (гонка read-modify-write
-    // со stale-чтением), поэтому фильтруем по ts. Не задано — берём все.
-    const sinceTs = parseInt(env.EVENTS_SINCE_TS, 10);
     // Чёрный список внутренних номеров (сотрудники/тест) — их сообщения не заявки.
     const internalPhones = new Set(
       String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
     const events = rawDayEvents.filter((e) => {
       if (!e) return false;
-      if (Number.isFinite(sinceTs) && e.ts < sinceTs) return false;
       if (isDeletedMarker(e.text)) return false; // удалённое сообщение — отвечать не на что
       if (e.blocked) return false; // контакт заблокирован на момент сообщения — отдел его не видит
       if (internalPhones.size && e.phone && internalPhones.has(String(e.phone).replace(/\D/g, ''))) return false;
@@ -595,7 +589,7 @@ async function runDigest(env, meta) {
     // статусу + попутно дотягиваем телефоны. Делаем ДО проверки «тихо», чтобы счётчик
     // «без ответа» был честным (если все зависшие заблокированы — час тихий).
     const unBefore = metrics.unanswered.slice();
-    await refineUnanswered(env, metrics, isFinal ? 60 : 30);
+    await refineUnanswered(env, metrics, isFinal ? 20 : 12);
     // Бот сам читает транскрипты зависших и решает, кто реально без ответа.
     await judgeUnanswered(env, metrics, events);
 
@@ -763,8 +757,25 @@ function computeMetrics(rawEvents, now, thresholdMin) {
     // текста, но только если оператор ещё НЕ вступал (возможно, новый лид прислал фото).
     // Если оператор уже отвечал, а клиент прислал стикер/смайл/фото без текста — это
     // реакция, не «вопрос без ответа» (фидбэк смены: «там смайлик отправил клиент»).
-    const substantiveClient = clientMsgs.filter((c) =>
-      c.text ? !isClosingText(c.text) : operatorMsgs.length === 0);
+    // Идём по таймлайну, чтобы учесть контекст предыдущего сообщения оператора:
+    // голое «да/хорошо» обычно закрытие, НО если оператор прямо перед этим предложил
+    // записаться/спросил время — это согласие на запись, ответ нужен (горячий лид не теряем).
+    let prevOp = null;
+    const substantiveClient = [];
+    for (const e of evs) {
+      if (e.direction === 'operator') { prevOp = e; continue; }
+      if (!isLiveClient(e)) continue;
+      let sub;
+      if (e.text) {
+        // Закрытие («да»/«хорошо»/«договорились») в ответ на вопрос или предложение записи
+        // оператора — это согласие, ответ нужен; благодарность/прощание (CLOSING_STRONG) — нет.
+        const opAsked = prevOp && (/\?/.test(prevOp.text || '') || BOOKING_CONFIRM.test(prevOp.text || '') || BOOKING_ASK.test(prevOp.text || ''));
+        sub = !isClosingText(e.text) || !!(opAsked && !CLOSING_STRONG.test(e.text));
+      } else {
+        sub = operatorMsgs.length === 0; // медиа без текста — содержательно, только если оператор ещё не вступал
+      }
+      if (sub) substantiveClient.push(e);
+    }
     const lastClientMsg = substantiveClient.length ? substantiveClient[substantiveClient.length - 1] : null;
     const lastOperatorTs = operatorMsgs.length ? operatorMsgs[operatorMsgs.length - 1].ts : -1;
     if (lastClientMsg && lastOperatorTs < lastClientMsg.ts && (now - lastClientMsg.ts) > thresholdMs) {
@@ -812,12 +823,10 @@ function medianMinutes(diffsMs) {
 // События дня с теми же фильтрами, что в дайджесте (отсечка ts, удалённые, заблок., внутренние).
 async function loadFilteredEvents(env, now) {
   const raw = (await env.PULSE_KV.get(`events:${almatyDateStr(now)}`, { type: 'json' })) || [];
-  const sinceTs = parseInt(env.EVENTS_SINCE_TS, 10);
   const internalPhones = new Set(
     String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
   return raw.filter((e) => {
     if (!e) return false;
-    if (Number.isFinite(sinceTs) && e.ts < sinceTs) return false;
     if (isDeletedMarker(e.text)) return false;
     if (e.blocked) return false;
     if (internalPhones.size && e.phone && internalPhones.has(String(e.phone).replace(/\D/g, ''))) return false;
@@ -1101,6 +1110,7 @@ async function fetchAltegioRecords(env, token, startDate, endDate) {
     if (!Array.isArray(arr) || !arr.length) break;
     out.push(...arr);
     if (arr.length < 200) break;
+    if (page === 25) console.warn(`[altegio] потолок 25 стр (${out.length} записей) — длинный диапазон мог быть обрезан`);
   }
   return out;
 }
@@ -1537,6 +1547,7 @@ function parseVerdicts(raw) {
 // Plain text без parse_mode: формат раздела 6 разметки не требует, а свободный
 // текст от LLM с символами * или _ ломал бы Markdown-парсер (5 отправок в день).
 async function sendTelegram(env, text) {
+  if (typeof text === 'string' && text.length > 4096) text = text.slice(0, 4090) + '…'; // лимит Telegram
   const res = await fetch(`${TELEGRAM_API}/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -1558,6 +1569,9 @@ async function sendTelegram(env, text) {
 
 // Общий вызов Telegram Bot API. Не бросает — логирует и возвращает разобранный ответ.
 async function tgCall(env, method, payload) {
+  if (payload && typeof payload.text === 'string' && payload.text.length > 4096) {
+    payload = { ...payload, text: payload.text.slice(0, 4090) + '…' }; // лимит Telegram
+  }
   try {
     const res = await fetch(`${TELEGRAM_API}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
       method: 'POST',
@@ -2028,15 +2042,18 @@ async function refineUnanswered(env, metrics, limit) {
   if (!token) return 0;
   const map = await getChannelMap(env);
   const allUuids = Object.values(map);
-  const cap = Math.min(items.length, limit || 50);
+  const cap = Math.min(items.length, limit || 20);
+  let budget = 30; // потолок субреквестов к message.help за прогон (защита от лимита Cloudflare)
   const keep = [];
   let blocked = 0;
   for (let i = 0; i < items.length; i++) {
     const u = items[i];
-    if (i >= cap) { keep.push(u); continue; } // сверх лимита — не проверяем
+    if (i >= cap || budget <= 0) { keep.push(u); continue; } // сверх лимита/бюджета — не проверяем
     const tryUuids = (u.channelId != null && map[String(u.channelId)]) ? [map[String(u.channelId)]] : allUuids;
     let card = null;
     for (const uuid of tryUuids) {
+      if (budget <= 0) break;
+      budget--;
       try {
         const r = await fetch(
           `${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/${uuid}/users/${u.dialogId}`,
