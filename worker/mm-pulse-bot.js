@@ -944,28 +944,34 @@ function broadcastActive(now) {
 // Отдельное письмо в чат по рассылке (НЕ врезка в пульс — по просьбе заказчика).
 function formatBroadcast(m, parts) {
   const lines = [];
-  // Критичный риск (≥3 жалоб за час) — баннером в начало письма.
-  if (m.broadcastRisks && m.broadcastRisks.critical) {
-    lines.push(`🚨 РИСК РАССЫЛКИ: ${m.broadcastRisks.count} жалоб/сигналов за короткое время!`);
-    for (const r of m.broadcastRisks.list.slice(0, 5)) lines.push(`• ${contactLabel({ phone: r.phone, name: r.name })}: «${r.text}»`);
+  const r = m.broadcastRisks || { count: 0, critical: false, list: [] };
+  const conv = Math.round((m.broadcastConversionRate || 0) * 100);
+  // Критичный риск (≥3 жалоб за час) — в начало письма, капсом (без эмодзи).
+  if (r.critical) {
+    lines.push(`ВНИМАНИЕ: рост негатива на рассылку — ${r.count} жалоб(ы) за короткое время. Нужна реакция.`);
+    for (const x of r.list.slice(0, 5)) lines.push(`— ${contactLabel({ phone: x.phone, name: x.name })}: «${x.text}»`);
     lines.push('');
   }
-  lines.push(`📣 Летняя рассылка «Экспресс-программы» · ${parts.hhmm} · ${parts.ddmm}`);
-  const t = m.broadcastByTemplate;
-  lines.push(`📤 Отправлено сегодня: ${m.broadcastSent} · 🔥A ${t.A} · 🌷B ${t.B} · 🌸C ${t.C}`);
-  if (m.broadcastByHour && m.broadcastByHour.size) {
-    const hrs = [...m.broadcastByHour.entries()].sort((a, b) => a[0] - b[0]).map(([h, n]) => `${h}ч·${n}`).join(' ');
-    lines.push(`🕐 Темп: ${hrs}`);
-  }
-  lines.push(`💬 Ответили: ${m.broadcastReplies} (${Math.round(m.broadcastConversionRate * 100)}%) · 🗓 Броней: ${m.broadcastBookings}`);
-  // Некритичные риски — строкой со списком; ноль — спокойная отметка.
-  if (!m.broadcastRisks.critical) {
-    if (m.broadcastRisks.count) {
-      lines.push(`⚠️ Рисков: ${m.broadcastRisks.count}`);
-      for (const r of m.broadcastRisks.list.slice(0, 3)) lines.push(`• ${contactLabel({ phone: r.phone, name: r.name })}: «${r.text}»`);
+  lines.push(`Рассылка «Летние экспресс-программы» — сводка на ${parts.hhmm}, ${parts.ddmm}`);
+  lines.push('');
+  lines.push(`Отправлено сегодня: ${m.broadcastSent} сообщений`);
+  lines.push(`Ответили клиенты: ${m.broadcastReplies} (${conv}% от отправленных)`);
+  lines.push(`Записались после рассылки: ${m.broadcastBookings} (бронь в течение 72 часов)`);
+  if (!r.critical) {
+    if (r.count) {
+      lines.push(`Жалобы и негатив: ${r.count} — проверьте:`);
+      for (const x of r.list.slice(0, 3)) lines.push(`— ${contactLabel({ phone: x.phone, name: x.name })}: «${x.text}»`);
     } else {
-      lines.push('✅ Рисков: 0 — жалоб нет');
+      lines.push('Жалобы и негатив: не выявлено');
     }
+  }
+  // Детали для понимания темпа (вторично).
+  const t = m.broadcastByTemplate;
+  lines.push('');
+  lines.push(`Использованные тексты: вариант A — ${t.A}, B — ${t.B}, C — ${t.C}`);
+  if (m.broadcastByHour && m.broadcastByHour.size) {
+    const hrs = [...m.broadcastByHour.entries()].sort((a, b) => a[0] - b[0]).map(([h, n]) => `${h}:00 — ${n}`).join(', ');
+    lines.push(`Отправлено по часам: ${hrs}`);
   }
   return lines.join('\n');
 }
