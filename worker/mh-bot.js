@@ -361,9 +361,13 @@ const CONFIRM_DAY_COUNTER_TTL = 90000;   // KV TTL счётчика «сколь
 const BROADCAST_CHANNEL_ID = 20916;
 const BROADCAST_CHANNEL_UUID = '71608151-e312-48d2-b103-524c8b2e146e';
 const BROADCAST_PER_HOUR = 30;            // hard cap в час
-const BROADCAST_TICK_MAX = 8;             // макс. отправок за один cron-tick (15 мин)
-const BROADCAST_TICK_PAUSE_MIN = 90000;   // 90 сек минимум
-const BROADCAST_TICK_PAUSE_MAX = 120000;  // 120 сек максимум
+// TICK_MAX × PAUSE_MAX должен укладываться в ~6 мин чтобы scheduled event
+// не упёрся в Cloudflare-таймаут (особенно когда параллельно идёт confirmation).
+// 5 × 90 = 450 сек = 7.5 мин — safe. За час (4 тика): 20 отправок.
+// Если нужно 30/час — поднимать PER_HOUR не дальше TICK_MAX×4.
+const BROADCAST_TICK_MAX = 5;
+const BROADCAST_TICK_PAUSE_MIN = 60000;   // 60 сек минимум
+const BROADCAST_TICK_PAUSE_MAX = 90000;   // 90 сек максимум
 const BROADCAST_COLD_DAYS = 90;           // не дёргаем кто молчит >90 дней
 const BROADCAST_END_HOUR = 21;            // до 21:00 Almaty
 const BROADCAST_DEDUP_TTL = 2592000;      // 30 дней — один номер не задвоится
