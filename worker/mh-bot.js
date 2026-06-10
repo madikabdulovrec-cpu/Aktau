@@ -360,29 +360,51 @@ const CONFIRM_DAY_COUNTER_TTL = 90000;   // KV TTL счётчика «сколь
 // WA2 (channel 20916) клиентам Altegio с активной перепиской ≤90 дней.
 const BROADCAST_CHANNEL_ID = 20916;
 const BROADCAST_CHANNEL_UUID = '71608151-e312-48d2-b103-524c8b2e146e';
-const BROADCAST_PER_HOUR = 30;            // hard cap в час
-// Дневной потолок — страховка под рекомендацию message.help bulk-FAQ
-// «не более 300 сообщений в день, иначе риск блокировки». 250 даёт
-// запас от 300. С TICK_MAX=5 и cron */10 (6 тиков/час × 12 часов = 360
-// теоретически) дневной потолок остановит на 250 — защищает от
-// случайного перерасхода в один день.
-const BROADCAST_PER_DAY = 250;
-// TICK_MAX × PAUSE_MAX должен укладываться в ~6 мин чтобы scheduled event
-// не упёрся в Cloudflare-таймаут (параллельно идёт confirmation).
-// 5 × 90 = 7.5 мин — safe.
-const BROADCAST_TICK_MAX = 5;
-const BROADCAST_TICK_PAUSE_MIN = 60000;   // 60 сек минимум
-const BROADCAST_TICK_PAUSE_MAX = 90000;   // 90 сек максимум
+// ── Двухэтапная рассылка ──────────────────────────────────────────────────
+// Шаг 1 (engage): короткий вопрос «интересно?» — открываем новый чат через
+//   need_create=true. Темп очень мягкий: 12/час, 100/день, паузы 4-6 мин.
+//   Под рекомендацию msg.help bulk-FAQ «100/день минимум».
+// Шаг 2 (full): полный текст акций — отправляется ТОЛЬКО клиенту, ответившему
+//   «да/интересно». Идёт уже как продолжение диалога (не считается холодным
+//   сообщением Meta).
+// Opt-out: ответ «нет/отписать» → broadcast_optout:phone на 365 дней.
+const BROADCAST_PER_HOUR = 12;            // hard cap в час для engage-шага
+const BROADCAST_PER_DAY = 100;            // hard cap в день
+const BROADCAST_TICK_MAX = 2;             // 2 за tick × 6 тиков/час = 12/час
+const BROADCAST_TICK_PAUSE_MIN = 240000;  // 4 мин минимум — «человеческий» темп
+const BROADCAST_TICK_PAUSE_MAX = 360000;  // 6 мин максимум
+const BROADCAST_ENGAGE_PENDING_TTL = 172800;  // 48 ч — ждём ответ клиента
+const BROADCAST_OPTOUT_TTL = 31536000;        // 365 дней — opt-out
 const BROADCAST_COLD_DAYS = 90;           // не дёргаем кто молчит >90 дней
 const BROADCAST_END_HOUR = 21;            // до 21:00 Almaty
 const BROADCAST_DEDUP_TTL = 2592000;      // 30 дней — один номер не задвоится
 const BROADCAST_BASE_CACHE_TTL = 21600;   // 6 ч — кеш базы из Altegio
 const BROADCAST_HOUR_COUNTER_TTL = 7200;  // KV TTL часового счётчика broadcast
 
-// Три шаблона текста (ротация по часу). Цены/составы/срок идентичны во всех
-// трёх, отличаются стилистика, приветствие, эмодзи-маркеры — чтобы Meta не
-// видела одинаковый шаблон у разных получателей.
-const BROADCAST_TEMPLATES = [
+// ── ШАБЛОН ENGAGE (шаг 1) ────────────────────────────────────────────────
+// Короткое сообщение-вопрос. Открывает новый чат. 3 микро-варианта.
+const BROADCAST_ENGAGE_TEMPLATES = [
+`Здравствуйте 🌷
+На связи студия M&M.
+
+Подготовили для вас выгодное летнее предложение — экспресс-программы коррекции фигуры. Интересно узнать подробнее?`,
+
+`Добрый день! ✨
+Это студия M&M.
+
+У нас стартовали летние акционные программы со скидкой. Прислать вам подробности?`,
+
+`Здравствуйте 🌸
+На связи M&M.
+
+Сделали для вас специальное летнее предложение на наши экспресс-программы. Хотите узнать детали?`,
+];
+
+// ── ШАБЛОН FULL (шаг 2) ──────────────────────────────────────────────────
+// Полный текст акций. Шлём ТОЛЬКО клиенту, ответившему «да» на engage.
+// Идёт уже как продолжение диалога — Meta не считает холодным.
+// 3 варианта (ротация по record_id mod 3 / engage variant).
+const BROADCAST_FULL_TEMPLATES = [
   // ── Шаблон 1 (близко к исходнику) ──
 `🔥 Летние экспресс-программы M&M 🔥
 
@@ -640,6 +662,27 @@ async function processMessage(msg, env) {
       await handleConfirmationResponse(env, msg, kind, pending);
     } else {
       await handleConfirmationFollowUp(env, msg, pending);
+    }
+    return;
+  }
+
+  // Ответ клиента на engage-сообщение рассылки акций. Так же круглосуточно.
+  // «Да/+/интересно/расскажите» → отправляем полный шаблон акций (шаг 2).
+  // «Нет/не нужно/отпишите» → opt-out на 365 дней + вежливый ответ.
+  // Длинный/непонятный ответ → передаём менеджеру (он лучше отработает
+  // вопросы про цену конкретной программы и т.п.).
+  const engageRaw = await env.BOT_KV.get(`broadcast_engage_pending:user:${msg.userId}`);
+  if (engageRaw) {
+    let engage = null;
+    try { engage = JSON.parse(engageRaw); } catch (_) { engage = null; }
+    const kind = classifyConfirmationResponse(msg.text);
+    await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+    if (kind === 'yes') {
+      await handleBroadcastEngageYes(env, msg, engage);
+    } else if (kind === 'no') {
+      await handleBroadcastEngageNo(env, msg, engage);
+    } else {
+      await handleBroadcastEngageOther(env, msg, engage);
     }
     return;
   }
@@ -1872,6 +1915,71 @@ async function handleConfirmationFollowUp(env, msg, pending) {
     + `text="${String(msg.text || '').slice(0, 60)}"`);
 }
 
+// ── Ответы клиента на engage-сообщение рассылки ────────────────────────────
+// engage: {phone, templateIdx, sentAt}. На «Да» → отправляем FULL шаблон,
+// «Нет» → ставим opt-out на 365 дней, иначе → передаём менеджеру.
+
+async function handleBroadcastEngageYes(env, msg, engage) {
+  // Удаляем pending в любом случае
+  await env.BOT_KV.delete(`broadcast_engage_pending:user:${msg.userId}`);
+
+  // Берём вариант FULL шаблона тот же что был у engage — для согласованности
+  const variant = engage && Number.isFinite(Number(engage.templateIdx))
+    ? Number(engage.templateIdx) : 0;
+  const fullText = BROADCAST_FULL_TEMPLATES[variant % 3];
+
+  // Краткое приветствие + полный текст (одним сообщением для целостности)
+  const text = `Отлично! ✨ Рассказываю:\n\n${fullText}\n\nЕсли захотите выбрать программу — просто напишите, передам менеджеру для записи.`;
+  await sendMessage(env, msg, text);
+
+  // Помечаем как «прошёл шаг 2» для аналитики
+  await env.BOT_KV.put(`broadcast_engage_yes:${msg.userId}`, JSON.stringify({
+    at: new Date().toISOString(),
+    phone: engage && engage.phone,
+    variant,
+  }), { expirationTtl: LEAD_TTL });
+
+  console.log(`broadcast engage YES u${msg.userId} → отправлен FULL вариант ${variant + 1}`);
+}
+
+async function handleBroadcastEngageNo(env, msg, engage) {
+  await env.BOT_KV.delete(`broadcast_engage_pending:user:${msg.userId}`);
+
+  // Opt-out на 365 дней по телефону — больше не дёргаем НИКАКОЙ рассылкой
+  if (engage && engage.phone) {
+    await env.BOT_KV.put(`broadcast_optout:${engage.phone}`,
+      JSON.stringify({ at: new Date().toISOString(), via: 'engage_no' }),
+      { expirationTtl: BROADCAST_OPTOUT_TTL });
+  }
+
+  await sendMessage(env, msg,
+    'Поняла, не буду беспокоить 🌷 Если что-то понадобится — пишите, всегда рады!');
+
+  console.log(`broadcast engage NO u${msg.userId} → opt-out для ${engage && engage.phone}`);
+}
+
+async function handleBroadcastEngageOther(env, msg, engage) {
+  await env.BOT_KV.delete(`broadcast_engage_pending:user:${msg.userId}`);
+
+  // Любой длинный/непонятный ответ — передаём менеджеру.
+  await sendMessage(env, msg,
+    'Поняла вас 🌷 Передаю менеджеру — он(а) свяжется в ближайшее время и подробно расскажет.');
+
+  if (msg.userId) {
+    await env.BOT_KV.put(`op:${msg.userId}`, '1',
+      { expirationTtl: OPERATOR_PAUSE_TTL });
+  }
+
+  await env.BOT_KV.put(`broadcast_engage_handoff:${msg.userId}`, JSON.stringify({
+    at: new Date().toISOString(),
+    phone: engage && engage.phone,
+    clientText: String(msg.text || '').slice(0, 300),
+  }), { expirationTtl: LEAD_TTL });
+
+  await assignToManager(env, msg);
+  console.log(`broadcast engage OTHER u${msg.userId} → handoff, text="${String(msg.text || '').slice(0, 60)}"`);
+}
+
 // ── Парсеры даты Altegio (локальное время Almaty) ──────────────────────────
 
 function parseAltegioParts(s) {
@@ -1992,12 +2100,13 @@ async function runBroadcastJob(env) {
   }
 
   shuffleInPlace(base);
-  const text = BROADCAST_TEMPLATES[templateIdx];
+  // Шаг 1 (engage): короткий вопрос с открытием нового чата на WA2.
+  const text = BROADCAST_ENGAGE_TEMPLATES[templateIdx];
 
   let sent = 0;
   let dedupSkip = 0;
+  let optoutSkip = 0;
   let noContactSkip = 0;
-  let coldSkip = 0;
   let pendingSkip = 0;
   let opSkip = 0;
 
@@ -2007,23 +2116,18 @@ async function runBroadcastJob(env) {
     const phone = normalizePhone(client.phone);
     if (!phone) continue;
 
+    // Уже шла рассылка этому телефону
     if (await env.BOT_KV.get(`broadcast_sent:${phone}`)) { dedupSkip++; continue; }
+    // Клиент когда-то ответил «нет/отпишите» — больше не пишем
+    if (await env.BOT_KV.get(`broadcast_optout:${phone}`)) { optoutSkip++; continue; }
 
+    // need_create=true: открываем НОВЫЙ чат с клиентом на WA2 (двухэтапная
+    // схема снижает риск Meta — первое сообщение короткое и вопросительное).
     const resolved = await mhResolveContactStrict(env, token, phone,
-      BROADCAST_CHANNEL_ID, BROADCAST_CHANNEL_UUID);
+      BROADCAST_CHANNEL_ID, BROADCAST_CHANNEL_UUID, true);
     if (!resolved) { noContactSkip++; continue; }
 
-    // Фильтр холодных (>90 дней без сообщений)
-    if (resolved.lastMessageAt) {
-      const last = parseAltegioParts(resolved.lastMessageAt);
-      const lastMs = last ? partsToAlmatyMs(last) : null;
-      if (lastMs && (Date.now() - lastMs) > BROADCAST_COLD_DAYS * 86400000) {
-        coldSkip++;
-        continue;
-      }
-    }
-
-    // Не лезем в чат, где клиент ждёт ответ на подтверждение
+    // Не лезем в чат, где клиент ждёт ответ на confirmation
     if (await env.BOT_KV.get(`confirm_pending:user:${resolved.userId}`)) {
       pendingSkip++;
       continue;
@@ -2031,6 +2135,11 @@ async function runBroadcastJob(env) {
     // Не лезем в чат, где менеджер уже работает
     if (await env.BOT_KV.get(`op:${resolved.userId}`)) {
       opSkip++;
+      continue;
+    }
+    // Уже ждём ответ на engage от этого user — не дублируем
+    if (await env.BOT_KV.get(`broadcast_engage_pending:user:${resolved.userId}`)) {
+      dedupSkip++;
       continue;
     }
 
@@ -2044,11 +2153,16 @@ async function runBroadcastJob(env) {
     sent++;
     await env.BOT_KV.put(`broadcast_sent:${phone}`, JSON.stringify({
       sentAt: new Date().toISOString(),
-      templateIdx, userId: resolved.userId,
+      templateIdx, userId: resolved.userId, step: 'engage',
     }), { expirationTtl: BROADCAST_DEDUP_TTL });
+    // Pending для второго этапа: при ответе клиента (да/нет/что-то ещё)
+    // processMessage заглянет сюда и поймёт что отправить.
+    await env.BOT_KV.put(`broadcast_engage_pending:user:${resolved.userId}`,
+      JSON.stringify({
+        phone, templateIdx, sentAt: new Date().toISOString(),
+      }), { expirationTtl: BROADCAST_ENGAGE_PENDING_TTL });
     await env.BOT_KV.put(hourKey, String(hourUsed + sent),
       { expirationTtl: BROADCAST_HOUR_COUNTER_TTL });
-    // Дневной счётчик (TTL 25ч = на 1ч больше суток для надёжной смены)
     await env.BOT_KV.put(dayKey, String(dayUsed + sent),
       { expirationTtl: 90000 });
 
@@ -2059,10 +2173,11 @@ async function runBroadcastJob(env) {
     }
   }
 
-  console.log(`broadcast tick: base=${base.length}, h=${now.hour}:${String(now.minute).padStart(2,'0')}, `
+  console.log(`broadcast engage tick: base=${base.length}, h=${now.hour}:${String(now.minute).padStart(2,'0')}, `
     + `template=${templateIdx + 1}, hour_used=${hourUsed + sent}/${BROADCAST_PER_HOUR}, `
-    + `this_tick=${sent}, dedup=${dedupSkip}, no_contact=${noContactSkip}, `
-    + `cold=${coldSkip}, pending=${pendingSkip}, op=${opSkip}`);
+    + `day_used=${dayUsed + sent}/${BROADCAST_PER_DAY}, this_tick=${sent}, `
+    + `dedup=${dedupSkip}, optout=${optoutSkip}, no_contact=${noContactSkip}, `
+    + `pending=${pendingSkip}, op=${opSkip}`);
 }
 
 // Выгрузка активной базы клиентов из Altegio с кешем в KV на BASE_CACHE_TTL.
@@ -2116,8 +2231,13 @@ async function fetchBroadcastBase(env) {
 // Строгий резолв контакта по телефону: ТОЛЬКО на канале BROADCAST_CHANNEL_ID.
 // Если клиент на нём не писал — возвращает null (не открываем новый чат).
 async function mhResolveContactStrict(env, token, phone,
-  targetChannelId, targetChannelUuid) {
+  targetChannelId, targetChannelUuid, needCreate = false) {
   let res;
+  const body = {
+    phone,
+    need_create: !!needCreate,
+  };
+  if (needCreate) body.channel_uuid = targetChannelUuid;
   try {
     res = await fetch(
       `${MH_API}/app/projects/${env.MH_PROJECT_ID}/contacts/contact_by_phone`,
@@ -2125,7 +2245,7 @@ async function mhResolveContactStrict(env, token, phone,
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`,
           'content-type': 'application/json' },
-        body: JSON.stringify({ phone, need_create: false }),
+        body: JSON.stringify(body),
       });
   } catch (e) {
     console.error('broadcast contact_by_phone:', e && e.message);
