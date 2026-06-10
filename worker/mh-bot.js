@@ -368,11 +368,11 @@ const BROADCAST_CHANNEL_UUID = '71608151-e312-48d2-b103-524c8b2e146e';
 //   «да/интересно». Идёт уже как продолжение диалога (не считается холодным
 //   сообщением Meta).
 // Opt-out: ответ «нет/отписать» → broadcast_optout:phone на 365 дней.
-const BROADCAST_PER_HOUR = 12;            // hard cap в час для engage-шага
-const BROADCAST_PER_DAY = 100;            // hard cap в день
-const BROADCAST_TICK_MAX = 2;             // 2 за tick × 6 тиков/час = 12/час
-const BROADCAST_TICK_PAUSE_MIN = 240000;  // 4 мин минимум — «человеческий» темп
-const BROADCAST_TICK_PAUSE_MAX = 360000;  // 6 мин максимум
+const BROADCAST_PER_HOUR = 20;            // hard cap в час для engage-шага
+const BROADCAST_PER_DAY = 200;            // hard cap в день (20/час × 10ч окна)
+const BROADCAST_TICK_MAX = 4;             // 4 за tick × ~5 тиков/час = 20/час
+const BROADCAST_TICK_PAUSE_MIN = 120000;  // 2 мин минимум
+const BROADCAST_TICK_PAUSE_MAX = 200000;  // 3.3 мин максимум (4×200с=13.3мин per tick)
 const BROADCAST_ENGAGE_PENDING_TTL = 172800;  // 48 ч — ждём ответ клиента
 const BROADCAST_OPTOUT_TTL = 31536000;        // 365 дней — opt-out
 
@@ -2202,15 +2202,16 @@ async function runBroadcastJob(env) {
 }
 
 // Выгрузка активной базы клиентов из Altegio с кешем в KV на BASE_CACHE_TTL.
-// Берём всех у кого visit_count > 0 и есть телефон. Источник: clients/search
-// с пагинацией. Один tick загружает базу за ~10-30 сек, потом 6ч из кеша.
+// Берём ВСЕХ кто есть в базе с телефоном (фильтр visit_count > 0 убран
+// 10.06.2026 — на WA2 база активных была охвачена ~70%, нужно расширение
+// для продолжения рассылки). Источник: clients/search с пагинацией.
 async function fetchBroadcastBase(env) {
   const cacheKey = `broadcast:base:${almatyNow().ymd}`;
   const cached = await env.BOT_KV.get(cacheKey, { type: 'json' });
   if (cached && Array.isArray(cached) && cached.length) return cached;
 
   const out = [];
-  for (let page = 1; page <= 30; page++) {
+  for (let page = 1; page <= 50; page++) {
     const url = `${ALTEGIO_API}/company/${env.ALTEGIO_COMPANY_ID}/clients/search`;
     let res;
     try {
@@ -2220,7 +2221,7 @@ async function fetchBroadcastBase(env) {
         body: JSON.stringify({
           page,
           page_size: 200,
-          fields: ['id', 'phone', 'name', 'visit_count', 'last_visit_date'],
+          fields: ['id', 'phone', 'name'],
           filters: [],
         }),
       });
@@ -2237,7 +2238,6 @@ async function fetchBroadcastBase(env) {
     if (!list.length) break;
     for (const c of list) {
       if (!c || !c.phone) continue;
-      if (Number(c.visit_count) === 0) continue;
       out.push({ phone: c.phone, name: c.name });
     }
     if (list.length < 200) break;
