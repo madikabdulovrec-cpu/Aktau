@@ -361,10 +361,15 @@ const CONFIRM_DAY_COUNTER_TTL = 90000;   // KV TTL счётчика «сколь
 const BROADCAST_CHANNEL_ID = 20916;
 const BROADCAST_CHANNEL_UUID = '71608151-e312-48d2-b103-524c8b2e146e';
 const BROADCAST_PER_HOUR = 30;            // hard cap в час
+// Дневной потолок — страховка под рекомендацию message.help bulk-FAQ
+// «не более 300 сообщений в день, иначе риск блокировки». 250 даёт
+// запас от 300. С TICK_MAX=5 и cron */10 (6 тиков/час × 12 часов = 360
+// теоретически) дневной потолок остановит на 250 — защищает от
+// случайного перерасхода в один день.
+const BROADCAST_PER_DAY = 250;
 // TICK_MAX × PAUSE_MAX должен укладываться в ~6 мин чтобы scheduled event
-// не упёрся в Cloudflare-таймаут (особенно когда параллельно идёт confirmation).
-// 5 × 90 = 450 сек = 7.5 мин — safe. За час (4 тика): 20 отправок.
-// Если нужно 30/час — поднимать PER_HOUR не дальше TICK_MAX×4.
+// не упёрся в Cloudflare-таймаут (параллельно идёт confirmation).
+// 5 × 90 = 7.5 мин — safe.
 const BROADCAST_TICK_MAX = 5;
 const BROADCAST_TICK_PAUSE_MIN = 60000;   // 60 сек минимум
 const BROADCAST_TICK_PAUSE_MAX = 90000;   // 90 сек максимум
@@ -1955,7 +1960,14 @@ async function runBroadcastJob(env) {
   const hoursSinceStart = Math.floor((now.ms - startedMs) / 3600000);
   const templateIdx = ((hoursSinceStart % 3) + 3) % 3;
 
-  // Часовой счётчик — hard cap 30/час
+  // Дневной потолок — страховка под правило message.help «не более 300/день»
+  const dayKey = `broadcast_day:${now.ymd}`;
+  const dayUsed = Number(await env.BOT_KV.get(dayKey)) || 0;
+  if (dayUsed >= BROADCAST_PER_DAY) {
+    console.log(`broadcast: day cap reached (${dayUsed}/${BROADCAST_PER_DAY}) — стоп до завтра`);
+    return;
+  }
+  // Часовой потолок 30/час
   const hourKey = `broadcast_hour:${now.ymdh}`;
   const hourUsed = Number(await env.BOT_KV.get(hourKey)) || 0;
   if (hourUsed >= BROADCAST_PER_HOUR) {
@@ -1963,7 +1975,8 @@ async function runBroadcastJob(env) {
     return;
   }
   const remainingThisHour = BROADCAST_PER_HOUR - hourUsed;
-  const tickQuota = Math.min(BROADCAST_TICK_MAX, remainingThisHour);
+  const remainingToday = BROADCAST_PER_DAY - dayUsed;
+  const tickQuota = Math.min(BROADCAST_TICK_MAX, remainingThisHour, remainingToday);
 
   // База клиентов Altegio (кеш в KV на 6ч)
   const base = await fetchBroadcastBase(env);
@@ -2035,6 +2048,9 @@ async function runBroadcastJob(env) {
     }), { expirationTtl: BROADCAST_DEDUP_TTL });
     await env.BOT_KV.put(hourKey, String(hourUsed + sent),
       { expirationTtl: BROADCAST_HOUR_COUNTER_TTL });
+    // Дневной счётчик (TTL 25ч = на 1ч больше суток для надёжной смены)
+    await env.BOT_KV.put(dayKey, String(dayUsed + sent),
+      { expirationTtl: 90000 });
 
     if (sent < tickQuota) {
       await sleep(BROADCAST_TICK_PAUSE_MIN
