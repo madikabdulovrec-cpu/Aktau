@@ -375,6 +375,25 @@ const BROADCAST_TICK_PAUSE_MIN = 240000;  // 4 мин минимум — «че�
 const BROADCAST_TICK_PAUSE_MAX = 360000;  // 6 мин максимум
 const BROADCAST_ENGAGE_PENDING_TTL = 172800;  // 48 ч — ждём ответ клиента
 const BROADCAST_OPTOUT_TTL = 31536000;        // 365 дней — opt-out
+
+// Hard-coded ЧС из Altegio (категория «Чёрный список») — пользователь
+// прислал список телефонов 10.06.2026. Дополнить если появятся новые.
+// Все нормализованы под формат normalizePhone (8 в начале → 7).
+const BROADCAST_BLACKLIST_PHONES = new Set([
+  '77758882733', // +7 775 888-27-33
+  '78747503038', // +7 874 750-30-38 — если хранится с 7 в начале
+  '77475030388', // тот же, если хранится с 8 в начале (альт. форма)
+  '77017297060', // +7 701 729-70-60
+  '77013703274', // +7 701 370-32-74
+  '77019334610', // +7 701 933-46-10
+  '77474788823', // +7 747 478-88-23
+  '77085305616', // +7 708 530-56-16
+  '77054222589', // +7 705 422-25-89
+  '77012062505', // +7 701 206-25-05
+  '77476223341', // +7 747 622-33-41
+  '77017717733', // +7 701 771-77-33
+  '77013148364', // +7 701 314-83-64
+]);
 const BROADCAST_COLD_DAYS = 90;           // не дёргаем кто молчит >90 дней
 const BROADCAST_END_HOUR = 21;            // до 21:00 Almaty
 const BROADCAST_DEDUP_TTL = 2592000;      // 30 дней — один номер не задвоится
@@ -2116,6 +2135,8 @@ async function runBroadcastJob(env) {
     const phone = normalizePhone(client.phone);
     if (!phone) continue;
 
+    // Чёрный список из Altegio — hard-coded (см. константу BROADCAST_BLACKLIST_PHONES)
+    if (BROADCAST_BLACKLIST_PHONES.has(phone)) { optoutSkip++; continue; }
     // Уже шла рассылка этому телефону
     if (await env.BOT_KV.get(`broadcast_sent:${phone}`)) { dedupSkip++; continue; }
     // Клиент когда-то ответил «нет/отпишите» — больше не пишем
