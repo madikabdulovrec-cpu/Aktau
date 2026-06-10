@@ -437,8 +437,8 @@ export default {
 
     // Отправить ТОЛЬКО письмо по рассылке в чат сейчас (ops/тест) — GET ?broadcastsend=<DIGEST_SECRET>.
     if (env.DIGEST_SECRET && url.searchParams.get('broadcastsend') === env.DIGEST_SECRET) {
-      await maybeSendBroadcast(env, Date.now());
-      return json({ ok: true, sent: 'broadcast' });
+      const sent = await maybeSendBroadcast(env, Date.now());
+      return json({ ok: true, sent, note: sent ? 'письмо отправлено' : 'не отправлено (BROADCAST_REPORT=0 / нет отправок / акция завершена)' });
     }
 
     // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
@@ -1018,11 +1018,13 @@ function formatBroadcast(m, parts) {
 
 // Шлёт отдельное письмо по рассылке, если акция активна и сегодня были отправки.
 async function maybeSendBroadcast(env, now) {
-  if (!broadcastActive(now)) return;
+  if (env.BROADCAST_REPORT === '0') return false; // отчёты по рассылке временно отключены (BROADCAST_REPORT=1 — включить)
+  if (!broadcastActive(now)) return false;
   try {
     const m = await computeBroadcastMetrics(env, now);
-    if (m.broadcastSent > 0) await sendTelegram(env, formatBroadcast(m, almatyParts(now)));
+    if (m.broadcastSent > 0) { await sendTelegram(env, formatBroadcast(m, almatyParts(now))); return true; }
   } catch (e) { console.error('[broadcast] send failed:', e && e.message); }
+  return false;
 }
 
 /* ============================================================

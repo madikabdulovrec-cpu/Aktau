@@ -24,6 +24,7 @@ id = "100bb068db2f410b8da6f760f9ad3970"
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
 AI_JUDGE = "1"                          # ИИ сам читает диалоги и решает, кто реально «без ответа». "0" — выключить.
+BROADCAST_REPORT = "0"                   # письма по летней рассылке в чат: "0" — пауза, "1" — слать (до 15.06).
 AI_GATEWAY = "mm-pulse"                 # имя Cloudflare AI Gateway. Пусто = прямой вызов (блокируется 403).
 DEBUG_RAW = "0"                         # Диагностика: пишет сырые вебхуки в KV (?rawdump=). Включать только на время отладки.
 MH_PROJECT_ID = "220763"                # id проекта message.help — ПОДТВЕРДИТЬ
