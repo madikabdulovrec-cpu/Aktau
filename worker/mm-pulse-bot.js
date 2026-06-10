@@ -417,6 +417,17 @@ export default {
         admins: funnel.admins.map((a) => ({ name: a.name, total: a.total, attended: a.attended, noshow: a.noshow })) });
     }
 
+    // [DEBUG] что лежит в KV бота по номеру — GET ?eventsdump=<DIGEST_SECRET>&phone=77...
+    if (env.DIGEST_SECRET && url.searchParams.get('eventsdump') === env.DIGEST_SECRET) {
+      const phone = (url.searchParams.get('phone') || '').replace(/\D/g, '');
+      const raw = (await env.PULSE_KV.get(`events:${almatyDateStr(Date.now())}`, { type: 'json' })) || [];
+      const tail = phone.slice(-10);
+      const items = raw.filter((e) => e && String(e.phone || '').replace(/\D/g, '').endsWith(tail))
+        .sort((a, b) => a.ts - b.ts)
+        .map((e) => ({ dir: e.direction, dialog: e.dialog_id, ch: e.channel_id, type: e.message_type, text: String(e.text || '').slice(0, 50), hhmm: almatyParts(e.ts).hhmm }));
+      return json({ ok: true, phone: tail, count: items.length, items });
+    }
+
     // [DEBUG] метрики летней рассылки — GET ?broadcast=<DIGEST_SECRET>.
     if (env.DIGEST_SECRET && url.searchParams.get('broadcast') === env.DIGEST_SECRET) {
       const m = await computeBroadcastMetrics(env, Date.now());
@@ -502,6 +513,14 @@ function isDeletedMarker(text) {
   if (!text) return false;
   const t = String(text).replace(/[_*\s]+/g, ' ').trim().toLowerCase();
   return t === 'message deleted' || t === 'сообщение удалено' || t === 'this message was deleted';
+}
+
+// Системная отметка о ЗВОНКЕ ("_Incoming call_" и т.п.) — это НЕ текстовое сообщение,
+// в чате на звонок не отвечают (перезванивают). Всё сообщение = марке́р (как у удаления).
+function isCallMarker(text) {
+  if (!text) return false;
+  const t = String(text).replace(/[_*]+/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  return ['incoming call', 'outgoing call', 'missed call', 'входящий звонок', 'исходящий звонок', 'пропущенный звонок', 'звонок'].includes(t);
 }
 
 // Убрать исходное сообщение из бакета дня по событию удаления. По message_id (точно),
@@ -750,6 +769,17 @@ function computeMetrics(rawEvents, now, thresholdMin) {
     dialogs.get(e.dialog_id).push(e);
   }
 
+  // Последний ответ оператора ПО ТЕЛЕФОНУ (через все диалоги). Нужно из-за смены номера:
+  // клиент пишет на мёртвый WhatsApp (17222) И на новый (20916) — отвечают в одном диалоге,
+  // в другом висит «без ответа». Если на телефон ответили где-либо после сообщения — снимаем.
+  const phoneOpTs = new Map();
+  for (const e of events) {
+    if (e.direction === 'operator' && e.phone) {
+      const k = String(e.phone).replace(/\D/g, '').slice(-10);
+      if (k.length === 10 && (!phoneOpTs.has(k) || e.ts > phoneOpTs.get(k))) phoneOpTs.set(k, e.ts);
+    }
+  }
+
   const deltaStart = now - DELTA_WINDOW_MS;
   const thresholdMs = thresholdMin * 60 * 1000;
 
@@ -808,6 +838,7 @@ function computeMetrics(rawEvents, now, thresholdMin) {
     for (const e of evs) {
       if (e.direction === 'operator') { prevOp = e; continue; }
       if (!isLiveClient(e)) continue;
+      if (isCallMarker(e.text)) continue; // отметка о звонке — не чат-вопрос, в чате не отвечают
       let sub;
       if (e.text) {
         // Закрытие («да»/«хорошо»/«договорились») в ответ на вопрос или предложение записи
@@ -821,7 +852,16 @@ function computeMetrics(rawEvents, now, thresholdMin) {
     }
     const lastClientMsg = substantiveClient.length ? substantiveClient[substantiveClient.length - 1] : null;
     const lastOperatorTs = operatorMsgs.length ? operatorMsgs[operatorMsgs.length - 1].ts : -1;
-    if (lastClientMsg && lastOperatorTs < lastClientMsg.ts && (now - lastClientMsg.ts) > thresholdMs) {
+    // Если ПОСЛЕДНЕЕ действие клиента — звонок, разговор ушёл в телефон (его закрывают
+    // звонком, не в чате) → чат-«без ответа» не флагуем. Берём любое клиентское событие
+    // (даже со служебным message_type), чтобы поймать отметку о звонке.
+    const clientDir = evs.filter((e) => e.direction === 'client');
+    const movedToCall = clientDir.length && isCallMarker(clientDir[clientDir.length - 1].text);
+    // Ответили ли этому телефону оператором в ЛЮБОМ диалоге после последнего сообщения
+    // клиента (случай дубля на старый+новый WhatsApp) → тогда диалог не «без ответа».
+    const phoneKey = lastClientMsg && lastClientMsg.phone ? String(lastClientMsg.phone).replace(/\D/g, '').slice(-10) : '';
+    const answeredElsewhere = phoneKey.length === 10 && phoneOpTs.has(phoneKey) && phoneOpTs.get(phoneKey) >= lastClientMsg.ts;
+    if (lastClientMsg && !movedToCall && !answeredElsewhere && lastOperatorTs < lastClientMsg.ts && (now - lastClientMsg.ts) > thresholdMs) {
       unanswered.push({
         dialogId,
         phone: lastClientMsg.phone || '',
