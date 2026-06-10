@@ -1110,9 +1110,11 @@ async function runConfirmationJob(env) {
     console.log(`confirm: outside window (h=${now.hour}), skip`);
     return;
   }
-  // Cron теперь */15 (broadcast'у нужна частота), но confirmation хочет */30:
-  // запускаемся только на минутах 0 и 30.
-  if (now.minute !== 0 && now.minute !== 30) return;
+  // Раньше тут был фильтр `now.minute !== 0 && now.minute !== 30 → return`
+  // (для разнесения с broadcast'ом). Сломал работу: Cloudflare scheduled
+  // не гарантирует точную минуту — приходит на :01 или :31, фильтр отбрасывал
+  // всё подряд → 48 часов без единого confirmation. Удалён. Защита от
+  // перерасхода идёт через hour-cap (4/час, для WA1 override 2/час).
 
   const tomorrowStr = ymdDaysAhead(now, 1);
   const records = await fetchTomorrowRecordsSafe(env, tomorrowStr);
