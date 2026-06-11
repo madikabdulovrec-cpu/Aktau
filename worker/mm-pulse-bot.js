@@ -630,14 +630,13 @@ async function runDigest(env, meta) {
 
     const dateKey = `events:${almatyDateStr(now)}`;
     const rawDayEvents = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
-    // Чёрный список внутренних номеров (сотрудники/тест) — их сообщения не заявки.
-    const internalPhones = new Set(
-      String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
+    // Чёрный список внутренних (сотрудники/владелец/тест) — их сообщения не заявки.
+    const isInternal = internalMatcher(env);
     const events = rawDayEvents.filter((e) => {
       if (!e) return false;
       if (isDeletedMarker(e.text)) return false; // удалённое сообщение — отвечать не на что
       if (e.blocked) return false; // контакт заблокирован на момент сообщения — отдел его не видит
-      if (internalPhones.size && e.phone && internalPhones.has(String(e.phone).replace(/\D/g, ''))) return false;
+      if (isInternal(e)) return false; // внутренний номер или имя контакта (напр. владелец)
       return true;
     });
     const metrics = computeMetrics(events, now, unansweredThreshold(env));
@@ -1031,16 +1030,28 @@ async function maybeSendBroadcast(env, now) {
  * СВЕРКА ЛИДОВ ДНЯ — таргетолог vs message.help vs реальные диалоги
  * ============================================================ */
 
-// События дня с теми же фильтрами, что в дайджесте (отсечка ts, удалённые, заблок., внутренние).
+// Матчер «внутренний контакт» (сотрудник/владелец/тест): по ТЕЛЕФОНУ (INTERNAL_PHONES)
+// ИЛИ по ИМЕНИ контакта (INTERNAL_NAMES) — для IG-контактов без телефона (напр. владелец).
+function internalMatcher(env) {
+  const phones = new Set(String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
+  const normName = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const names = new Set(String(env.INTERNAL_NAMES || '').split(',').map(normName).filter(Boolean));
+  return (e) => {
+    if (phones.size && e.phone && phones.has(String(e.phone).replace(/\D/g, ''))) return true;
+    if (names.size && e.contact_name && names.has(normName(e.contact_name))) return true;
+    return false;
+  };
+}
+
+// События дня с теми же фильтрами, что в дайджесте (удалённые, заблок., внутренние).
 async function loadFilteredEvents(env, now) {
   const raw = (await env.PULSE_KV.get(`events:${almatyDateStr(now)}`, { type: 'json' })) || [];
-  const internalPhones = new Set(
-    String(env.INTERNAL_PHONES || '').split(',').map((s) => s.replace(/\D/g, '')).filter(Boolean));
+  const isInternal = internalMatcher(env);
   return raw.filter((e) => {
     if (!e) return false;
     if (isDeletedMarker(e.text)) return false;
     if (e.blocked) return false;
-    if (internalPhones.size && e.phone && internalPhones.has(String(e.phone).replace(/\D/g, ''))) return false;
+    if (isInternal(e)) return false;
     return true;
   });
 }

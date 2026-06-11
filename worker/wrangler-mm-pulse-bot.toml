@@ -46,6 +46,7 @@ ALTEGIO_COMPANY_ID = "1330174"          # id филиала Altegio — для K
 #   --- PII (репо публичный — только секретами, значения в pulse-deploy.local.txt) ---
 #   wrangler secret put TELEGRAM_CHAT_ID   --config worker/wrangler-mm-pulse-bot.toml
 #   wrangler secret put INTERNAL_PHONES    --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put INTERNAL_NAMES     --config worker/wrangler-mm-pulse-bot.toml  (имена внутр. контактов без телефона, напр. владелец в IG)
 #   wrangler secret put ADMIN_IDS          --config worker/wrangler-mm-pulse-bot.toml
 #   --- Altegio (кнопка «Администраторы», только чтение журнала записей) ---
 #   значения секретов — в worker/pulse-deploy.local.txt (gitignored):
