@@ -4,7 +4,8 @@
  *
  * ФУНКЦИИ:
  *   1) КРУГЛОСУТОЧНО (с 12.06.2026; ранее только ночью 21:00–07:00) — приём
- *      вебхуков от новых лидов в WhatsApp, ответ через Claude API, доведение
+ *      вебхуков от новых лидов в WhatsApp (текст + ГОЛОСОВЫЕ через Whisper,
+ *      Workers AI binding [ai]), ответ через Claude API, доведение
  *      до КЭВ (договорённость о визите: имя/телефон/процедура/день/интервал/
  *      противопоказания). КЭВ мгновенно уходит карточкой в Telegram-группу
  *      менеджеров; после КЭВ бот продолжает отвечать на уточнения
@@ -351,6 +352,16 @@ const KEV_NUDGE_HOUR_MAX = 2;     // отдельный потолок дожи�
 const KEV_NUDGE_MIN_AGE_H = 3;    // не раньше 3 ч после последнего хода бота
 const KEV_NUDGE_MAX_AGE_H = 26;   // старше ~суток — не дожимаем, поезд ушёл
 
+// ── ГОЛОСОВЫЕ (Whisper, Workers AI) ─────────────────────────────────────────
+// Voice-note WhatsApp приходит как message_type=audio + file_url (.oga,
+// Ogg/Opus). Транскрибируем через binding AI (wrangler [ai]) и ведём дальше
+// как обычный текст. Лимит размера: голосовые ~1 МБ/мин, >4 МБ — не наш кейс
+// (скорее песня/файл), такие отдаём менеджеру.
+const VOICE_TYPES = ['audio', 'voice', 'ptt', 'audio_message'];
+const VOICE_MAX_BYTES = 4 * 1024 * 1024;
+const VOICE_MODEL = '@cf/openai/whisper-large-v3-turbo'; // мультиязычный (ru/kz)
+const VOICE_MODEL_FALLBACK = '@cf/openai/whisper';       // вход — массив байт
+
 // Текущее время Almaty в одном месте — чтобы по всему файлу не плодить
 // `new Date(Date.now() + 5*3600000)`. Возвращает объект с распространёнными
 // представлениями.
@@ -628,6 +639,14 @@ export default {
           '🧪 mh-bot: тест канала уведомлений менеджеров. Сообщение можно игнорировать.');
         return json({ ok, ms: Date.now() - t0 });
       }
+      // Ops: проверка транскрипции голосового — GET ?voicetest=<WEBHOOK_SECRET>&url=<file_url>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('voicetest') === env.WEBHOOK_SECRET) {
+        const fileUrl = url.searchParams.get('url') || '';
+        if (!fileUrl) return json({ ok: false, error: 'no_url' });
+        const t0 = Date.now();
+        const text = await transcribeVoice(env, { fileUrl, messageType: 'audio' });
+        return json({ ok: !!text, ms: Date.now() - t0, text });
+      }
       // Ops: симуляция диалога с ботом (golden-тесты промпта, БЕЗ отправок клиенту
       // и в Telegram) — GET ?sim=<WEBHOOK_SECRET>&u=<id>&text=<сообщение>[&reset=1].
       if (env.WEBHOOK_SECRET && url.searchParams.get('sim') === env.WEBHOOK_SECRET) {
@@ -706,6 +725,7 @@ function parseWebhook(body) {
     messageType: p.message_type || 'text',
     destination: p.destination || '',
     createdAt: p.created_at || '',
+    fileUrl: p.file_url || '',   // голосовые/вложения: ссылка на файл (.oga для voice-note)
   };
 }
 
@@ -752,17 +772,39 @@ async function processMessage(msg, env) {
     return;
   }
 
-  // Обрабатываем ТОЛЬКО входящие текстовые сообщения от клиента.
+  // Обрабатываем входящие сообщения клиента: ТЕКСТ и ГОЛОСОВЫЕ.
   // destination=from — «От пользователя». Всё прочее (to, notice_*, ai,
   // comment, altegio_*, ...) — исходящее/служебное/автоматическое, не наше.
+  // Фото/видео/стикеры/документы — по-прежнему менеджерам (бот их не видит).
   if (msg.destination !== 'from') return;
-  if (msg.messageType !== 'text') return;
-  if (!msg.text || !msg.userId) return;
+  if (!msg.userId) return;
+  const isVoice = isVoiceMessage(msg);
+  if (!isVoice && msg.messageType !== 'text') return;
+  if (!isVoice && !msg.text) return;
 
-  // Дедуп — message.help может повторить доставку вебхука. Делаем ДО
-  // confirm_pending, чтобы не среагировать дважды на ответ «Да/Нет».
+  // Дедуп — message.help может повторить доставку вебхука. ДО транскрипции
+  // (не распознавать дважды) и ДО confirm_pending (не среагировать дважды
+  // на ответ «Да/Нет»).
   const seenKey = `seen:${msg.messageId}`;
   if (await env.BOT_KV.get(seenKey)) return;
+
+  // Голосовое → текст (Whisper, Workers AI). Удалось — сообщение дальше
+  // живёт как обычный текст (включая «Да/Нет» на подтверждение записи).
+  // Не удалось — placeholder: в confirm/engage-цепочках уйдёт менеджеру
+  // стандартным follow-up'ом, в чате бота клиента вежливо попросим написать
+  // текстом (фолбэк ниже, после проверок принадлежности чата).
+  let voiceFailed = false;
+  if (isVoice) {
+    const transcript = await transcribeVoice(env, msg);
+    if (transcript) {
+      msg.text = transcript;
+      console.log(`voice ok ${tag}: ${transcript.length} симв.`);
+    } else {
+      voiceFailed = true;
+      msg.text = '[голосовое сообщение — распознать не удалось]';
+      console.log(`voice FAIL ${tag}`);
+    }
+  }
 
   // Ответ клиента на подтверждение записи — НЕЗАВИСИМО от часа суток.
   // Цепочка должна быть доведена в любом случае: «Да» → attendance=2,
@@ -864,6 +906,15 @@ async function processMessage(msg, env) {
       console.log(`skip existing client ${tag}`);
       return;
     }
+  }
+
+  // Голосовое не распозналось, чат ведёт бот (все проверки принадлежности
+  // выше пройдены) — честно просим текст. В Claude placeholder не отправляем.
+  if (voiceFailed) {
+    const ok = await sendMessage(env, msg,
+      'Простите, не получилось расслышать голосовое 🙈 Напишите, пожалуйста, текстом — сразу отвечу.');
+    if (ok) await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+    return;
   }
 
   const contextHistory = appendTurn(histBefore, 'user', msg.text);
@@ -968,6 +1019,70 @@ function buildServiceNote(kevPending, kevMissing) {
       + 'полный BOOKING_JSON, когда всё соберёшь.]';
   }
   return '';
+}
+
+// ── Голосовые сообщения: распознавание через Workers AI (Whisper) ───────────
+
+function isVoiceMessage(msg) {
+  return VOICE_TYPES.includes(String(msg.messageType || '').toLowerCase())
+    && !!msg.fileUrl;
+}
+
+// Транскрипция голосового. Возвращает текст или '' (не вышло — вызывающий
+// решает, что делать). Best-effort: любые сбои логируются и не роняют поток.
+async function transcribeVoice(env, msg) {
+  if (!env.AI || typeof env.AI.run !== 'function') {
+    console.log('voice: AI binding не подключён, пропуск');
+    return '';
+  }
+  let buf;
+  try {
+    const res = await fetch(msg.fileUrl);
+    if (!res.ok) {
+      console.error('voice fetch:', res.status);
+      return '';
+    }
+    const len = Number(res.headers.get('content-length') || 0);
+    if (len && len > VOICE_MAX_BYTES) {
+      console.log(`voice: файл ${len} байт > лимита, менеджеру`);
+      return '';
+    }
+    buf = await res.arrayBuffer();
+    if (buf.byteLength > VOICE_MAX_BYTES) {
+      console.log('voice: файл больше лимита, менеджеру');
+      return '';
+    }
+  } catch (e) {
+    console.error('voice fetch error:', e && e.message);
+    return '';
+  }
+
+  let out = null;
+  try {
+    out = await env.AI.run(VOICE_MODEL, { audio: bufToBase64(buf) });
+  } catch (e1) {
+    console.error(`voice ${VOICE_MODEL}:`, e1 && e1.message);
+    try {
+      out = await env.AI.run(VOICE_MODEL_FALLBACK, { audio: [...new Uint8Array(buf)] });
+    } catch (e2) {
+      console.error(`voice ${VOICE_MODEL_FALLBACK}:`, e2 && e2.message);
+      return '';
+    }
+  }
+  const text = String((out && out.text) || '').trim();
+  // Совсем короткий «текст» — шум/вздох, не сообщение.
+  return text.length >= 2 ? text.slice(0, 1500) : '';
+}
+
+// ArrayBuffer → base64 (вход whisper-large-v3-turbo) без переполнения стека.
+function bufToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
 }
 
 // ── Гейт: новый лид или действующий клиент ─────────────────────────────────

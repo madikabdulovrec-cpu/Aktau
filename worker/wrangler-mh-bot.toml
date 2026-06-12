@@ -25,6 +25,11 @@ crons = ["*/10 * * * *"]
 binding = "BOT_KV"
 id = "729a6c1778f24eaf82b875a8bfea9987"
 
+# Workers AI — транскрипция голосовых клиентов (Whisper). Без него бот просто
+# просит написать текстом (graceful degradation).
+[ai]
+binding = "AI"
+
 # KV mm-pulse-bot — READ-ONLY по соглашению (зеркально его binding'у MH_KV):
 # дневной режим лид-бота читает журнал событий events:YYYY-MM-DD, чтобы не
 # влезать в чаты, где сегодня-вчера уже отвечал человек (humanOwnsDialog).
