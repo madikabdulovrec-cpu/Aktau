@@ -20,6 +20,14 @@ crons = ["0 3-16 * * *"]
 binding = "PULSE_KV"
 id = "100bb068db2f410b8da6f760f9ad3970"
 
+# KV mh-bot (BOT_KV) — READ-ONLY по соглашению: pulse читает карточки КЭВ
+# (kev:*) для сверки с Altegio и пометки sent:* для маркировки сообщений бота.
+# Писать в этот namespace из pulse ЗАПРЕЩЕНО (он принадлежит mh-bot).
+# id — тот же, что в worker/wrangler-mh-bot.toml.
+[[kv_namespaces]]
+binding = "MH_KV"
+id = "729a6c1778f24eaf82b875a8bfea9987"
+
 # Plaintext-переменные (НЕ секреты). Заполнить перед деплоем.
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
@@ -31,6 +39,9 @@ MH_PROJECT_ID = "220763"                # id проекта message.help — П�
 UNANSWERED_THRESHOLD_MIN = "20"         # порог «без ответа сейчас», мин
 SELLERS = ""                            # seed-список сотрудников (только если KV пуст). Дальше список ведут управляющие из бота → KV cfg:sellers.
 ALTEGIO_COMPANY_ID = "1330174"          # id филиала Altegio — для KPI администраторов (кнопка «Администраторы»).
+# ── Контроль «КЭВ → запись» (карточки mh-bot, сверка с Altegio) ──
+KEV_MARKER = "[чат-бот]"                # маркер источника в комментарии записи Altegio (чекер качества)
+KEV_DM_OVERDUE_MIN = "120"              # просрочка сверх SLA (мин), после которой личное сообщение ADMIN_IDS
 # PII — НЕ в git (репозиторий публичный), хранятся СЕКРЕТАМИ. Значения — в worker/pulse-deploy.local.txt:
 #   TELEGRAM_CHAT_ID  — id рабочего чата отдела (для группы отрицательный)
 #   INTERNAL_PHONES   — телефоны сотрудников/внутренние номера, через запятую (отсев из метрик)

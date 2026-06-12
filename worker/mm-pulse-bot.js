@@ -44,8 +44,12 @@
  *   MH_PROJECT_ID            — id проекта message.help (≈220763)
  *   TELEGRAM_CHAT_ID         — id рабочего чата отдела (для группы отрицательный)
  *   UNANSWERED_THRESHOLD_MIN — порог «без ответа сейчас», мин. По умолчанию 20.
- *  KV namespace:
+ *  KV namespaces:
  *   PULSE_KV — бакеты событий дня (events:YYYY-MM-DD, TTL 48 ч) + кэш токена message.help
+ *   MH_KV    — KV mh-bot, READ-ONLY по соглашению: карточки КЭВ (kev:*) для
+ *              сверки с Altegio + пометки sent:* для маркировки сообщений бота
+ *              (bot:true → не считаются скоростью ответа менеджеров и не
+ *              снимают флаг «без ответа»)
  *
  * ─── VERIFY на первом боевом тесте ──────────────────────────────────────────
  * Эти места написаны по mh-bot.js / спецификации message.help — подтвердить:
@@ -428,6 +432,19 @@ export default {
       return json({ ok: true, phone: tail, count: items.length, items });
     }
 
+    // [DEBUG] контроль КЭВ → запись (сверка с Altegio, эскалации, метрики) —
+    // GET ?kev=<DIGEST_SECRET>. Запускает реальный проход (алерты уйдут, если
+    // есть просрочки и они ещё не отправлялись).
+    if (env.DIGEST_SECRET && url.searchParams.get('kev') === env.DIGEST_SECRET) {
+      const stats = await runKevControl(env, Date.now());
+      return json({
+        ok: true,
+        mhKvBound: !!(env.MH_KV && typeof env.MH_KV.list === 'function'),
+        stats,
+        line: formatKevLine(stats) || '(пусто)',
+      });
+    }
+
     // [DEBUG] метрики летней рассылки — GET ?broadcast=<DIGEST_SECRET>.
     if (env.DIGEST_SECRET && url.searchParams.get('broadcast') === env.DIGEST_SECRET) {
       const m = await computeBroadcastMetrics(env, Date.now());
@@ -491,6 +508,25 @@ async function recordEvent(body, env) {
 
   const ev = parseWebhook(body);
   if (!ev) return; // не channel.message.created, либо не клиент/оператор
+
+  // Маркировка бота (mh-bot): свои исходящие тот помечает sent:{message_id} в
+  // своём KV (binding MH_KV, читаем read-only). Такие события получают bot:true —
+  // ответы ИИ не засчитываются в скорость ответа менеджеров и не снимают флаг
+  // «без ответа». direction оставляем 'operator' нарочно: метрики рассылки и
+  // таймлайн диалога продолжают видеть сообщение как исходящее.
+  // Проверяем ЗДЕСЬ (в момент вебхука), а не в дайджесте: sent:-ключи живут 1 час.
+  if (ev.direction === 'operator' && ev.message_id
+      && env.MH_KV && typeof env.MH_KV.get === 'function') {
+    try {
+      let mark = await env.MH_KV.get(`sent:${ev.message_id}`);
+      if (!mark) {
+        // Гонка «вебхук обогнал put» у mh-bot: подождать и перепроверить.
+        await sleep(1200);
+        mark = await env.MH_KV.get(`sent:${ev.message_id}`);
+      }
+      if (mark) ev.bot = true;
+    } catch (_) { /* best-effort: не размечен — посчитается оператором */ }
+  }
 
   const dateKey = `events:${almatyDateStr(ev.ts)}`;
   const bucket = (await env.PULSE_KV.get(dateKey, { type: 'json' })) || [];
@@ -649,6 +685,25 @@ async function runDigest(env, meta) {
     // «без ответа» был честным (если все зависшие заблокированы — час тихий).
     const unBefore = metrics.unanswered.slice();
     await refineUnanswered(env, metrics, isFinal ? 20 : 12);
+
+    // Контроль «КЭВ → запись в Altegio» (карточки mh-bot): сверка по телефону,
+    // SLA-эскалации, метрики дня. Best-effort: сбой не роняет дайджест.
+    // ДО ИИ-судьи: диалоги с ОТКРЫТЫМ КЭВ убираем из «без ответа» — их судьбу
+    // ведёт КЭВ-контроль (карточка уже у менеджеров, SLA тикает), дублировать
+    // их ещё и в списке зависших — тройной шум по одному клиенту.
+    try { metrics.kev = await runKevControl(env, now); }
+    catch (e) { console.error('[kev] control failed:', e && e.message); metrics.kev = null; }
+    if (metrics.kev && metrics.kev.openPhones && metrics.kev.openPhones.length) {
+      const open = new Set(metrics.kev.openPhones);
+      const before = metrics.unanswered.length;
+      metrics.unanswered = metrics.unanswered.filter((u) => {
+        const p = String(u.phone || '').replace(/\D/g, '').slice(-10);
+        return !(p && open.has(p));
+      });
+      metrics.kevHidden = before - metrics.unanswered.length;
+      if (metrics.kevHidden) console.log(`[kev] скрыто из «без ответа» (ведёт КЭВ-контроль): ${metrics.kevHidden}`);
+    }
+
     // Бот сам читает транскрипты зависших и решает, кто реально без ответа.
     await judgeUnanswered(env, metrics, events);
 
@@ -662,6 +717,7 @@ async function runDigest(env, meta) {
         aiDropped: metrics.aiDropped || 0,
         todayLeads: metrics.todayLeads,
         newLeads: metrics.newLeads,
+        kev: metrics.kev,
         aiVerdicts: metrics.aiVerdicts || [],
         finalUnanswered: metrics.unanswered.slice(0, 15).map((u) => ({ label: contactLabel(u), waitedMin: u.waitedMin })),
         preview: (isFinal ? formatFinal : formatIntermediate)(metrics, parts, ''),
@@ -670,9 +726,11 @@ async function runDigest(env, meta) {
 
     // «Тихо»: за 3 часа ничего нового и нет зависших — короткая строка, без LLM.
     if (!isFinal && metrics.deltaLeads === 0 && metrics.unanswered.length === 0) {
+      const kevLine = formatKevLine(metrics.kev);
       const text = `📊 Пульс продаж · ${parts.hhmm} · ${parts.ddmm}\n`
         + `Тихо: 0 новых за час, все диалоги отвечены.\n`
-        + `Всего за день: ${metrics.todayLeads} ${plural(metrics.todayLeads, ['обращение', 'обращения', 'обращений'])}, из них новых: ${metrics.newLeads}.`;
+        + `Всего за день: ${metrics.todayLeads} ${plural(metrics.todayLeads, ['обращение', 'обращения', 'обращений'])}, из них новых: ${metrics.newLeads}.`
+        + (kevLine ? `\n${kevLine}` : '');
       await sendTelegram(env, text);
       await maybeSendBroadcast(env, now); // отдельное письмо по летней рассылке
       console.log('[digest] quiet', { ...metricsSummary(metrics), ...meta });
@@ -771,9 +829,10 @@ function computeMetrics(rawEvents, now, thresholdMin) {
   // Последний ответ оператора ПО ТЕЛЕФОНУ (через все диалоги). Нужно из-за смены номера:
   // клиент пишет на мёртвый WhatsApp (17222) И на новый (20916) — отвечают в одном диалоге,
   // в другом висит «без ответа». Если на телефон ответили где-либо после сообщения — снимаем.
+  // Ответы БОТА (bot:true) не считаются: «без ответа» = человек не вступил.
   const phoneOpTs = new Map();
   for (const e of events) {
-    if (e.direction === 'operator' && e.phone) {
+    if (e.direction === 'operator' && !e.bot && e.phone) {
       const k = String(e.phone).replace(/\D/g, '').slice(-10);
       if (k.length === 10 && (!phoneOpTs.has(k) || e.ts > phoneOpTs.get(k))) phoneOpTs.set(k, e.ts);
     }
@@ -813,8 +872,9 @@ function computeMetrics(rawEvents, now, thresholdMin) {
     const isNewInWindow = firstClientTs >= deltaStart && firstClientTs <= now;
     if (isNewInWindow) { deltaLeads++; if (isNewLead) deltaNew++; }
 
-    // Скорость первого ответа: первый клиентский → первый ответ после него.
-    const firstReply = operatorMsgs.find((o) => o.ts >= firstClientTs);
+    // Скорость первого ответа: первый клиентский → первый ответ ЧЕЛОВЕКА после
+    // него. Ответы mh-bot (bot:true) — не работа менеджеров, в метрику не идут.
+    const firstReply = operatorMsgs.find((o) => !o.bot && o.ts >= firstClientTs);
     if (firstReply) {
       const diff = firstReply.ts - firstClientTs;
       todayResponses.push(diff);
@@ -850,7 +910,10 @@ function computeMetrics(rawEvents, now, thresholdMin) {
       if (sub) substantiveClient.push(e);
     }
     const lastClientMsg = substantiveClient.length ? substantiveClient[substantiveClient.length - 1] : null;
-    const lastOperatorTs = operatorMsgs.length ? operatorMsgs[operatorMsgs.length - 1].ts : -1;
+    // «Без ответа» снимает только ответ ЧЕЛОВЕКА — реплики бота (bot:true) не в счёт
+    // (бот не оформляет записи; клиент, ждущий действия, не должен прятаться).
+    const humanOps = operatorMsgs.filter((o) => !o.bot);
+    const lastOperatorTs = humanOps.length ? humanOps[humanOps.length - 1].ts : -1;
     // Если ПОСЛЕДНЕЕ действие клиента — звонок, разговор ушёл в телефон (его закрывают
     // звонком, не в чате) → чат-«без ответа» не флагуем. Берём любое клиентское событие
     // (даже со служебным message_type), чтобы поймать отметку о звонке.
@@ -1027,6 +1090,238 @@ async function maybeSendBroadcast(env, now) {
 }
 
 /* ============================================================
+ * КОНТРОЛЬ «КЭВ → ЗАПИСЬ В ALTEGIO» (WS-C)
+ * Карточки КЭВ пишет mh-bot в свой KV kev:{userId}:{ts} (binding MH_KV,
+ * читаем read-only по соглашению — pulse в чужой namespace НЕ пишет, своё
+ * состояние сверки держит в PULSE_KV kevstate:*). Каждый часовой тик:
+ *   1) сверка открытых КЭВ с записями Altegio по нормализованному телефону
+ *      (запись СОЗДАНА после КЭВ → КЭВ закрыт, фиксируем лаг);
+ *   2) просрочка SLA → карточка в группу; просрочка > KEV_DM_OVERDUE_MIN —
+ *      личное сообщение управляющим (ADMIN_IDS);
+ *   3) чекер качества записи: услуга соответствует процедуре карточки
+ *      (нестрогий матч по словам), в комментарии маркер KEV_MARKER;
+ *   4) метрики дня для пульса/итога/снимка.
+ * ============================================================ */
+
+const KEV_TRACK_WINDOW_H = 48;  // КЭВ старше 48ч — фиксируем как невыполненный, дальше не трекаем
+
+function kevMarker(env) { return String(env.KEV_MARKER || '[чат-бот]'); }
+const norm10 = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 10 ? d.slice(-10) : ''; };
+
+// create_date Altegio: либо ISO с таймзоной («2026-06-12T01:23:45+05:00») —
+// Date.parse корректен; либо naive-строка В ЛОКАЛЬНОМ времени филиала (Almaty,
+// UTC+5). Общий parseTs для naive-строк применяет МСК (формат message.help) —
+// для Altegio дал бы ошибку 2 часа, поэтому отдельный парсер.
+function parseAltegioCreateTs(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (/(?:[+-]\d{2}:?\d{2}|Z)$/i.test(s)) {
+    const t = Date.parse(s);
+    return Number.isNaN(t) ? null : t;
+  }
+  const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - ALMATY_UTC_OFFSET, +m[5], +(m[6] || 0));
+}
+
+// Карточки КЭВ из KV mh-bot не старше windowH часов. null = MH_KV не подключён.
+async function listKevCardsFromMh(env, now, windowH) {
+  if (!env.MH_KV || typeof env.MH_KV.list !== 'function') return null;
+  const since = now - windowH * 3600000;
+  const out = [];
+  let cursor;
+  for (let i = 0; i < 4; i++) {
+    let page;
+    try {
+      page = await env.MH_KV.list({ prefix: 'kev:', limit: 1000, cursor });
+    } catch (e) {
+      console.error('[kev] MH_KV list:', e && e.message);
+      return null;
+    }
+    for (const k of page.keys) {
+      const ts = Number(String(k.name).split(':')[2]); // kev:{userId}:{ts}
+      if (!Number.isFinite(ts) || ts < since) continue;
+      try {
+        const card = await env.MH_KV.get(k.name, { type: 'json' });
+        if (card && card.phone) out.push({ ...card, kevKey: k.name });
+      } catch (_) { /* пропуск битой карточки */ }
+    }
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  out.sort((a, b) => (a.kevAt || 0) - (b.kevAt || 0));
+  return out;
+}
+
+// Чекер качества записи по КЭВ. «Грязная» = нет маркера [чат-бот] в комментарии
+// ИЛИ услуга записи не похожа на процедуру карточки (нестрогий матч по словам
+// ≥3 букв в обе стороны). Расхождение услуги — пометка в отчёте, не алерт.
+function kevQuality(env, kev, rec) {
+  const issues = [];
+  const marker = kevMarker(env).toLowerCase();
+  if (!String(rec.comment || '').toLowerCase().includes(marker)) {
+    issues.push(`нет маркера ${kevMarker(env)} в комментарии`);
+  }
+  const titles = (rec.services || []).map((s) => String((s && s.title) || '')).join(' ').toLowerCase();
+  const want = String(kev.service || '').toLowerCase();
+  if (!titles.trim()) {
+    issues.push('услуга в записи не указана');
+  } else if (want) {
+    const tokens = want.split(/[^a-zа-яё0-9]+/i).filter((w) => w.length >= 3);
+    const hit = tokens.some((w) => titles.includes(w))
+      || titles.split(/[^a-zа-яё0-9]+/i).filter((w) => w.length >= 3).some((w) => want.includes(w));
+    if (!hit) {
+      issues.push(`услуга «${String((rec.services[0] && rec.services[0].title) || '—').slice(0, 40)}»`
+        + ` не похожа на карточку («${String(kev.service).slice(0, 40)}»)`);
+    }
+  }
+  return { clean: !issues.length, issues };
+}
+
+const kevPhoneLabel = (p) => { const d = String(p || '').replace(/\D/g, ''); return d ? `+${d}` : '—'; };
+const fmtWaitMin = (min) => (min >= 60 ? `${Math.floor(min / 60)} ч ${min % 60} мин` : `${min} мин`);
+
+// Главный проход контроля. Возвращает метрики дня для пульса/снимка
+// (или null, если MH_KV не подключён). Эскалации шлёт сам, по одной на КЭВ
+// (флаги в kevstate, поэтому повторные вызовы в одном тике безопасны).
+async function runKevControl(env, now) {
+  const kevs = await listKevCardsFromMh(env, now, KEV_TRACK_WINDOW_H);
+  if (kevs == null) return null;
+
+  // Записи Altegio, созданные за окно контроля, — один fetch на тик.
+  // altegioOk=false (нет токена / API упал) → НЕ эскалируем и не «протухаем»
+  // КЭВ: без свежих данных «запись не найдена» — это не факт, а слепота.
+  let altegioOk = false;
+  const recsByPhone = new Map(); // last10 → [{ms, rec}] по возрастанию ms
+  if (kevs.length) {
+    const token = await altegioUserToken(env);
+    if (token) {
+      const recs = await fetchAltegioRecords(env, token,
+        almatyDateStr(now - KEV_TRACK_WINDOW_H * 3600000), almatyDateStr(now));
+      if (recs != null) {
+        altegioOk = true;
+        for (const r of recs) {
+          if (!r || r.deleted) continue;
+          const ph = norm10(r.client && r.client.phone);
+          if (!ph) continue;
+          const ms = parseAltegioCreateTs(r.create_date);
+          if (ms == null) continue;
+          if (!recsByPhone.has(ph)) recsByPhone.set(ph, []);
+          recsByPhone.get(ph).push({ ms, rec: r });
+        }
+        for (const list of recsByPhone.values()) list.sort((a, b) => a.ms - b.ms);
+      }
+    }
+    if (!altegioOk) console.error('[kev] Altegio недоступен — тик без сверки/эскалаций');
+  }
+
+  const dmThresholdMin = parseInt(env.KEV_DM_OVERDUE_MIN, 10) || 120;
+  const today = almatyDateStr(now);
+  const stats = {
+    n: 0, done: 0, overdue: 0, dirty: 0, lags: [],
+    openWaiting: 0, dirtyIssues: [], openPhones: [],
+  };
+
+  for (const k of kevs) {
+    const stKey = `kevstate:${k.kevKey}`;
+    let st = (await env.PULSE_KV.get(stKey, { type: 'json' })) || {};
+    const slaMs = Number(k.slaDeadline) || ((k.kevAt || 0) + 3600000);
+
+    if (altegioOk && st.status !== 'closed' && st.status !== 'expired') {
+      // Матч: запись, созданная после КЭВ (допуск −30 мин: менеджер мог успеть
+      // оформить, пока бот дописывал диалог).
+      const cand = (recsByPhone.get(norm10(k.phone)) || [])
+        .find((x) => x.ms >= ((k.kevAt || 0) - 1800000));
+      if (cand) {
+        const lagMin = Math.max(0, Math.round((cand.ms - (k.kevAt || cand.ms)) / 60000));
+        const q = kevQuality(env, k, cand.rec);
+        st = {
+          ...st, status: 'closed', closedAt: cand.ms, recordId: cand.rec.id,
+          lagMin, late: cand.ms > slaMs, clean: q.clean, issues: q.issues,
+        };
+        await env.PULSE_KV.put(stKey, JSON.stringify(st), { expirationTtl: 30 * 86400 });
+        console.log(`[kev] closed ${k.kevKey} rec=${cand.rec.id} lag=${lagMin}min `
+          + `late=${st.late} clean=${q.clean}`);
+      } else if (now - (k.kevAt || 0) > (KEV_TRACK_WINDOW_H - 1) * 3600000) {
+        st = { ...st, status: 'expired' };
+        await env.PULSE_KV.put(stKey, JSON.stringify(st), { expirationTtl: 30 * 86400 });
+        console.log(`[kev] expired ${k.kevKey} — записи так и нет`);
+      } else if (now > slaMs) {
+        // Открыт и просрочен: эскалации (по одной на КЭВ).
+        const overdueMin = Math.round((now - slaMs) / 60000);
+        const waitedMin = Math.round((now - (k.kevAt || now)) / 60000);
+        if (!st.grpAlertAt) {
+          await sendTelegram(env,
+            `⚠️ КЭВ не оформлен: ${k.name || '—'} · ${kevPhoneLabel(k.phone)}\n`
+            + `${k.service || '—'} · ${[k.day, k.interval].filter(Boolean).join(' ') || '—'}\n`
+            + `Договорённость от бота ждёт оформления ${fmtWaitMin(waitedMin)} `
+            + `(SLA ${k.slaLabel || 'прошёл'}).\n`
+            + `Оформите запись в Altegio, в комментарий — маркер ${kevMarker(env)}.`);
+          st.grpAlertAt = now;
+          await env.PULSE_KV.put(stKey, JSON.stringify(st), { expirationTtl: 30 * 86400 });
+        }
+        if (overdueMin > dmThresholdMin && !st.dmAlertAt) {
+          for (const adminId of adminIds(env)) {
+            await tgCall(env, 'sendMessage', {
+              chat_id: adminId,
+              text: `🚨 КЭВ просрочен на ${fmtWaitMin(overdueMin)} сверх SLA:\n`
+                + `${k.name || '—'} · ${kevPhoneLabel(k.phone)} · ${k.service || '—'}\n`
+                + 'Запись в Altegio так и не оформлена — нужна ваша реакция.',
+              disable_web_page_preview: true,
+            });
+          }
+          st.dmAlertAt = now;
+          await env.PULSE_KV.put(stKey, JSON.stringify(st), { expirationTtl: 30 * 86400 });
+        }
+      }
+    }
+
+    // Телефоны ВСЕХ открытых КЭВ (за окно контроля) — runDigest по ним убирает
+    // диалоги из «без ответа»: их судьбу ведёт КЭВ-контроль, дублировать шум не надо.
+    if (st.status !== 'closed' && st.status !== 'expired') {
+      const p10 = norm10(k.phone);
+      if (p10) stats.openPhones.push(p10);
+    }
+
+    // Метрики дня — по календарному дню КЭВ (Алматы).
+    if (almatyDateStr(k.kevAt || 0) === today) {
+      stats.n++;
+      if (st.status === 'closed') {
+        stats.done++;
+        stats.lags.push(st.lagMin || 0);
+        if (st.late) stats.overdue++;
+        if (st.clean === false) {
+          stats.dirty++;
+          stats.dirtyIssues.push(`${k.name || kevPhoneLabel(k.phone)}: ${(st.issues || []).join('; ')}`);
+        }
+      } else if (st.status === 'expired') {
+        stats.overdue++;
+      } else {
+        stats.openWaiting++;
+        if (now > slaMs) stats.overdue++;
+      }
+    }
+  }
+
+  stats.lagMedianMin = stats.lags.length
+    ? medianMinutes(stats.lags.map((m) => m * 60000)) : null;
+  console.log(`[kev] control: tracked=${kevs.length} today=${stats.n} done=${stats.done} `
+    + `overdue=${stats.overdue} dirty=${stats.dirty} waiting=${stats.openWaiting}`);
+  return stats;
+}
+
+// Строка блока КЭВ для пульса/итога дня. null-метрики (MH_KV не подключён) → ''.
+function formatKevLine(kev) {
+  if (!kev || (!kev.n && !kev.overdue && !kev.openWaiting)) return '';
+  const pctDone = kev.n ? Math.round((kev.done / kev.n) * 100) : 0;
+  let s = `🤝 КЭВ бота: ${kev.n} за день · оформлено ${kev.done}${kev.n ? ` (${pctDone}%)` : ''}`;
+  if (kev.lagMedianMin != null) s += ` · медианный лаг ${kev.lagMedianMin} мин`;
+  if (kev.overdue) s += ` · ⚠️ просрочено ${kev.overdue}`;
+  if (kev.dirty) s += ` · 🧹 грязных ${kev.dirty}`;
+  return s;
+}
+
+/* ============================================================
  * СВЕРКА ЛИДОВ ДНЯ — таргетолог vs message.help vs реальные диалоги
  * ============================================================ */
 
@@ -1176,12 +1471,19 @@ async function buildDailySnapshot(env, now) {
   const reco = computeLeadReco(events, now);
   const dateStr = almatyDateStr(now);
   const tRaw = await env.PULSE_KV.get(`target:${dateStr}`);
+  // Блок КЭВ — для отчётов за период. runKevControl идемпотентен (эскалации
+  // защищены флагами kevstate), повторный вызов в тике безопасен.
+  let kev = null;
+  try { kev = await runKevControl(env, now); } catch (_) { /* без блока КЭВ */ }
   return {
     date: dateStr,
     target: tRaw != null ? parseInt(tRaw, 10) : null,
     wrote: reco.newContacts, real: reco.real,
     spam: reco.breakdown.spam, greeting: reco.breakdown.greeting, noText: reco.breakdown.noText,
     newLeads: m.newLeads, ongoing: m.ongoing, medianMin: m.todayMedianMin, unanswered: m.unanswered.length,
+    kevN: kev ? kev.n : null, kevDone: kev ? kev.done : null,
+    kevOverdue: kev ? kev.overdue : null, kevDirty: kev ? kev.dirty : null,
+    kevLagMedian: kev ? kev.lagMedianMin : null,
   };
 }
 async function saveDailySnapshot(env, snap) {
@@ -1238,6 +1540,12 @@ function formatSalesDay(s, mhTotal) {
   lines.push(`🎯 Таргетолог: ${s.target != null ? s.target : '—'} · 📥 message.help: ${mhTotal != null ? mhTotal : '—'} · ✍️ написали: ${s.wrote} · ✅ реальных: ${s.real}`);
   lines.push(`🆕 Новых заявок: ${s.newLeads} · ↩️ продолжений: ${s.ongoing}`);
   lines.push(`⏱ Медиана ответа: ${s.medianMin != null ? s.medianMin + ' мин' : '—'} · 🔴 без ответа: ${s.unanswered}`);
+  if (s.kevN != null && (s.kevN || s.kevOverdue)) {
+    lines.push(`🤝 КЭВ бота: ${s.kevN} · оформлено ${s.kevDone}`
+      + (s.kevLagMedian != null ? ` · лаг ${s.kevLagMedian} мин` : '')
+      + (s.kevOverdue ? ` · ⚠️ просрочено ${s.kevOverdue}` : '')
+      + (s.kevDirty ? ` · 🧹 грязных ${s.kevDirty}` : ''));
+  }
   const junk = [];
   if (s.spam) junk.push(`спам ${s.spam}`);
   if (s.greeting) junk.push(`односложные ${s.greeting}`);
@@ -1248,6 +1556,7 @@ function formatSalesDay(s, mhTotal) {
 function formatSalesPeriod(range, snaps, mhDaily) {
   const byDate = {}; for (const s of snaps) byDate[s.date] = s;
   let sumReg = 0, sumReal = 0, sumNew = 0, sumTarget = 0, daysReg = 0, daysReal = 0, daysTarget = 0;
+  let sumKev = 0, sumKevDone = 0, sumKevOverdue = 0, daysKev = 0;
   const perDay = [];
   for (const d of range.dates) {
     const s = byDate[d];
@@ -1256,6 +1565,7 @@ function formatSalesPeriod(range, snaps, mhDaily) {
     if (reg != null) { sumReg += reg; daysReg++; }
     if (real != null) { sumReal += real; daysReal++; }
     if (s) { sumNew += s.newLeads || 0; if (s.target != null) { sumTarget += s.target; daysTarget++; } }
+    if (s && s.kevN != null) { sumKev += s.kevN; sumKevDone += s.kevDone || 0; sumKevOverdue += s.kevOverdue || 0; daysKev++; }
     if (reg != null || real != null) perDay.push(`${ddmmFromDate(d)} ${reg != null ? reg : '—'}${real != null ? '→' + real : ''}`);
   }
   const lines = [`📊 Отчёт «Отдел продаж» · ${range.label} (${ddmmFromDate(range.from)}–${ddmmFromDate(range.to)})`];
@@ -1263,6 +1573,10 @@ function formatSalesPeriod(range, snaps, mhDaily) {
   lines.push(`✅ Реальных диалогов: ${daysReal ? sumReal : '—'}${daysReal ? ` (${daysReal} дн с данными)` : ''}`);
   if (daysReal) lines.push(`🆕 Новых заявок: ${sumNew}`);
   if (daysTarget) lines.push(`🎯 Таргетолог (где указан): ${sumTarget}`);
+  if (daysKev && sumKev) {
+    lines.push(`🤝 КЭВ бота: ${sumKev} · оформлено ${sumKevDone} (${pct(sumKevDone, sumKev)}%)`
+      + (sumKevOverdue ? ` · просрочено ${sumKevOverdue}` : '') + ` — ${daysKev} дн с данными`);
+  }
   if (perDay.length) lines.push('— ' + perDay.join(' · '));
   lines.push('ℹ️ Детальная аналитика копится с запуска; за прошлые дни — число лидов из реестра message.help.');
   return lines.join('\n');
@@ -1530,6 +1844,9 @@ function formatIntermediate(m, parts, smart) {
     if (m.unanswered.length > 5) lines.push(`…и ещё ${m.unanswered.length - 5}`);
   }
 
+  const kevLine = formatKevLine(m.kev);
+  if (kevLine) lines.push(kevLine);
+
   const action = cleanSmart(smart);
   if (action) lines.push(`⚡ Действие: ${action}`);
   return lines.join('\n');
@@ -1548,6 +1865,13 @@ function formatFinal(m, parts, smart) {
     const why = top.aiReason ? `${top.aiReason}, ` : '';
     lines.push(`🔴 Без ответа на конец дня: ${m.unanswered.length} `
       + `(дольше всех ${top.isNew ? '🆕 ' : '↩️ '}${contactLabel(top)} — ${why}${top.waitedMin} мин)`);
+  }
+
+  const kevLine = formatKevLine(m.kev);
+  if (kevLine) lines.push(kevLine);
+  if (m.kev && m.kev.dirty && m.kev.dirtyIssues && m.kev.dirtyIssues.length) {
+    lines.push('🧹 «Грязные» записи по КЭВ (нет маркера / услуга не совпала):');
+    for (const d of m.kev.dirtyIssues.slice(0, 5)) lines.push(`• ${d}`);
   }
 
   // callPersona для итога возвращает «вывод дня\nдействие на завтра».
@@ -1605,6 +1929,12 @@ function buildIntermediatePrompt(m, parts) {
   } else {
     lines.push('- зависших без ответа сейчас нет');
   }
+  if (m.kev && m.kev.n) {
+    lines.push(`- КЭВ ночного бота (готовые договорённости о визите): ${m.kev.n}, `
+      + `оформлено записей в Altegio: ${m.kev.done}, просрочено: ${m.kev.overdue}`
+      + (m.kev.lagMedianMin != null ? `, медианный лаг оформления ${m.kev.lagMedianMin} мин` : '')
+      + '. КЭВ без записи = почти готовый клиент теряется на ровном месте.');
+  }
   lines.push(
     '',
     'Это короткий пульс в рабочий чат отдела, выходит каждый час. Дай блок «на что',
@@ -1629,6 +1959,11 @@ function buildFinalPrompt(m, parts) {
       ? `- медиана первого ответа: ${m.todayMedianMin} мин`
       : '- медиана первого ответа: данных нет',
     `- осталось без ответа на конец дня: ${m.unanswered.length}`,
+    ...(m.kev && m.kev.n ? [
+      `- КЭВ ночного бота: ${m.kev.n}, оформлено записей: ${m.kev.done}, `
+      + `просрочено: ${m.kev.overdue}, «грязных» записей: ${m.kev.dirty}`
+      + (m.kev.lagMedianMin != null ? `, медианный лаг ${m.kev.lagMedianMin} мин` : ''),
+    ] : []),
     '',
     'Это итоговый пульс дня в рабочий чат отдела. Дай ровно две строки, голосом РОП,',
     'конкретно, без заголовков:',
@@ -1710,7 +2045,9 @@ async function callClaude(env, userPrompt, opts = {}) {
  * ============================================================ */
 
 // Системный промпт классификатора: НЕ персона РОП, а сухой контролёр.
-const JUDGE_PROMPT = `Ты — контролёр чата отдела продаж бьюти-студии M&M. На входе несколько диалогов с клиентами: реплики «Клиент»/«Менеджер» по времени (история ~2 дня, текст может быть обрезан).
+const JUDGE_PROMPT = `Ты — контролёр чата отдела продаж бьюти-студии M&M. На входе несколько диалогов с клиентами: реплики «Клиент»/«Менеджер»/«Бот» по времени (история ~2 дня, текст может быть обрезан).
+
+«Бот» — автоответчик студии (ИИ): он отвечает на вопросы и собирает заявки, но НЕ оформляет записи и не решает сложные вопросы. Если бот уже ответил клиенту по сути и действий человека не требуется — needs_reply=false. Если клиент ждёт действия ЧЕЛОВЕКА (оформить запись, перенести, отменить, перезвонить, цена курса, жалоба) — needs_reply=true, даже если бот что-то ответил.
 
 Для КАЖДОГО диалога реши: нужен ли СЕЙЧАС ответ менеджера клиенту.
 
@@ -1770,7 +2107,7 @@ async function judgeUnanswered(env, metrics, events) {
     const cases = judged.map((u, idx) => {
       const evs = (byDialog.get(u.dialogId) || []).slice().sort((a, b) => a.ts - b.ts).slice(-14);
       const transcript = evs.map((e) => {
-        const who = e.direction === 'client' ? 'Клиент' : 'Менеджер';
+        const who = e.direction === 'client' ? 'Клиент' : (e.bot ? 'Бот' : 'Менеджер');
         const body = e.text ? e.text : `[${e.message_type || 'вложение'}]`;
         return `${who} ${almatyParts(e.ts).hhmm}: ${body}`;
       }).join('\n');
