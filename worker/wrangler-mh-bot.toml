@@ -25,6 +25,14 @@ crons = ["*/10 * * * *"]
 binding = "BOT_KV"
 id = "729a6c1778f24eaf82b875a8bfea9987"
 
+# KV mm-pulse-bot — READ-ONLY по соглашению (зеркально его binding'у MH_KV):
+# дневной режим лид-бота читает журнал событий events:YYYY-MM-DD, чтобы не
+# влезать в чаты, где сегодня-вчера уже отвечал человек (humanOwnsDialog).
+# Писать сюда из mh-bot ЗАПРЕЩЕНО (namespace принадлежит pulse).
+[[kv_namespaces]]
+binding = "PULSE_KV"
+id = "100bb068db2f410b8da6f760f9ad3970"
+
 # Plaintext-переменные (НЕ секреты). Заполнить перед деплоем.
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
