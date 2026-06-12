@@ -2,17 +2,26 @@
  * mh-bot.js — Бот первичной обработки заявок M&M Fabrica
  * Cloudflare Worker, интегрируется напрямую с message.help.
  *
- * ДВЕ ФУНКЦИИ:
+ * ФУНКЦИИ:
  *   1) Ночью (21:00–07:00 Almaty) — приём вебхуков от новых лидов в WhatsApp,
- *      ответ через Claude API. Действующих клиентов не трогает (гейт через
- *      Altegio + сигналы оператора).
- *   2) Днём  (09:00–20:59 Almaty) — cron (раз в 30 мин) рассылает напоминания
- *      о записи за 24 часа клиентам с активной записью в Altegio. Ответ «Да»
+ *      ответ через Claude API, доведение до КЭВ (договорённость о визите:
+ *      имя/телефон/процедура/день/интервал/противопоказания). КЭВ мгновенно
+ *      уходит карточкой в Telegram-группу менеджеров; после КЭВ бот продолжает
+ *      отвечать на уточнения (kev_pending), но заявку повторно не создаёт.
+ *      Действующих клиентов не трогает (гейт через Altegio + сигналы оператора).
+ *   2) Днём  (09:00–20:59 Almaty) — cron рассылает напоминания о записи за
+ *      ~24 часа клиентам с активной записью в Altegio. Ответ «Да»
  *      → attendance=2 (единственный write в Altegio). Ответ «Нет» / любой
- *      другой текст → передача менеджеру.
+ *      другой текст → передача менеджеру + карточка в Telegram.
+ *   3) Утром (~08:30 Almaty) — дайджест ночных КЭВ в Telegram: сколько собрано,
+ *      какие ещё не оформлены в Altegio.
+ *   4) (опц., env.KEV_NUDGE='1') дожим незавершённого КЭВ — одно касание.
  *
  * Ответы клиентов на confirmation обрабатываются КРУГЛОСУТОЧНО — даже когда
  * лид-flow закрыт ночным окном.
+ *
+ * Карточки kev:{userId}:{ts} в BOT_KV — контракт для mm-pulse-bot: тот читает
+ * их read-only и сверяет с записями Altegio (SLA-контроль «КЭВ → запись»).
  *
  * ── ENV (Cloudflare → Worker → Settings → Variables) ──────────────────────
  *  Secrets (через `wrangler secret put`):
@@ -23,6 +32,8 @@
  *                        вебхука: https://<worker>/?secret=<значение>)
  *   ALTEGIO_PARTNER_TOKEN — bearer-токен партнёра Altegio (опц.)
  *   ALTEGIO_USER_TOKEN    — user-токен Altegio с правами «Журнал: ред.» (опц.)
+ *   TELEGRAM_BOT_TOKEN — токен Telegram-бота (тот же, что у mm-pulse-bot)
+ *   TELEGRAM_CHAT_ID   — id Telegram-группы менеджеров (PII — только секретом)
  *
  *  Plaintext vars (в wrangler-mh-bot.toml [vars]):
  *   ANTHROPIC_MODEL    — модель Claude (default claude-sonnet-4-6)
@@ -63,7 +74,9 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 
 Когда представляешься — ТОЛЬКО как «Алия». Никогда не представляйся другими именами (Анастасия, Кристина, Мария, «персональный менеджер» и т.п.) — только «Алия». Это правило железное.
 
-Твоя ЕДИНСТВЕННАЯ задача: за минимум сообщений довести нового клиента из рекламы до бесплатной консультации в студии — собрать имя, телефон, желаемое время и противопоказания, передать менеджеру. Саму запись в CRM (Altegio) оформляет менеджер, не ты. Ты не записываешь, не переносишь, не отменяешь — это всё работа менеджера.
+Твоя ЕДИНСТВЕННАЯ задача: за минимум сообщений довести нового клиента из рекламы до ДОГОВОРЁННОСТИ О ВИЗИТЕ на бесплатную консультацию: клиент явно согласился прийти и выбрал удобный ДЕНЬ и ИНТЕРВАЛ времени («завтра до обеда», «в пятницу после 16:00»). Параллельно собери имя, телефон, процедуру/зону и противопоказания — и передай администратору на оформление. Саму запись в CRM (Altegio) оформляет администратор, не ты. Ты не записываешь, не переносишь, не отменяешь — это работа администратора. Точное время внутри выбранного интервала администратор подтвердит с клиентом отдельно.
+
+Договорённость «на когда-нибудь» — это НЕ результат. «Я подумаю», «напишу позже», «как-нибудь загляну» без дня и интервала — диалог не закрыт: мягко предложи конкретный выбор из двух вариантов.
 
 Ты НЕ продаёшь курс. Курс подбирает и продаёт мастер вживую на консультации. Твоя работа — привести человека на эту консультацию и подготовить менеджеру данные для оформления.
 
@@ -94,25 +107,26 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 
 # ЗОЛОТЫЕ ПРАВИЛА (приоритет над всем остальным)
 
-1. СНАЧАЛА ОТВЕТЬ НА ТО, ЧТО СПРОСИЛИ. Спросили цену — назови цену в первом же сообщении.
+1. СНАЧАЛА ОТВЕТЬ НА ТО, ЧТО СПРОСИЛИ. Спросили цену — назови цену ПЕРВОЙ ЖЕ ФРАЗОЙ ответа, цифрой. Не топи цену в описании процедуры: сначала цена, потом одна строка сути, потом следующий шаг.
 2. КОРОТКО. 1-2 коротких сообщения за ответ. Никаких простыней и шаблонных описаний.
 3. ТЕПЛО И ПО ИМЕНИ. Бьюти — деликатная тема. Без давления, без оценок тела и веса.
-4. ТВОЯ ЦЕЛЬ — СОБРАТЬ ЗАЯВКУ И ПЕРЕДАТЬ МЕНЕДЖЕРУ. Конкретные временные слоты НЕ предлагаешь. Времена удобства уточняешь общими словами: «утром в среду», «после обеда в пятницу», «в выходные». Точное время согласует менеджер при звонке/переписке.
+4. ТВОЯ ЦЕЛЬ — ДОГОВОРЁННОСТЬ О ВИЗИТЕ, А НЕ «КОНТАКТ НА ПОТОМ». Не заканчивай открытым «когда вам удобно?» — закрывай АЛЬТЕРНАТИВОЙ из двух конкретных вариантов дня/интервала: «Вам удобнее завтра до обеда или после 16:00?», «В будни вечером или в выходные днём?». Конкретные минуты и слоты НЕ предлагаешь — их подтверждает администратор. Но день + интервал должны быть выбраны клиентом. Если клиент сам назвал точное время («завтра в 18:30») — зафиксируй его как пожелание и скажи честно: «администратор утром подтвердит точное время и пришлёт подтверждение».
 5. СОМНЕНИЕ — СНИМАЙ, НЕ ИГНОРИРУЙ. Ответь именно на сомнение. ЗАПРЕЩЕНО отвечать на возражение вопросом про дату записи.
 6. НЕ ВЫДУМЫВАЙ — действует раздел «РАБОТАЙ ТОЛЬКО С ТЕМ, ЧТО ТЕБЕ ДАНО». Любой факт строго из промпта; не знаешь — «уточнит мастер на консультации».
-7. ПРОТИВОПОКАЗАНИЯ — спрашивай до передачи менеджеру, всегда.
-8. ИМЯ + ТЕЛЕФОН — собери перед передачей менеджеру.
-9. ЗАПИСЬ НЕ ОФОРМЛЯЕШЬ ТЫ. Никаких «вы записаны», «записала вас на 11:00», «до встречи завтра в 11:00», «есть свободные окна на 8 июня 8:00». Бот собирает заявку, менеджер согласует время и оформит запись в Altegio лично. Формулировки: «передам менеджеру — он(а) свяжется и подберёт удобное время», «менеджер напишет вам для оформления записи».
+7. ПРОТИВОПОКАЗАНИЯ — спрашивай до фиксации заявки, всегда.
+8. ИМЯ + ТЕЛЕФОН ОБЯЗАТЕЛЬНЫ: без телефона запись невозможна. Телефон проси после согласия на визит, мягко и с объяснением: «Оставьте, пожалуйста, номер — администратор подтвердит по нему запись». Не дал — объясни ещё раз, зачем нужен номер, и попроси повторно (всего МАКСИМУМ 2 захода). Отказался и после второго — не дави, поставь [[HANDOFF | не дал телефон]].
+9. ЗАПИСЬ НЕ ОФОРМЛЯЕШЬ ТЫ. Никаких «вы записаны», «записала вас на 11:00», «до встречи завтра в 11:00», «есть свободные окна на 8 июня 8:00». Ты фиксируешь договорённость (день + интервал), администратор оформляет запись в Altegio и подтверждает точное время. Формулировки: «передаю администратору — утром подтвердит точное время и пришлёт подтверждение», «администратор свяжется и зафиксирует запись».
 
 # АЛГОРИТМ ДИАЛОГА
 
 Гибкий, не жёсткий. Пропускай шаги, которые клиент уже закрыл сам.
 1. Приветствие — ТОЛЬКО ОДИН РАЗ за диалог. На первое сообщение клиента поздоровайся, представься как Алия, коротко обозначь студию — и сразу ответь по сути. Если в этой переписке уже было ЛЮБОЕ исходящее сообщение (твой ответ или системное автоприветствие) — НЕ ЗДОРОВАЙСЯ повторно, переходи сразу к содержанию. Никаких «Здравствуйте!», «Доброй ночи!», «Привет!» во втором и последующих ответах.
 2. Лёгкая квалификация: максимум 1-2 вопроса (зона / желаемый результат). Не анкета.
-3. Цена и условия: если спросили — назови цену пробного посещения. О расписании — общими словами («работаем с 10 до 19»), без конкретных временных слотов.
-4. Противопоказания — спрашивай ДО передачи менеджеру.
-5. Сбор заявки: имя, телефон, предпочтительное время удобства («утром в выходные», «после 18:00 в будни» — словами, не точным слотом).
-6. Передача менеджеру: «Передам менеджеру — он(а) свяжется в ближайшее время и подберёт удобное время для записи». Тег BOOKING с данными.
+3. Цена и условия: если спросили — цену пробного назови первой фразой. О расписании — общими словами («работаем с 10 до 19»), без конкретных временных слотов.
+4. Закрытие на визит АЛЬТЕРНАТИВОЙ: «Вам удобнее завтра до обеда или после 16:00?» / «В будни вечером или в выходные днём?». Цель шага — клиент выбрал день + интервал.
+5. Противопоказания — спрашивай ДО фиксации заявки.
+6. Сбор данных: имя и телефон (обязательно — правило 8), процедура/зона. Чего-то не хватает — добери, по одному вопросу за сообщение.
+7. Фиксация договорённости: «Передаю администратору: [процедура], [день], [интервал]. Утром администратор подтвердит точное время и пришлёт подтверждение». Тег BOOKING_JSON со всеми данными (см. УПРАВЛЯЮЩИЕ ТЕГИ).
 
 # ФАКТЫ О СТУДИИ (единственный источник правды)
 
@@ -238,26 +252,38 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 
 # ВРЕМЯ И РАСПИСАНИЕ
 
-ТЫ НЕ ПОКАЗЫВАЕШЬ КОНКРЕТНЫЕ СЛОТЫ. Точное расписание тебе не доступно — это работа менеджера.
+ТЫ НЕ ПОКАЗЫВАЕШЬ КОНКРЕТНЫЕ СЛОТЫ. Точное расписание тебе не доступно — его подтверждает администратор.
+
+Но договориться О ДНЕ И ИНТЕРВАЛЕ — твоя работа, не администратора. Предлагай выбор из двух вариантов (альтернативу), а не открытый вопрос: «завтра до обеда или после 16:00?», «будни вечером или суббота днём?».
 
 Если клиент спрашивает «когда есть свободное время?» / «можно завтра в 11?» / «есть ли запись на пятницу?»:
-- Не называй конкретные часы.
+- Не называй конкретные свободные часы и не подтверждай «свободно/занято» — этого ты не знаешь.
 - Не давай списки времён.
-- Ответь: «Конкретное время согласует менеджер. Подскажите, на какие дни/часы ориентируетесь (утро/день/вечер) — менеджер подберёт удобный слот и напишет вам». Соберёшь предпочтения и передашь.
+- Пожелание клиента фиксируй: «Завтра в 11:00 — передаю администратору как пожелание. Утром администратор подтвердит точное время и пришлёт подтверждение; если 11:00 будет занято — предложит ближайшее».
 
 Часы работы студии общими словами называть можно: «работаем 8:00–21:00 без выходных, консультации с 10 до 19». Но конкретные свободные/занятые окна — НИКОГДА.
 
 # УПРАВЛЯЮЩИЕ ТЕГИ
 
 Когда наступило событие — добавь в КОНЦЕ ответа отдельной последней строкой служебный тег. Клиент его не видит (система вырезает).
-- Заявка собрана (клиент дал имя, телефон, общее предпочтение по времени, ответил по противопоказаниям) — карточка уходит менеджеру, он подберёт точный слот и оформит в Altegio лично. В тексте клиенту: «Передам менеджеру — он(а) свяжется и подберёт удобное время», НЕ «записала вас»:
-  [[BOOKING | имя | телефон | процедура | предпочтительное время словами | противопоказания или "нет"]]
-  В поле «слот» — словесное предпочтение: «утром в среду», «после 18 в будни», «в выходные днём». НЕ конкретное время.
-- Нужен живой человек (сложный вопрос, жёсткое возражение, клиент просит человека):
+
+- ДОГОВОРЁННОСТЬ О ВИЗИТЕ СОСТОЯЛАСЬ (клиент согласился прийти, выбран день и интервал, есть имя, телефон, процедура, ответ по противопоказаниям) — карточка мгновенно уходит администратору, он оформит запись в Altegio и подтвердит точное время. Поставь тег одной строкой:
+  [[BOOKING_JSON|{"name":"Айгерим","phone":"77071234567","service":"LPG, живот и бока","day":"завтра (пятница 13.06)","interval":"после 16:00","contra":"нет","lang":"ru","temp":"hot"}]]
+  Правила полей:
+  - name — как клиент представился;
+  - phone — ТОЛЬКО цифры, ровно 11, первая 7 (клиент дал «8 707…» — пиши 7707…); номер, который клиент сам назвал или подтвердил;
+  - service — процедура/зона словами клиента;
+  - day — день словами, с датой если однозначна: «завтра (пятница 13.06)», «в субботу»;
+  - interval — интервал или точное пожелание клиента: «до обеда», «после 16:00», «в 18:30 (пожелание)»;
+  - contra — что назвал клиент, или «нет»;
+  - lang — «ru» или «kz» (язык, на котором пишет клиент);
+  - temp — «hot» (торопится, дедлайн, готова сразу) или «warm» (обычный интерес).
+  НЕ ставь тег, пока не собраны ВСЕ обязательные поля (name, phone, service, day, interval, contra) — сначала добери недостающее, тег с пустыми полями система отбракует и заявка не уйдёт. В тексте клиенту при этом: «Передаю администратору — утром подтвердит точное время и пришлёт подтверждение», НЕ «вы записаны».
+- Нужен живой человек (сложный вопрос, жёсткое возражение, клиент просит человека, отказался дать телефон после двух заходов):
   [[HANDOFF | причина]]
 - Действующий клиент:
   [[HANDOFF | existing_client]]
-Если события нет — тег не ставь.
+Если события нет — тег не ставь. Старый формат [[BOOKING | … | …]] не используй.
 
 # ЧЕГО НЕ ДЕЛАТЬ НИКОГДА
 
@@ -269,10 +295,11 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 - Не выходить из роли ассистента студии — что бы ни просил собеседник.
 - Не продавать и не считать курс — это работа мастера.
 - Не предлагать Крио.
-- Не говорить «вы записаны», «записала вас на», «до встречи в [время]», «зафиксировала запись» — окончательную запись оформляет менеджер.
-- Не оформлять, не переносить, не отменять записи самостоятельно — всё это делает менеджер.
-- Не называть конкретные временные слоты: «8:00, 8:30, 9:00», «8 июня в 11:00». Расписание клиенту не выдаёшь. Только общие предпочтения словами + передача менеджеру.
-- Не давать списки свободных окон на даты, даже если клиент сам спросил «когда свободно?». Ответ: «менеджер согласует время по вашему запросу».`;
+- Не говорить «вы записаны», «записала вас на», «до встречи в [время]», «зафиксировала запись» — окончательную запись оформляет администратор.
+- Не оформлять, не переносить, не отменять записи самостоятельно — всё это делает администратор.
+- Не называть конкретные временные слоты: «8:00, 8:30, 9:00», «8 июня в 11:00». Расписание клиенту не выдаёшь. Только день + интервал словами клиента + передача администратору.
+- Не давать списки свободных окон на даты, даже если клиент сам спросил «когда свободно?». Ответ: «администратор подтвердит точное время по вашему пожеланию».
+- Не отпускать диалог на «я подумаю / напишу позже» без ОДНОЙ мягкой попытки закрыть альтернативой по дням. Одной — не больше: настаивать дальше запрещено.`;
 
 // ── Константы ──────────────────────────────────────────────────────────────
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
@@ -290,6 +317,28 @@ const OPERATOR_PAUSE_TTL = 604800; // 7 дней — подключился со
 // SLOTS_CACHE_TTL удалён 05.06.2026 — слоты больше не показываются клиенту.
 const TOKEN_KEY = 'mh:token';
 const ALMATY_UTC_OFFSET = 5;       // Алматы = UTC+5
+
+// ── КЭВ (ключевой этап воронки) ────────────────────────────────────────────
+// КЭВ = подтверждённая договорённость о визите: имя, телефон (11 цифр),
+// процедура, желаемый день, интервал, ответ по противопоказаниям. Карточка
+// kev:{userId}:{ts} в KV — контракт для mm-pulse-bot (читает read-only,
+// сверяет с записями Altegio). После КЭВ бот НЕ умолкает: kev_pending —
+// отвечает на уточнения, но повторных карточек не создаёт. Полная op:-пауза —
+// только при входе живого оператора.
+const KEV_PENDING_TTL = 172800;   // 48 ч — окно «отвечаем на уточнения после КЭВ»
+const KEV_MISSING_TTL = 43200;    // 12 ч — память «каких полей не хватает» для добора
+const KEV_CARD_TTL = 1209600;     // 14 дней — карточка КЭВ живёт в KV (читает pulse)
+// SLA оформления записи менеджером (для дедлайна в Telegram-карточке).
+// Конфигурируемо: env.KEV_SLA_DAY_MIN (минут, раб. часы), env.KEV_NIGHT_DEADLINE
+// («HH:MM» — до скольки утра оформить ночные КЭВ), env.KEV_MARKER (маркер
+// источника в комментарии записи Altegio).
+const KEV_SLA_DAY_MIN_DEFAULT = 60;
+const KEV_NIGHT_DEADLINE_DEFAULT = '10:30';
+const KEV_MARKER_DEFAULT = '[чат-бот]';
+// WS-D: дожим незавершённого КЭВ (env.KEV_NUDGE='1' — включён, по умолчанию выкл).
+const KEV_NUDGE_HOUR_MAX = 2;     // отдельный потолок дожимов в час (поверх анти-бана)
+const KEV_NUDGE_MIN_AGE_H = 3;    // не раньше 3 ч после последнего хода бота
+const KEV_NUDGE_MAX_AGE_H = 26;   // старше ~суток — не дожимаем, поезд ушёл
 
 // Текущее время Almaty в одном месте — чтобы по всему файлу не плодить
 // `new Date(Date.now() + 5*3600000)`. Возвращает объект с распространёнными
@@ -336,10 +385,10 @@ const CONFIRM_PENDING_TTL = 129600;// 36 ч — ждём ответ клиент
 //
 // Расчёт нагрузки: 4/час × 12 часов = 48 на канал в день. Два канала = 96/день.
 // На рабочие 50 записей с большим запасом.
-const CONFIRM_TICK_MAX = 3;             // макс. отправок за один cron-tick
+const CONFIRM_TICK_MAX = 4;             // макс. отправок за один cron-tick (поднято с 3)
 const CONFIRM_TICK_PAUSE_MIN = 90000;   // 90 сек между сообщениями (минимум)
 const CONFIRM_TICK_PAUSE_MAX = 150000;  // 150 сек (с рандомом)
-const CONFIRM_PER_CHANNEL_HOURLY_MAX = 4; // потолок исходящих с одного канала в час
+const CONFIRM_PER_CHANNEL_HOURLY_MAX = 6; // потолок исходящих с одного канала в час (поднято с 4)
 // Дневной потолок на канал — глобальная страховка под официальную рекомендацию
 // message.help: «не более 300 сообщений в день — иначе риск блокировки за
 // жалобы на спам». Ставим консервативные 200, чтобы даже при ошибке в часовых
@@ -368,11 +417,12 @@ const BROADCAST_CHANNEL_UUID = '71608151-e312-48d2-b103-524c8b2e146e';
 //   «да/интересно». Идёт уже как продолжение диалога (не считается холодным
 //   сообщением Meta).
 // Opt-out: ответ «нет/отписать» → broadcast_optout:phone на 365 дней.
-const BROADCAST_PER_HOUR = 20;            // hard cap в час для engage-шага
-const BROADCAST_PER_DAY = 200;            // hard cap в день (20/час × 10ч окна)
-const BROADCAST_TICK_MAX = 4;             // 4 за tick × ~5 тиков/час = 20/час
-const BROADCAST_TICK_PAUSE_MIN = 120000;  // 2 мин минимум
-const BROADCAST_TICK_PAUSE_MAX = 200000;  // 3.3 мин максимум (4×200с=13.3мин per tick)
+// ── PILOT режим: жёсткие потолки чтобы поймать причину 94% fail rate ──
+const BROADCAST_PER_HOUR = 5;             // PILOT: было 15
+const BROADCAST_PER_DAY = 10;             // PILOT: было 180
+const BROADCAST_TICK_MAX = 2;             // PILOT: было 3 — 2 попытки за tick
+const BROADCAST_TICK_PAUSE_MIN = 120000;  // 2 мин
+const BROADCAST_TICK_PAUSE_MAX = 180000;  // 3 мин (2×180с=6мин per tick)
 const BROADCAST_ENGAGE_PENDING_TTL = 172800;  // 48 ч — ждём ответ клиента
 const BROADCAST_OPTOUT_TTL = 31536000;        // 365 дней — opt-out
 
@@ -553,6 +603,22 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'GET') {
+      // Ops: проверка Telegram-канала менеджеров — GET ?tgtest=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('tgtest') === env.WEBHOOK_SECRET) {
+        const t0 = Date.now();
+        const ok = await sendTelegramAlert(env,
+          '🧪 mh-bot: тест канала уведомлений менеджеров. Сообщение можно игнорировать.');
+        return json({ ok, ms: Date.now() - t0 });
+      }
+      // Ops: симуляция диалога с ботом (golden-тесты промпта, БЕЗ отправок клиенту
+      // и в Telegram) — GET ?sim=<WEBHOOK_SECRET>&u=<id>&text=<сообщение>[&reset=1].
+      if (env.WEBHOOK_SECRET && url.searchParams.get('sim') === env.WEBHOOK_SECRET) {
+        const r = await simulateDialog(env,
+          url.searchParams.get('u') || 'sim1',
+          url.searchParams.get('text') || '',
+          url.searchParams.get('reset') === '1');
+        return json(r);
+      }
       return json({ status: 'ok', service: 'mh-bot', ts: new Date().toISOString() });
     }
     if (request.method !== 'POST') {
@@ -594,14 +660,18 @@ export default {
     return json({ ok: true });
   },
 
-  // Cron-handler. Триггер `*/15 * * * *` запускает оба job'a параллельно;
-  // каждый сам пропускает «не свой» тик (confirmation — каждые 30 мин,
-  // broadcast — каждый тик пока BROADCAST_ACTIVE=1).
+  // Cron-handler. Триггер `*/10 * * * *` запускает job'ы параллельно;
+  // каждый сам пропускает «не свой» тик (confirmation/broadcast — окна часов,
+  // утренний дайджест КЭВ — окно 08:30–09:30, nudge — только при KEV_NUDGE=1).
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runConfirmationJob(env).catch((e) =>
       console.error('confirmation job failed:', e && e.message)));
     ctx.waitUntil(runBroadcastJob(env).catch((e) =>
       console.error('broadcast job failed:', e && e.message)));
+    ctx.waitUntil(runKevMorningDigest(env).catch((e) =>
+      console.error('kev digest failed:', e && e.message)));
+    ctx.waitUntil(runKevNudgeJob(env).catch((e) =>
+      console.error('kev nudge failed:', e && e.message)));
   },
 };
 
@@ -720,10 +790,28 @@ async function processMessage(msg, env) {
   }
 
   // Чат уже ведёт человек (сотрудник подключился, или бот ранее сделал
-  // handoff/booking) — бот не вмешивается.
+  // handoff) — бот не вмешивается.
   if (await env.BOT_KV.get(`op:${msg.userId}`)) {
     console.log(`paused, human owns ${tag}`);
     return;
+  }
+
+  // КЭВ уже состоялся (заявка передана менеджеру, kev_pending активен 48ч):
+  // бот продолжает отвечать на уточнения («а парковка есть?»), но заявку
+  // заново не собирает и ПОВТОРНЫХ карточек не создаёт.
+  let kevPending = null;
+  const kevPendingRaw = await env.BOT_KV.get(`kev_pending:${msg.userId}`);
+  if (kevPendingRaw) {
+    try { kevPending = JSON.parse(kevPendingRaw); } catch (_) { kevPending = {}; }
+  }
+
+  // Прерванный добор полей КЭВ с прошлого хода — напомним Claude, чего не хватает.
+  let kevMissing = null;
+  if (!kevPending) {
+    const kevMissingRaw = await env.BOT_KV.get(`kev_missing:${msg.userId}`);
+    if (kevMissingRaw) {
+      try { kevMissing = JSON.parse(kevMissingRaw); } catch (_) { kevMissing = null; }
+    }
   }
 
   // История диалога (baseLen — для защиты от гонки при записи).
@@ -745,7 +833,8 @@ async function processMessage(msg, env) {
 
   // Слоты в промпт больше НЕ подмешиваем: бот не показывает временные окна,
   // выбор времени делает менеджер. См. блок «ВРЕМЯ И РАСПИСАНИЕ» в SYSTEM_PROMPT.
-  const reply = await callClaude(env, contextHistory);
+  const reply = await callClaude(env, contextHistory,
+    buildServiceNote(kevPending, kevMissing));
 
   // Если Claude недоступен — НЕ молчим: мягкий ответ + handoff менеджеру.
   let clientText;
@@ -764,6 +853,27 @@ async function processMessage(msg, env) {
     handoff = 'bot_unavailable';
   }
 
+  // После состоявшегося КЭВ повторные BOOKING-теги игнорируем (карточка уже у
+  // менеджера). Запрос изменения/отмены Claude отдаёт HANDOFF'ом — он пройдёт.
+  if (booking && kevPending) {
+    console.log(`booking suppressed (kev already pending) ${tag}`);
+    booking = null;
+  }
+
+  // Валидация КЭВ: тег без обязательных полей НЕ закрывает диалог — бот
+  // игнорирует тег, запоминает недостающее (kev_missing) и добирает дальше.
+  let bookingMissing = null;
+  if (booking) {
+    const v = validateBooking(booking);
+    if (v.ok) {
+      booking.phone = v.phone; // нормализованный 7XXXXXXXXXX
+    } else {
+      bookingMissing = v.missing;
+      console.log(`booking incomplete ${tag}: ${v.missing.join('; ')} — добор`);
+      booking = null;
+    }
+  }
+
   // Ответ клиенту. Если не доставлено — не помечаем seen и не сохраняем
   // историю: остаётся шанс на повторную обработку.
   const sent = await sendMessage(env, msg, clientText);
@@ -773,6 +883,17 @@ async function processMessage(msg, env) {
   }
 
   await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+
+  // Память добора: каких полей КЭВ не хватило в этом ходе (подмешается в
+  // следующий запрос к Claude). Полный валидный BOOKING очищает её в handleBooking.
+  if (bookingMissing) {
+    await env.BOT_KV.put(`kev_missing:${msg.userId}`, JSON.stringify({
+      missing: bookingMissing,
+      at: Date.now(),
+      channelId: msg.channelId,
+      channelUuid: msg.channelUuid,
+    }), { expirationTtl: KEV_MISSING_TTL });
+  }
 
   // История: перечитываем свежую копию — параллельный вебхук того же клиента
   // мог записать раньше; берём более длинную, чтобы не затереть чужой ход.
@@ -787,7 +908,29 @@ async function processMessage(msg, env) {
   if (booking) await handleBooking(env, msg, booking);
 
   console.log(`done ${tag} booking=${!!booking} handoff=${handoff || '-'}`
-    + `${claudeFailed ? ' claude-fail' : ''}`);
+    + `${bookingMissing ? ` missing=${bookingMissing.length}` : ''}`
+    + `${kevPending ? ' kev-pending' : ''}${claudeFailed ? ' claude-fail' : ''}`);
+}
+
+// Служебная заметка для Claude (клиент её не видит, в KV-историю не пишется):
+// контекст «КЭВ уже состоялся» либо «каких полей заявки не хватает».
+function buildServiceNote(kevPending, kevMissing) {
+  if (kevPending) {
+    const what = [kevPending.service, kevPending.day, kevPending.interval]
+      .filter(Boolean).join(', ');
+    return '[СЛУЖЕБНОЕ, КЛИЕНТ ЭТОГО НЕ ВИДИТ: заявка этого клиента УЖЕ передана '
+      + `администратору${what ? ` (${what})` : ''}. Отвечай на уточняющие вопросы по сути. `
+      + 'Заявку заново НЕ собирай, теги BOOKING_JSON/BOOKING НЕ ставь. По вопросам '
+      + 'времени и записи: «администратор свяжется и подтвердит». Если клиент хочет '
+      + 'ИЗМЕНИТЬ или ОТМЕНИТЬ договорённость — поставь [[HANDOFF | изменение заявки]].]';
+  }
+  if (kevMissing && Array.isArray(kevMissing.missing) && kevMissing.missing.length) {
+    return '[СЛУЖЕБНОЕ, КЛИЕНТ ЭТОГО НЕ ВИДИТ: для заявки ещё не хватает: '
+      + kevMissing.missing.join(', ')
+      + '. Уточни недостающее естественно (по одному вопросу за сообщение) и поставь '
+      + 'полный BOOKING_JSON, когда всё соберёшь.]';
+  }
+  return '';
 }
 
 // ── Гейт: новый лид или действующий клиент ─────────────────────────────────
@@ -889,7 +1032,10 @@ function appendTurn(history, role, content) {
 }
 
 // ── Вызов Claude API (raw fetch, prompt caching, retry) ─────────────────────
-async function callClaude(env, history) {
+// serviceNote (опц.) — служебный контекст хода («КЭВ уже передан» / «не хватает
+// полей»), добавляется ТОЛЬКО в последнее user-сообщение запроса; в KV-историю
+// не попадает, prompt cache системного префикса не ломает.
+async function callClaude(env, history, serviceNote) {
   // Слоты в промпт НЕ подмешиваем — бот не показывает временные слоты.
   // НО подмешиваем ТЕКУЩУЮ ДАТУ (Almaty) в последнее user-сообщение —
   // нужна для логики «акция действует до 15.06.2026». Подмешиваем только
@@ -901,7 +1047,8 @@ async function callClaude(env, history) {
     if (apiMessages[i].role === 'user') {
       apiMessages[i] = {
         role: 'user',
-        content: `ТЕКУЩАЯ ДАТА: ${todayStr}\n\n${apiMessages[i].content}`,
+        content: `ТЕКУЩАЯ ДАТА: ${todayStr}\n\n${apiMessages[i].content}`
+          + (serviceNote ? `\n\n${serviceNote}` : ''),
       };
       break;
     }
@@ -957,25 +1104,77 @@ async function callClaude(env, history) {
   return '';
 }
 
-// ── Управляющие теги [[BOOKING|...]] / [[HANDOFF|...]] ──────────────────────
+// ── Управляющие теги [[BOOKING_JSON|{...}]] / [[BOOKING|...]] / [[HANDOFF|...]] ──
+// Основной формат КЭВ — BOOKING_JSON (имя/телефон/процедура/день/интервал/
+// противопоказания/язык/температура). Старый позиционный [[BOOKING|a|b|c|d|e]]
+// поддержан для обратной совместимости: его «слот» считается «день+интервал»
+// одной строкой (поле day, legacy=true).
 function parseControlTags(text) {
   let booking = null;
   let handoff = null;
+
+  // Новый формат: [[BOOKING_JSON|{...}]] (JSON одной строкой).
+  const jsonRe = /\[\[\s*BOOKING_JSON\s*\|\s*(\{[\s\S]*?\})\s*\]\]/gi;
+  let jm;
+  while ((jm = jsonRe.exec(text)) !== null) {
+    try {
+      const o = JSON.parse(jm[1]);
+      booking = {
+        name: String(o.name || '').trim(),
+        phone: String(o.phone || '').replace(/\D/g, ''),
+        service: String(o.service || '').trim(),
+        day: String(o.day || '').trim(),
+        interval: String(o.interval || '').trim(),
+        contraindications: String(o.contra || o.contraindications || '').trim(),
+        lang: (String(o.lang || '').trim().toLowerCase() === 'kz') ? 'kz' : 'ru',
+        temp: (String(o.temp || '').trim().toLowerCase() === 'hot') ? 'hot' : 'warm',
+      };
+    } catch (e) {
+      // Битый JSON = тега нет: диалог продолжится, Claude обычно чинит сам.
+      console.error('BOOKING_JSON parse error:', e && e.message);
+    }
+  }
+
+  // Старый формат + HANDOFF.
   const re = /\[\[\s*(BOOKING|HANDOFF)\s*\|([^\]]*)\]\]/gi;
   let match;
   while ((match = re.exec(text)) !== null) {
     const kind = match[1].toUpperCase();
     const payload = match[2].trim();
     if (kind === 'BOOKING') {
-      const p = payload.split('|').map((s) => s.trim());
-      booking = { name: p[0] || '', phone: p[1] || '', service: p[2] || '',
-        slot: p[3] || '', contraindications: p[4] || '' };
+      if (!booking) { // BOOKING_JSON приоритетнее, если Claude поставил оба
+        const p = payload.split('|').map((s) => s.trim());
+        booking = { name: p[0] || '', phone: (p[1] || '').replace(/\D/g, ''),
+          service: p[2] || '', day: p[3] || '', interval: '',
+          contraindications: p[4] || '', lang: 'ru', temp: 'warm', legacy: true };
+      }
     } else {
       handoff = payload || 'general';
     }
   }
-  const cleanText = text.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
+
+  const cleanText = text.replace(jsonRe, '').replace(re, '')
+    .replace(/\n{3,}/g, '\n\n').trim();
   return { cleanText, booking, handoff };
+}
+
+// Валидация карточки КЭВ. ok=false → тег не закрывает диалог, missing подмешается
+// в следующий запрос Claude. Для легаси-формата day («слот») засчитывается как
+// день+интервал. Возвращает нормализованный телефон (7XXXXXXXXXX).
+function validateBooking(b) {
+  const missing = [];
+  if (!b.name) missing.push('имя клиента');
+  const ph = normalizePhone(b.phone);
+  if (!ph || ph.length !== 11 || ph[0] !== '7') missing.push('телефон (11 цифр, формат 7…)');
+  if (!b.service) missing.push('процедура/зона');
+  if (b.legacy) {
+    if (!b.day) missing.push('желаемый день и время');
+  } else {
+    if (!b.day) missing.push('желаемый день');
+    if (!b.interval) missing.push('интервал времени (или пожелание клиента)');
+  }
+  if (!b.contraindications) missing.push('ответ по противопоказаниям (или «нет»)');
+  return { ok: !missing.length, missing, phone: ph };
 }
 
 // (УДАЛЕНО 05.06.2026) buildSlotsBlock / getAltegioSlots / buildTemplateSlots
@@ -1122,6 +1321,16 @@ async function getContactId(env, msg) {
   return id ? Number(id) : null;
 }
 
+// Человекочитаемая причина handoff для карточки менеджеру.
+function handoffReasonHuman(reason) {
+  const map = {
+    existing_client: 'действующий клиент (перенос/вопрос по визиту)',
+    bot_unavailable: 'сбой ИИ — бот не смог ответить',
+    'не клиентский запрос': 'не клиентский запрос (спам/партнёр/коллега)',
+  };
+  return map[reason] || reason || 'передача менеджеру';
+}
+
 async function handleHandoff(env, msg, reason) {
   const card = {
     type: 'handoff', reason,
@@ -1135,24 +1344,473 @@ async function handleHandoff(env, msg, reason) {
     await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
   }
   await assignToManager(env, msg);
+
+  // Мгновенная карточка менеджерам в Telegram (best-effort).
+  let phone = null;
+  try { phone = await getContactPhone(env, msg); } catch (_) { /* без телефона */ }
+  await sendTelegramAlert(env, [
+    `🟠 Бот передал диалог менеджеру · ${almatyHHMM()}`,
+    `Клиент: ${phone ? fmtPhoneHuman(phone) : `чат №${msg.userId} (телефон не определился)`}`,
+    `Причина: ${handoffReasonHuman(reason)}`,
+    `Последнее сообщение: «${String(msg.text || '').slice(0, 160)}»`,
+    'Подхватите диалог в message.help.',
+  ].join('\n'));
+
   console.log(`handoff saved u${msg.userId} reason=${reason}`);
 }
 
 async function handleBooking(env, msg, booking) {
+  const nowMs = Date.now();
+  const sla = kevSlaDeadline(env, nowMs);
   const card = {
-    type: 'booking', ...booking,
+    type: 'kev', ...booking,
     userId: msg.userId, channelId: msg.channelId,
-    createdAt: new Date().toISOString(),
+    createdAt: new Date(nowMs).toISOString(),
+    kevAt: nowMs,
+    slaDeadline: sla.ms,
+    slaLabel: sla.label,
+    night: sla.night,
   };
-  await env.BOT_KV.put(`lead:${msg.userId}:${Date.now()}`, JSON.stringify(card),
+  // lead: — старый контракт (читали отчёты), kev: — контракт для mm-pulse-bot
+  // (сверка с Altegio по телефону, SLA-эскалации).
+  await env.BOT_KV.put(`lead:${msg.userId}:${nowMs}`, JSON.stringify(card),
     { expirationTtl: LEAD_TTL });
-  // Запись зафиксирована, лид уходит менеджеру — бот в этом чате умолкает.
-  if (msg.userId) {
-    await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
-  }
+  await env.BOT_KV.put(`kev:${msg.userId}:${nowMs}`, JSON.stringify(card),
+    { expirationTtl: KEV_CARD_TTL });
+
+  // КЭВ состоялся — но бот НЕ умолкает (раньше тут была op:-пауза на 7 дней, и
+  // клиент, спросивший в 2 часа ночи «а парковка есть?», получал тишину).
+  // kev_pending: бот отвечает на уточнения, повторных карточек не создаёт.
+  // Полная op:-пауза — только при реальном входе человека (from_operator).
+  await env.BOT_KV.put(`kev_pending:${msg.userId}`, JSON.stringify({
+    kevAt: nowMs,
+    service: booking.service, day: booking.day, interval: booking.interval,
+  }), { expirationTtl: KEV_PENDING_TTL });
+  await env.BOT_KV.delete(`kev_missing:${msg.userId}`);
+
   await assignToManager(env, msg);
-  console.log(`booking saved u${msg.userId} name=${booking.name || '-'}`);
-  // Бот в Altegio не пишет — запись оформляет менеджер по карточке лида.
+
+  // Мгновенная карточка КЭВ менеджерам в Telegram + резюме диалога через Claude
+  // (резюме best-effort: ИИ недоступен — карточка уходит без него).
+  const summary = await buildKevSummary(env, msg.userId);
+  const lines = [
+    `🟢 КЭВ · ${sla.night ? 'ночной бот' : 'бот'} · ${almatyHHMM()}`,
+    `${booking.name || '—'} · ${fmtPhoneHuman(booking.phone)}`,
+    `${booking.service || '—'} · ${[booking.day, booking.interval].filter(Boolean).join(' ')}`,
+    `Противопоказания: ${booking.contraindications || '—'} · язык: ${booking.lang || 'ru'}`
+      + (booking.temp === 'hot' ? ' · 🔥 горячий' : ''),
+  ];
+  if (summary) lines.push(`📝 Резюме: ${summary}`);
+  lines.push(`⏳ Оформить запись в Altegio ${sla.label}, в комментарий записи — маркер ${kevMarker(env)}`);
+  await sendTelegramAlert(env, lines.join('\n'));
+
+  console.log(`KEV saved u${msg.userId} name=${booking.name || '-'} temp=${booking.temp || '-'} night=${sla.night}`);
+  // Бот в Altegio не пишет — запись оформляет менеджер по карточке КЭВ.
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// КЭВ: ИНФРАСТРУКТУРА — Telegram-карточки, SLA, резюме, утренний дайджест,
+// дожим (WS-D), симуляция диалога (ops)
+// ════════════════════════════════════════════════════════════════════════════
+
+function kevMarker(env) {
+  return String(env.KEV_MARKER || KEV_MARKER_DEFAULT);
+}
+
+// ── Telegram-уведомления менеджерам (группа «Отдел продаж М&М») ─────────────
+// Best-effort: сбой Telegram НЕ должен ломать ответ клиенту или cron-джобу.
+// Секреты TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID — те же, что у mm-pulse-bot.
+async function sendTelegramAlert(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.log('tg alert skipped: TELEGRAM_* не настроены');
+    return false;
+  }
+  if (typeof text === 'string' && text.length > 4096) text = text.slice(0, 4090) + '…';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: env.TELEGRAM_CHAT_ID,
+            text,
+            disable_web_page_preview: true,
+          }),
+        });
+      if (res.ok) return true;
+      console.error('tg alert:', res.status, (await res.text()).slice(0, 150));
+      if (res.status !== 429 && res.status < 500) return false;
+    } catch (e) {
+      console.error('tg alert error:', e && e.message);
+    }
+    await sleep(700 * (attempt + 1));
+  }
+  return false;
+}
+
+// Личное сообщение управляющему (эскалация). chatId — Telegram ID из ADMIN_IDS.
+async function sendTelegramDm(env, chatId, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !chatId) return false;
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+      });
+    return res.ok;
+  } catch (e) {
+    console.error('tg dm error:', e && e.message);
+    return false;
+  }
+}
+
+// +7 707 123-45-67 из 77071234567. В Telegram-карточках менеджерам телефон
+// полный (рабочая необходимость); в ЛОГАХ — по-прежнему только maskPhone.
+function fmtPhoneHuman(p) {
+  const d = String(p || '').replace(/\D/g, '');
+  if (d.length === 11 && d[0] === '7') {
+    return `+7 ${d.slice(1, 4)} ${d.slice(4, 7)}-${d.slice(7, 9)}-${d.slice(9, 11)}`;
+  }
+  return d ? `+${d}` : '—';
+}
+
+function almatyHHMM() {
+  const t = almatyNow();
+  return `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`;
+}
+
+// Дедлайн SLA оформления записи по КЭВ.
+// Ночь (21:00–07:00 Almaty) → «до 10:30» ближайшего утра (env.KEV_NIGHT_DEADLINE);
+// день → +KEV_SLA_DAY_MIN минут (env, по умолчанию 60).
+function kevSlaDeadline(env, kevMs) {
+  const a = new Date(kevMs + ALMATY_UTC_OFFSET * 3600000);
+  const hour = a.getUTCHours();
+  const night = hour >= BOT_HOUR_START || hour < BOT_HOUR_END;
+  if (night) {
+    const m = String(env.KEV_NIGHT_DEADLINE || KEV_NIGHT_DEADLINE_DEFAULT)
+      .match(/^(\d{1,2}):(\d{2})$/);
+    const dh = m ? +m[1] : 10;
+    const dm = m ? +m[2] : 30;
+    // База — полночь Алматы дня КЭВ. После полуночи (00–07) дедлайн сегодня
+    // утром; вечером (21–24) — завтра утром.
+    const midnight = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate(), 0, 0, 0)
+      - ALMATY_UTC_OFFSET * 3600000;
+    const sameDay = midnight + (dh * 60 + dm) * 60000;
+    const ms = hour < BOT_HOUR_END ? sameDay : sameDay + 86400000;
+    return { ms, label: `до ${String(dh).padStart(2, '0')}:${String(dm).padStart(2, '0')}`, night: true };
+  }
+  const slaMin = parseInt(env.KEV_SLA_DAY_MIN, 10) || KEV_SLA_DAY_MIN_DEFAULT;
+  const ms = kevMs + slaMin * 60000;
+  const dl = new Date(ms + ALMATY_UTC_OFFSET * 3600000);
+  return {
+    ms,
+    label: `до ${String(dl.getUTCHours()).padStart(2, '0')}:${String(dl.getUTCMinutes()).padStart(2, '0')}`,
+    night: false,
+  };
+}
+
+// Лёгкий вызов Claude с произвольным системным промптом (резюме диалога и т.п.).
+// 2 попытки, best-effort: при сбое возвращает '' — вызывающий обязан уметь без.
+async function callClaudeLight(env, system, userText, maxTokens) {
+  if (!env.ANTHROPIC_API_KEY) return '';
+  const payload = {
+    model: env.ANTHROPIC_MODEL || DEFAULT_MODEL,
+    max_tokens: maxTokens || 300,
+    temperature: 0.2,
+    system,
+    messages: [{ role: 'user', content: userText }],
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res;
+    try {
+      res = await fetch(ANTHROPIC_URL, {
+        method: 'POST',
+        headers: {
+          'x-api-key': env.ANTHROPIC_API_KEY,
+          'anthropic-version': ANTHROPIC_VERSION,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      console.error('claude light fetch:', e && e.message);
+      await sleep(400 * (attempt + 1));
+      continue;
+    }
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      const block = data && (data.content || []).find((b) => b.type === 'text');
+      return block ? block.text.trim() : '';
+    }
+    if (res.status !== 429 && res.status < 500) {
+      console.error(`claude light ${res.status}`);
+      return '';
+    }
+    await sleep(600 * (attempt + 1));
+  }
+  return '';
+}
+
+// Резюме диалога для карточки КЭВ: 2–4 строки «что хочет, что важно».
+async function buildKevSummary(env, userId) {
+  try {
+    const hist = (await env.BOT_KV.get(`hist:${userId}`, { type: 'json' })) || [];
+    if (!hist.length) return '';
+    const transcript = hist.slice(-14).map((m) =>
+      `${m.role === 'user' ? 'Клиент' : 'Алия'}: ${String(m.content).slice(0, 280)}`).join('\n');
+    return await callClaudeLight(env,
+      'Сожми диалог отдела продаж бьюти-студии в резюме для менеджера: 2-4 КОРОТКИЕ '
+      + 'строки — что клиент хочет, что важно (срочность, сомнения, вопросы, нюансы). '
+      + 'Без приветствий, без воды, без markdown. Только факты из диалога.',
+      transcript, 250);
+  } catch (e) {
+    console.error('kev summary error:', e && e.message);
+    return '';
+  }
+}
+
+// ── Утренний дайджест ночных КЭВ (~08:30 Almaty) ────────────────────────────
+// Одно сообщение в группу менеджеров: сколько КЭВ собрал бот за ночь и какие
+// ещё не оформлены в Altegio. Окно 08:30–09:30 (Cloudflare cron не гарантирует
+// минуту запуска — инцидент «48ч без подтверждений»), дедуп — KV-флаг дня.
+async function runKevMorningDigest(env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  const now = almatyNow();
+  const inWindow = (now.hour === 8 && now.minute >= 30) || (now.hour === 9 && now.minute < 30);
+  if (!inWindow) return;
+  const guardKey = `kev_digest:${now.ymd}`;
+  if (await env.BOT_KV.get(guardKey)) return;
+
+  // «За ночь» = последние 13 часов (с ~19:30 вчера) — захватывает всё ночное
+  // окно бота 21:00–07:00 плюс поздний вечер.
+  const kevs = await listKevCards(env, now.ms - 13 * 3600000);
+  if (!kevs.length) {
+    console.log('kev digest: 0 КЭВ за ночь — молчим');
+    await env.BOT_KV.put(guardKey, '1', { expirationTtl: 90000 });
+    return;
+  }
+
+  // Сверка с Altegio: записи, СОЗДАННЫЕ вчера-сегодня, матчинг по телефону.
+  let createdRecs = null;
+  if (env.ALTEGIO_PARTNER_TOKEN && env.ALTEGIO_USER_TOKEN && env.ALTEGIO_COMPANY_ID) {
+    try {
+      createdRecs = await altegioFetchRecordsCreated(env, ymdDaysAhead(now, -1), now.ymd);
+    } catch (e) {
+      console.error('kev digest altegio:', e && e.message);
+    }
+  }
+  const createdByPhone = new Map(); // phone → самый ранний create ts
+  for (const r of createdRecs || []) {
+    if (!r || r.deleted) continue;
+    const ph = normalizePhone((r.client && r.client.phone) || '');
+    if (!ph) continue;
+    const p = parseAltegioParts(r.create_date);
+    const ms = p ? partsToAlmatyMs(p) : null;
+    if (ms == null) continue;
+    if (!createdByPhone.has(ph) || ms < createdByPhone.get(ph)) createdByPhone.set(ph, ms);
+  }
+
+  const dd = `${now.ymd.slice(8, 10)}.${now.ymd.slice(5, 7)}`;
+  const items = [];
+  let waiting = 0;
+  for (const k of kevs) {
+    // Оформлен, если запись создана не раньше чем за 30 мин ДО КЭВ (допуск на
+    // менеджера, успевшего оформить параллельно с диалогом).
+    const done = createdRecs != null && createdByPhone.has(k.phone)
+      && createdByPhone.get(k.phone) >= ((k.kevAt || 0) - 1800000);
+    if (!done) waiting++;
+    items.push(`${done ? '✅' : '⏳'} ${k.name || '—'} · ${fmtPhoneHuman(k.phone)} · `
+      + `${k.service || '—'} · ${[k.day, k.interval].filter(Boolean).join(' ') || '—'}`);
+  }
+
+  const lines = [`🌅 Ночные КЭВ · ${dd}`];
+  lines.push(createdRecs == null
+    ? `За ночь ${kevs.length} КЭВ (Altegio недоступен — статус оформления не проверен):`
+    : `За ночь ${kevs.length} КЭВ, ${waiting ? `${waiting} ждут оформления:` : 'все уже оформлены ✅'}`);
+  lines.push(...items.slice(0, 15));
+  if (items.length > 15) lines.push(`…и ещё ${items.length - 15}`);
+  if (waiting) {
+    lines.push('', `⏳ SLA: оформить до ${env.KEV_NIGHT_DEADLINE || KEV_NIGHT_DEADLINE_DEFAULT}`
+      + ` с маркером ${kevMarker(env)} в комментарии записи.`);
+  }
+  // Гард дня — только ПОСЛЕ успешной отправки: при сбое Telegram следующий
+  // тик окна (через 10 мин) попробует ещё раз.
+  const sent = await sendTelegramAlert(env, lines.join('\n'));
+  if (sent) await env.BOT_KV.put(guardKey, '1', { expirationTtl: 90000 });
+  console.log(`kev digest ${sent ? 'sent' : 'FAILED'}: ${kevs.length} kev, ${waiting} waiting`);
+}
+
+// Карточки КЭВ из KV новее sinceMs. Ключ kev:{userId}:{ts} — ts фильтруем до
+// чтения значения (дёшево). Курсор до 5 страниц по 1000 ключей.
+async function listKevCards(env, sinceMs) {
+  const out = [];
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const page = await env.BOT_KV.list({ prefix: 'kev:', limit: 1000, cursor });
+    for (const k of page.keys) {
+      const ts = Number(String(k.name).split(':')[2]);
+      if (!Number.isFinite(ts) || ts < sinceMs) continue;
+      const card = await env.BOT_KV.get(k.name, { type: 'json' });
+      if (card && card.phone) out.push({ ...card, kevKey: k.name });
+    }
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  out.sort((a, b) => (a.kevAt || 0) - (b.kevAt || 0));
+  return out;
+}
+
+// Записи Altegio, СОЗДАННЫЕ в диапазоне дат (c_start_date/c_end_date — по дате
+// оформления, не визита). Для проверки «КЭВ → запись оформлена». Одна страница
+// 200 записей: за 2 дня студия столько не оформляет.
+async function altegioFetchRecordsCreated(env, startDate, endDate) {
+  const url = `${ALTEGIO_API}/records/${env.ALTEGIO_COMPANY_ID}`
+    + `?c_start_date=${startDate}&c_end_date=${endDate}&count=200`;
+  const res = await fetch(url, { headers: altegioHeaders(env) });
+  if (!res.ok) {
+    console.error('altegio created records:', res.status);
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  return (data && data.data) || [];
+}
+
+// ── WS-D: дожим незавершённого КЭВ (фичефлаг env.KEV_NUDGE, по умолчанию ВЫКЛ) ──
+// Клиент дошёл до согласия, но пропал, не дав часть данных (kev_missing висит,
+// последний ход — бота). ОДНО касание: через 3+ ч в ночном окне бота (туда же
+// попадает «следующий вечер 21:30»). Только reply в существующий диалог через
+// анти-бан конвейер mhSendByPhone (need_create=false, cold-фильтр, потолки
+// канала) + отдельный потолок KEV_NUDGE_HOUR_MAX/час. Нет ответа — стоп.
+async function runKevNudgeJob(env) {
+  if (env.KEV_NUDGE !== '1') return;
+  const now = almatyNow();
+  const inNight = now.hour >= BOT_HOUR_START || now.hour < BOT_HOUR_END;
+  if (!inNight) return;
+
+  const hourKey = `kev_nudge_hour:${now.ymdh}`;
+  let sentThisHour = Number(await env.BOT_KV.get(hourKey)) || 0;
+  if (sentThisHour >= KEV_NUDGE_HOUR_MAX) return;
+
+  const page = await env.BOT_KV.list({ prefix: 'kev_missing:', limit: 100 });
+  for (const k of page.keys) {
+    if (sentThisHour >= KEV_NUDGE_HOUR_MAX) break;
+    const userId = k.name.slice('kev_missing:'.length);
+    if (!userId || userId.startsWith('sim_')) continue; // симуляции не дожимаем
+    const data = await env.BOT_KV.get(k.name, { type: 'json' });
+    if (!data || !data.at) continue;
+    const ageH = (now.ms - data.at) / 3600000;
+    if (ageH < KEV_NUDGE_MIN_AGE_H || ageH > KEV_NUDGE_MAX_AGE_H) continue;
+    if (await env.BOT_KV.get(`kev_nudged:${userId}`)) continue;        // одно касание
+    if (await env.BOT_KV.get(`op:${userId}`)) continue;                // чат у человека
+    if (await env.BOT_KV.get(`kev_pending:${userId}`)) continue;       // КЭВ уже состоялся
+    if (await env.BOT_KV.get(`confirm_pending:user:${userId}`)) continue;
+    // Последний ход в истории — клиента? Значит диалог жив, бот ему ещё ответит.
+    const hist = (await env.BOT_KV.get(`hist:${userId}`, { type: 'json' })) || [];
+    if (!hist.length || hist[hist.length - 1].role === 'user') continue;
+
+    const phone = await getContactPhone(env, {
+      userId,
+      channelUuid: data.channelUuid || resolveChannelUuid(env, data.channelId),
+    });
+    if (!phone) {
+      await env.BOT_KV.put(`kev_nudged:${userId}`, 'no_phone', { expirationTtl: 604800 });
+      continue;
+    }
+
+    const text = 'Я на связи 🌷 Если ещё актуально — напишите, когда вам удобнее '
+      + '(день и время), и я передам заявку администратору: он подтвердит запись '
+      + 'и пришлёт детали.';
+    let sent = null;
+    try {
+      sent = await mhSendByPhone(env, normalizePhone(phone), text);
+    } catch (e) {
+      console.error('kev nudge send:', e && e.message);
+    }
+    if (sent && sent.ok) {
+      sentThisHour++;
+      await env.BOT_KV.put(hourKey, String(sentThisHour), { expirationTtl: 7200 });
+      await env.BOT_KV.put(`kev_nudged:${userId}`, '1', { expirationTtl: 604800 });
+      if (sent.channelId != null) {
+        await incChannelHourCount(env, sent.channelId);
+        await incChannelDayCount(env, sent.channelId);
+      }
+      console.log(`kev nudge sent u${userId}`);
+      await sleep(5000);
+    } else if (sent && (sent.reason === 'no_contact' || sent.reason === 'cold')) {
+      // Перманентные отказы — больше не пробуем. Потолки (hour/day cap) —
+      // транзиентные, попробуем в следующий тик.
+      await env.BOT_KV.put(`kev_nudged:${userId}`, sent.reason, { expirationTtl: 604800 });
+    }
+  }
+}
+
+// ── Ops: симуляция диалога (golden-тесты промпта) ────────────────────────────
+// Полный Claude-флоу на синтетическом пользователе sim_{id}: история в KV,
+// служебные заметки, валидация BOOKING, kev_pending. НИЧЕГО не шлёт ни клиенту,
+// ни в Telegram, карточек kev:/lead: не создаёт.
+async function simulateDialog(env, simId, text, reset) {
+  const userId = `sim_${String(simId).replace(/[^\w-]/g, '')}`;
+  const histKey = `hist:${userId}`;
+  if (reset) {
+    await env.BOT_KV.delete(histKey);
+    await env.BOT_KV.delete(`kev_missing:${userId}`);
+    await env.BOT_KV.delete(`kev_pending:${userId}`);
+    if (!text) return { ok: true, reset: true, userId };
+  }
+  if (!text) return { ok: false, error: 'no_text' };
+
+  let kevPending = null;
+  const kevPendingRaw = await env.BOT_KV.get(`kev_pending:${userId}`);
+  if (kevPendingRaw) { try { kevPending = JSON.parse(kevPendingRaw); } catch (_) { kevPending = {}; } }
+  let kevMissing = null;
+  if (!kevPending) {
+    const kevMissingRaw = await env.BOT_KV.get(`kev_missing:${userId}`);
+    if (kevMissingRaw) { try { kevMissing = JSON.parse(kevMissingRaw); } catch (_) { kevMissing = null; } }
+  }
+
+  const histBefore = (await env.BOT_KV.get(histKey, { type: 'json' })) || [];
+  const contextHistory = appendTurn(histBefore, 'user', text);
+  const note = buildServiceNote(kevPending, kevMissing);
+  const reply = await callClaude(env, contextHistory, note);
+  const parsed = reply ? parseControlTags(reply)
+    : { cleanText: '', booking: null, handoff: null };
+
+  let validation = null;
+  let kevAccepted = false;
+  let suppressed = false;
+  if (parsed.booking && kevPending) {
+    suppressed = true;
+  } else if (parsed.booking) {
+    validation = validateBooking(parsed.booking);
+    if (validation.ok) {
+      kevAccepted = true;
+      await env.BOT_KV.put(`kev_pending:${userId}`, JSON.stringify({
+        kevAt: Date.now(), service: parsed.booking.service,
+        day: parsed.booking.day, interval: parsed.booking.interval,
+      }), { expirationTtl: 1800 }); // в симуляции — короткий TTL
+      await env.BOT_KV.delete(`kev_missing:${userId}`);
+    } else {
+      await env.BOT_KV.put(`kev_missing:${userId}`, JSON.stringify({
+        missing: validation.missing, at: Date.now(),
+      }), { expirationTtl: 1800 });
+    }
+  }
+
+  let merged = appendTurn(histBefore, 'user', text);
+  merged = appendTurn(merged, 'assistant', parsed.cleanText || reply || '(пусто)');
+  await env.BOT_KV.put(histKey, JSON.stringify(merged.slice(-HISTORY_LIMIT)),
+    { expirationTtl: 3600 });
+
+  return {
+    ok: true, userId,
+    reply: parsed.cleanText || reply || '',
+    booking: parsed.booking || null,
+    handoff: parsed.handoff || null,
+    validation, kevAccepted, suppressed,
+    serviceNote: note || undefined,
+  };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1273,25 +1931,37 @@ async function collectConfirmCandidates(env, records, now) {
     const apptMs = partsToAlmatyMs(parts);
     if (!apptMs || apptMs < now.ms + 60000) continue; // запись в прошлом — мимо
 
-    // ОКНО ОТПРАВКИ: 32ч ≥ время-до-визита ≥ 24ч.
-    // < 24ч — нарушает политику отмены студии (клиент уже не успевает
-    //         отменить без штрафа). Skip с одноразовым логом.
-    // > 32ч — ещё рано, ждём следующих cron-тиков.
+    // ОКНО ОТПРАВКИ: 30ч ≥ время-до-визита ≥ 20ч.
+    // Расширено по запросу владельца — не строгое 24ч, а гибкое 20–30ч окно.
+    // < 20ч — слишком близко к визиту, помечаем late_notice (менеджер вручную).
+    // > 30ч — ещё рано, ждём следующих cron-тиков.
     const apptToNow = apptMs - now.ms;
-    if (apptToNow > 32 * 3600000) continue;
-    if (apptToNow < 24 * 3600000) {
+    if (apptToNow > 30 * 3600000) continue;
+    if (apptToNow < 20 * 3600000) {
       const noticeKey = `confirm_late_notice:${r.id}`;
       if (!(await env.BOT_KV.get(noticeKey))) {
         console.log(`confirm: skip rec ${r.id} — appt ${r.date} осталось `
           + `<24h до визита, менеджер обзвонит вручную`);
         await env.BOT_KV.put(noticeKey, '1', { expirationTtl: CONFIRM_DEDUP_TTL });
+        // Карточка менеджерам: бот напоминание уже не отправит (политика
+        // «отмена за 24ч» не успевает) — подтвердить запись нужно вручную.
+        await sendTelegramAlert(env, [
+          `⏰ Запись без авто-напоминания · ${almatyHHMM()}`,
+          `${(r.client && r.client.name) ? r.client.name + ' · ' : ''}${fmtPhoneHuman(phone)}`,
+          `Визит: ${r.date} (осталось ~${Math.round(apptToNow / 3600000)} ч)`,
+          'Бот напоминание не отправит (<20ч до визита) — подтвердите запись звонком.',
+        ].join('\n'));
       }
       continue;
     }
 
-    // Идеальный слот = appt-24ч, ограничен дневным окном [09:00, 20:00].
-    // Никакого jitter в будущее — иначе слот может уплыть в зону <24ч.
-    const idealMs = apptMs - 24 * 3600000;
+    // Идеальный слот = appt-25ч (на 1ч раньше политики), ограничен [09:00, 20:00].
+    // 25ч вместо 24ч: cron `*/10` срабатывает с задержкой 0-10 мин, а при
+    // slot=appt-24h slotMs совпадает с временем суток визита и фактически
+    // никогда не «созревал» к нужному тику — 0 отправок за 14 дней.
+    // -25h даёт 1h буфер: slot созревает на час раньше, фактический gap
+    // send→appt остаётся ≥ 24ч (политика отмены студии не нарушается).
+    const idealMs = apptMs - 25 * 3600000;
     let slotMs;
     if (idealMs < today09Ms) slotMs = today09Ms;
     else if (idealMs > todayLateMs) slotMs = todayLateMs;
@@ -1900,6 +2570,17 @@ async function handleConfirmationResponse(env, msg, kind, pending) {
       userId: msg.userId,
     }), { expirationTtl: LEAD_TTL });
     await assignToManager(env, msg);
+
+    // Мгновенная карточка менеджерам: клиент отказался от записи — успеть
+    // спасти (перенос) или освободить слот в журнале.
+    await sendTelegramAlert(env, [
+      `🔴 Клиент ответил «НЕТ» на подтверждение записи · ${almatyHHMM()}`,
+      `${pending && pending.phone ? fmtPhoneHuman(pending.phone) : `Чат №${msg.userId}`}`
+        + ` · запись Altegio №${(pending && pending.recordId) || '—'}`,
+      `Ответ клиента: «${String(msg.text || '').slice(0, 120)}»`,
+      'Свяжитесь с клиентом: перенос или отмена записи.',
+    ].join('\n'));
+
     console.log(`confirm reply NO u${msg.userId} record=${pending && pending.recordId}`);
   }
 }
@@ -1929,6 +2610,17 @@ async function handleConfirmationFollowUp(env, msg, pending) {
     }), { expirationTtl: LEAD_TTL });
 
   await assignToManager(env, msg);
+
+  // Карточка менеджерам: клиент ответил на напоминание вопросом/просьбой —
+  // бот сам не отвечает, диалог ждёт человека.
+  await sendTelegramAlert(env, [
+    `🟡 Вопрос по записи вместо «Да/Нет» · ${almatyHHMM()}`,
+    `${pending && pending.phone ? fmtPhoneHuman(pending.phone) : `Чат №${msg.userId}`}`
+      + ` · запись Altegio №${(pending && pending.recordId) || '—'}`,
+    `Клиент: «${String(msg.text || '').slice(0, 160)}»`,
+    'Ответьте клиенту в message.help.',
+  ].join('\n'));
+
   console.log(`confirm reply FOLLOWUP u${msg.userId} `
     + `record=${pending && pending.recordId} `
     + `text="${String(msg.text || '').slice(0, 60)}"`);
@@ -2142,32 +2834,49 @@ async function runBroadcastJob(env) {
     // Клиент когда-то ответил «нет/отпишите» — больше не пишем
     if (await env.BOT_KV.get(`broadcast_optout:${phone}`)) { optoutSkip++; continue; }
 
-    // need_create=true: открываем НОВЫЙ чат с клиентом на WA2 (двухэтапная
-    // схема снижает риск Meta — первое сообщение короткое и вопросительное).
-    const resolved = await mhResolveContactStrict(env, token, phone,
-      BROADCAST_CHANNEL_ID, BROADCAST_CHANNEL_UUID, true);
-    if (!resolved) { noContactSkip++; continue; }
+    // ШАГ 1: ищем существующий контакт БЕЗ создания нового чата.
+    // Если клиент уже писал нам — провалидируем блокировки по его userId.
+    let resolved = await mhResolveContactStrict(env, token, phone,
+      BROADCAST_CHANNEL_ID, BROADCAST_CHANNEL_UUID, false);
 
-    // Не лезем в чат, где клиент ждёт ответ на confirmation
-    if (await env.BOT_KV.get(`confirm_pending:user:${resolved.userId}`)) {
-      pendingSkip++;
-      continue;
-    }
-    // Не лезем в чат, где менеджер уже работает
-    if (await env.BOT_KV.get(`op:${resolved.userId}`)) {
-      opSkip++;
-      continue;
-    }
-    // Уже ждём ответ на engage от этого user — не дублируем
-    if (await env.BOT_KV.get(`broadcast_engage_pending:user:${resolved.userId}`)) {
-      dedupSkip++;
+    if (resolved) {
+      // Существующий контакт — проверяем блокировки
+      if (await env.BOT_KV.get(`confirm_pending:user:${resolved.userId}`)) {
+        pendingSkip++;
+        continue;
+      }
+      if (await env.BOT_KV.get(`op:${resolved.userId}`)) {
+        opSkip++;
+        continue;
+      }
+      if (await env.BOT_KV.get(`broadcast_engage_pending:user:${resolved.userId}`)) {
+        dedupSkip++;
+        continue;
+      }
+    } else {
+      // ОТКАЗ от need_create=true: message.help при попытке создать чат на WA2
+      // игнорирует наш channel_uuid и привязывает контакт к WA1 (17222),
+      // потому что у клиентов уже есть история на WA1. Наш фильтр channel_id===20916
+      // не находит запись → send не делается → но триггер «Создать сделку» в
+      // воронке Records Altegio уже сработал на сам факт contact_by_phone.
+      // Итог: 84 пустых сделок 10.06 + 5.6% реальной отправки.
+      // Решение: шлём ТОЛЬКО тем, у кого уже есть история на WA2.
+      // Это соответствует правилу message.help bulk-FAQ.
+      noContactSkip++;
       continue;
     }
 
-    const ok = await mhSendDirect(env, token,
+    // Атомарная отправка с одним retry на сетевой/5xx сбой —
+    // чтобы не оставлять пустой чат после успешного create.
+    let ok = await mhSendDirect(env, token,
       BROADCAST_CHANNEL_UUID, resolved.userId, text);
     if (!ok) {
-      console.error(`broadcast: send failed phone=${maskPhone(phone)}`);
+      await sleep(2000 + Math.floor(Math.random() * 2000));
+      ok = await mhSendDirect(env, token,
+        BROADCAST_CHANNEL_UUID, resolved.userId, text);
+    }
+    if (!ok) {
+      console.error(`broadcast: send failed phone=${maskPhone(phone)} userId=${resolved.userId}`);
       continue;
     }
 
@@ -2283,6 +2992,19 @@ async function mhResolveContactStrict(env, token, phone,
   const c = data.data || data;
   if (!c) return null;
 
+  // ── PILOT DEBUG: показать структуру ответа MH ────────────────────────────
+  // Логируем какие списки и какие channel_id видим — чтобы понять почему
+  // валидация не находит targetChannelId.
+  const listSummary = [];
+  for (const [name, list] of [['users', c.users], ['channels', c.channels],
+    ['channel_links', c.channel_links], ['contact_channels', c.contact_channels]]) {
+    if (!Array.isArray(list)) { listSummary.push(`${name}=N/A`); continue; }
+    const cids = list.map((x) => x && (x.channel_id ?? '?')).join(',');
+    listSummary.push(`${name}=[${cids}]`);
+  }
+  console.log(`PILOT resolve phone=${maskPhone(phone)} needCreate=${needCreate} `
+    + `target=${targetChannelId} lists: ${listSummary.join(' ')}`);
+
   for (const list of [c.users, c.channels, c.channel_links, c.contact_channels]) {
     if (!Array.isArray(list)) continue;
     for (const x of list) {
@@ -2292,6 +3014,7 @@ async function mhResolveContactStrict(env, token, phone,
       if (!uid) continue;
       if (Number(cid) !== Number(targetChannelId)) continue;
       if (x.blocked) continue;
+      console.log(`PILOT resolve OK phone=${maskPhone(phone)} userId=${uid}`);
       return {
         channelUuid: targetChannelUuid,
         channelId: Number(targetChannelId),
@@ -2300,6 +3023,9 @@ async function mhResolveContactStrict(env, token, phone,
       };
     }
   }
+  console.log(`PILOT resolve NULL phone=${maskPhone(phone)} needCreate=${needCreate} `
+    + `— ни один список не содержит channel_id=${targetChannelId}. `
+    + `Top-level keys: ${Object.keys(c).join(',')}`);
   return null;
 }
 
@@ -2308,6 +3034,7 @@ async function mhResolveContactStrict(env, token, phone,
 async function mhSendDirect(env, token, channelUuid, userId, text) {
   const url = `${MH_API}/app/projects/${env.MH_PROJECT_ID}`
     + `/channels/${channelUuid}/send_message/${userId}`;
+  console.log(`PILOT send start userId=${userId} channelUuid=${channelUuid.slice(0,8)}…`);
   for (let attempt = 0; attempt < 3; attempt++) {
     let res;
     try {
@@ -2320,7 +3047,7 @@ async function mhSendDirect(env, token, channelUuid, userId, text) {
         body: form,
       });
     } catch (e) {
-      console.error('broadcast send fetch:', e && e.message);
+      console.error(`PILOT send fetch attempt=${attempt} userId=${userId}:`, e && e.message);
       await sleep(500 * (attempt + 1));
       continue;
     }
@@ -2331,13 +3058,12 @@ async function mhSendDirect(env, token, channelUuid, userId, text) {
         await env.BOT_KV.put(`sent:${sentId}`, '1',
           { expirationTtl: SENT_TTL });
       }
+      console.log(`PILOT send OK userId=${userId} attempt=${attempt} sentId=${sentId || 'none'}`);
       return true;
     }
-    if (res.status !== 429 && res.status < 500) {
-      console.error(`broadcast send ${res.status}:`,
-        (await res.text()).slice(0, 200));
-      return false;
-    }
+    const bodyText = (await res.text()).slice(0, 300);
+    console.error(`PILOT send FAIL userId=${userId} attempt=${attempt} status=${res.status} body=${bodyText}`);
+    if (res.status !== 429 && res.status < 500) return false;
     const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
     await sleep(retryAfter ? retryAfter * 1000 : 600 * (attempt + 1));
   }

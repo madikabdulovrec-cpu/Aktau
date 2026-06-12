@@ -30,10 +30,10 @@ id = "729a6c1778f24eaf82b875a8bfea9987"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"   # макс. качество: claude-opus-4-7
 MH_PROJECT_ID = "220763"                # id проекта message.help — ПОДТВЕРДИТЬ
 MH_CHANNELS = '{"17222":"3a00d58f-4060-42be-96b9-898cba18748e","20916":"71608151-e312-48d2-b103-524c8b2e146e"}'  # WhatsApp 1 (17222) + WhatsApp 2 (20916)
-# Спец-режим для свежеподключенного канала (05.06.2026 WA1 17222 поднят после
-# даунтайма). Снижаем потолок до 2/час на 24-48ч, чтобы Meta не сочла
-# восстановление за «новый спам-канал». СНЯТЬ после 06.06.2026 ~21:00 Almaty.
-MH_CHANNEL_HOURLY_OVERRIDE = '{"17222":2}'
+# Спец-режим для свежеподключенного канала был активен 05-06.06.2026 (WA1 17222
+# после даунтайма, потолок 2/час). СНЯТО 11.06.2026: прошло 5 дней без проблем,
+# возвращаем default CONFIRM_PER_CHANNEL_HOURLY_MAX (=6/час).
+MH_CHANNEL_HOURLY_OVERRIDE = ''
 MANAGER_OPERATOR_ID = ""                # id оператора-менеджера message.help (опц.)
 ALTEGIO_COMPANY_ID = "1330174"                 # id филиала Altegio (опц. — гейт и слоты)
 ALTEGIO_CONSULT_SERVICE_ID = "13190960"         # id услуги-консультации Altegio (опц. — слоты)
@@ -46,6 +46,12 @@ BROADCAST_ACTIVE = "1"
 # нам (из MH_CHANNELS). Клиентам, которые никогда не писали в WhatsApp, бот
 # напоминания не отправляет — чтобы не наводить шума с нового номера.
 
+# ── КЭВ (договорённость о визите) ────────────────────────────────────────────
+KEV_NUDGE = "0"                 # WS-D дожим незавершённого КЭВ: "1" — включить (отдельное решение владельца)
+KEV_SLA_DAY_MIN = "60"          # SLA оформления дневного КЭВ менеджером, минут
+KEV_NIGHT_DEADLINE = "10:30"    # ночные КЭВ (21:00–07:00) оформить до этого часа утра
+KEV_MARKER = "[чат-бот]"        # маркер источника в комментарии записи Altegio (по нему чекер качества)
+
 # Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
 #   wrangler secret put ANTHROPIC_API_KEY     --config worker/wrangler-mh-bot.toml
 #   wrangler secret put MH_LOGIN              --config worker/wrangler-mh-bot.toml
@@ -53,6 +59,10 @@ BROADCAST_ACTIVE = "1"
 #   wrangler secret put WEBHOOK_SECRET        --config worker/wrangler-mh-bot.toml
 #   wrangler secret put ALTEGIO_PARTNER_TOKEN --config worker/wrangler-mh-bot.toml  (опц.)
 #   wrangler secret put ALTEGIO_USER_TOKEN    --config worker/wrangler-mh-bot.toml  (опц.)
+#   --- Telegram-карточки КЭВ менеджерам (значения те же, что у mm-pulse-bot,
+#       см. worker/pulse-deploy.local.txt; PII — только секретами, репо публичный) ---
+#   wrangler secret put TELEGRAM_BOT_TOKEN    --config worker/wrangler-mh-bot.toml
+#   wrangler secret put TELEGRAM_CHAT_ID      --config worker/wrangler-mh-bot.toml
 #
 # После деплоя URL вебхука для message.help:
 #   https://mh-bot.<account>.workers.dev/?secret=<WEBHOOK_SECRET>
