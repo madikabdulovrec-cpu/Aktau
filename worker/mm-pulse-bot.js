@@ -46,10 +46,12 @@
  *   UNANSWERED_THRESHOLD_MIN — порог «без ответа сейчас», мин. По умолчанию 20.
  *  KV namespaces:
  *   PULSE_KV — бакеты событий дня (events:YYYY-MM-DD, TTL 48 ч) + кэш токена message.help
- *   MH_KV    — KV mh-bot, READ-ONLY по соглашению: карточки КЭВ (kev:*) для
- *              сверки с Altegio + пометки sent:* для маркировки сообщений бота
- *              (bot:true → не считаются скоростью ответа менеджеров и не
- *              снимают флаг «без ответа»)
+ *   MH_KV    — KV mh-bot. Читаем: карточки КЭВ (kev:*) для сверки с Altegio +
+ *              пометки sent:* для маркировки сообщений бота (bot:true → не
+ *              считаются скоростью ответа менеджеров и не снимают «без ответа»).
+ *              Пишем РОВНО один ключ — broadcast_pause (предохранитель рассылки,
+ *              WS-1): его tick mh-bot читает и пропускает рассылку. Всё остальное
+ *              в этом namespace — read-only по соглашению (принадлежит mh-bot).
  *
  * ─── VERIFY на первом боевом тесте ──────────────────────────────────────────
  * Эти места написаны по mh-bot.js / спецификации message.help — подтвердить:
@@ -460,6 +462,22 @@ export default {
       return json({ ok: true, sent, note: sent ? 'письмо отправлено' : 'не отправлено (BROADCAST_REPORT=0 / нет отправок / акция завершена)' });
     }
 
+    // [ТЕСТ] предохранитель рассылки в dry-режиме — GET ?breakertest=<DIGEST_SECRET>.
+    // Подставляет синтетический критический риск и показывает, что СДЕЛАЛ БЫ
+    // предохранитель (поставил бы паузу, кому ушёл бы алерт), НИЧЕГО не записывая и
+    // не отправляя. Плюс — реальный риск рассылки сейчас и текущее значение флага.
+    if (env.DIGEST_SECRET && url.searchParams.get('breakertest') === env.DIGEST_SECRET) {
+      const synthetic = { broadcastRisks: { count: 3, critical: true, list: [
+        { name: 'Тест', phone: '77000000001', text: 'спам, удалите мой номер' },
+        { name: 'Тест', phone: '77000000002', text: 'не пишите мне' },
+        { name: 'Тест', phone: '77000000003', text: 'откуда у вас мой номер' },
+      ] } };
+      const live = await computeBroadcastMetrics(env, Date.now(), { skipBookings: true }).catch(() => null);
+      const dryResult = await maybeBreakerPause(env, Date.now(), { dry: true, metrics: synthetic });
+      const flag = (env.MH_KV && typeof env.MH_KV.get === 'function') ? await env.MH_KV.get(BROADCAST_PAUSE_KEY) : null;
+      return json({ ok: true, dryResult, liveRisk: live ? live.broadcastRisks : null, currentPauseFlag: flag });
+    }
+
     // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
     if (env.DIGEST_SECRET && url.searchParams.get('report') === env.DIGEST_SECRET) {
       const sec = url.searchParams.get('sec') || 'sales';
@@ -709,6 +727,13 @@ async function runDigest(env, meta) {
     // Бот сам читает транскрипты зависших и решает, кто реально без ответа.
     await judgeUnanswered(env, metrics, events);
 
+    // Деньги дня (WS-1) — только в «Итоге дня» (21:00). Best-effort: нет Altegio →
+    // блок просто отсутствует. Считаем ДО dry-return, чтобы preview показывал выручку.
+    if (isFinal) {
+      try { metrics.money = await fetchDayMoney(env, now); }
+      catch (e) { console.error('[money] failed:', e && e.message); metrics.money = null; }
+    }
+
     // Dry-run (?dry=1): вернуть диагностику без отправки в чат.
     if (meta.dry) {
       return {
@@ -725,6 +750,11 @@ async function runDigest(env, meta) {
         preview: (isFinal ? formatFinal : formatIntermediate)(metrics, parts, ''),
       };
     }
+
+    // Предохранитель рассылки (WS-1): при всплеске жалоб ставит broadcast_pause
+    // и алертит владельцев. Каждый тик, до «тихой» ветки. Сбой не роняет дайджест.
+    try { await maybeBreakerPause(env, now); }
+    catch (e) { console.error('[breaker] failed:', e && e.message); }
 
     // «Тихо»: за 3 часа ничего нового и нет зависших — короткая строка, без LLM.
     if (!isFinal && metrics.deltaLeads === 0 && metrics.unanswered.length === 0) {
@@ -969,7 +999,9 @@ function medianMinutes(diffsMs) {
 
 // Метрики рассылки за день: отправки, шаблоны, темп по часам, ответы (24ч),
 // конверсия, брони после рассылки (Altegio, +72ч), риск-сигналы в ответах.
-async function computeBroadcastMetrics(env, now) {
+// opts.skipBookings — не дёргать Altegio за бронями (предохранителю WS-1 нужен
+// только риск-сигнал; экономим субреквест на ежечасном тике).
+async function computeBroadcastMetrics(env, now, opts = {}) {
   // Только сегодняшний бакет: «отправлено сегодня» без 2-дневного двойного счёта;
   // ответы на сегодняшние отправки приходят в этот же бакет.
   const seen = new Set(); const events = [];
@@ -1017,7 +1049,7 @@ async function computeBroadcastMetrics(env, now) {
   const sendTsByPhone = new Map();
   for (const [dialog, ts] of sendByDialog) { const ph = phoneByDialog.get(dialog); if (ph) { if (!sendTsByPhone.has(ph) || ts < sendTsByPhone.get(ph)) sendTsByPhone.set(ph, ts); } }
   let broadcastBookings = 0;
-  if (sendTsByPhone.size) {
+  if (sendTsByPhone.size && !opts.skipBookings) {
     const token = await altegioUserToken(env);
     if (token) {
       const recs = await fetchAltegioRecords(env, token, almatyDateStr(now - 4 * 86400000), almatyDateStr(now));
@@ -1089,6 +1121,51 @@ async function maybeSendBroadcast(env, now) {
     if (m.broadcastSent > 0) { await sendTelegram(env, formatBroadcast(m, almatyParts(now))); return true; }
   } catch (e) { console.error('[broadcast] send failed:', e && e.message); }
   return false;
+}
+
+// ── ПРЕДОХРАНИТЕЛЬ РАССЫЛКИ (WS-1) ───────────────────────────────────────────
+const BROADCAST_PAUSE_KEY = 'broadcast_pause';   // флаг в KV mh-bot: его tick читает и пропускает рассылку
+// При критическом риске (≥3 жалоб/час, computeBroadcastMetrics → riskCritical)
+// ставит broadcast_pause в KV mh-bot (ЕДИНСТВЕННАЯ запись pulse в чужой namespace,
+// см. шапку про MH_KV) + личный алерт владельцам с кнопкой «Возобновить».
+// Работает НЕЗАВИСИМО от BROADCAST_REPORT (тот гейтит письмо-отчёт, не предохранитель)
+// и от broadcastActive: тормозим, только пока акция реально активна. Идемпотентно —
+// пока пауза стоит, повторно не алертим (флаг проверяем перед записью).
+// opts.metrics — подставить готовые метрики (тест); opts.dry — посчитать, но НИЧЕГО
+// не писать и не слать (ops-проверка ?breakertest=). Возвращает {fired, reason, ...}.
+async function maybeBreakerPause(env, now, opts = {}) {
+  if (!broadcastActive(now)) return { fired: false, reason: 'акция не активна' };
+  if (!(env.MH_KV && typeof env.MH_KV.put === 'function')) return { fired: false, reason: 'MH_KV не подключён' };
+  let m = opts.metrics;
+  if (!m) {
+    try { m = await computeBroadcastMetrics(env, now, { skipBookings: true }); }
+    catch (e) { console.error('[breaker] метрики рассылки упали:', e && e.message); return { fired: false, reason: 'метрики упали' }; }
+  }
+  const r = m && m.broadcastRisks;
+  if (!r || !r.critical) return { fired: false, reason: 'риск не критичен', riskCount: r ? r.count : 0 };
+  let already = false;
+  try { already = !!(await env.MH_KV.get(BROADCAST_PAUSE_KEY)); }
+  catch (_) { /* не прочитали флаг — продолжаем, постановка идемпотентна по содержанию */ }
+  const reason = `всплеск негатива на рассылку: ${r.count} жалоб(ы) за короткое время`;
+  const recipients = [...adminIds(env)];
+  if (opts.dry) return { fired: true, dry: true, already, reason, recipients, riskCount: r.count };
+  if (already) return { fired: false, reason: 'уже на паузе', already: true };
+  try {
+    // Без TTL — снимается только кнопкой «Возобновить» (решение владельца).
+    await env.MH_KV.put(BROADCAST_PAUSE_KEY, JSON.stringify({ reason, ts: now, by: 'mm-pulse-bot' }));
+  } catch (e) { console.error('[breaker] не смог поставить broadcast_pause:', e && e.message); return { fired: false, reason: 'KV put упал' }; }
+  console.log('[breaker] рассылка остановлена:', reason);
+  const sample = r.list.slice(0, 5).map((x) => `— ${contactLabel({ phone: x.phone, name: x.name })}: «${x.text}»`).join('\n');
+  for (const adminId of recipients) {
+    await tgCall(env, 'sendMessage', {
+      chat_id: adminId,
+      text: `🛑 Рассылка остановлена автоматически.\n${reason}.\n${sample ? sample + '\n' : ''}\n`
+        + 'Проверьте тексты и базу. Когда готовы — нажмите кнопку, бот продолжит по расписанию.',
+      reply_markup: { inline_keyboard: [[{ text: '▶️ Возобновить рассылку', callback_data: 'bcast:resume' }]] },
+      disable_web_page_preview: true,
+    });
+  }
+  return { fired: true, reason, recipients };
 }
 
 /* ============================================================
@@ -1398,7 +1475,7 @@ function computeLeadReco(rawEvents, now) {
 // Сколько новых контактов message.help зарегистрировал за дату (по API, авторитетно).
 // created_at в MSK → переводим в дату Алматы (как бакеты). Оценочно: до 6 страниц/канал.
 async function fetchMhNewContacts(env, dateStr) {
-  const out = { total: 0, perChannel: {} };
+  const out = { total: 0, perChannel: {}, truncated: false };
   if (!env.MH_LOGIN || !env.MH_PASSWORD || !env.MH_PROJECT_ID) return out;
   const token = await getMhToken(env);
   if (!token) return out;
@@ -1416,11 +1493,14 @@ async function fetchMhNewContacts(env, dateStr) {
         const j = await (await fetch(
           `${MH_API}/app/projects/${env.MH_PROJECT_ID}/channels/${c.uuid}/users/?limit=50&page=${page}`, { headers: H })).json();
         users = (j && j.data) || [];
+        let pageHadToday = false;
         for (const u of users) {
           const cc = u.created_at ? parseTs(u.created_at) : null;
-          if (cc != null && almatyDateStr(cc) === dateStr) cnt++;
+          if (cc != null && almatyDateStr(cc) === dateStr) { cnt++; pageHadToday = true; }
         }
         if (!j || !j.has_more || !users.length) break;
+        // Потолок страниц, а сегодняшние контакты на последней ещё шли → недосчёт (honesty WS-1).
+        if (page === 6 && pageHadToday) out.truncated = true;
       } catch (_) { break; }
     }
     if (cnt) out.perChannel[String(c.name).trim()] = cnt;
@@ -1434,6 +1514,7 @@ function formatLeadReco(ddmm, target, mh, reco) {
   lines.push(`🎯 Таргетолог: ${target != null ? target : '—'}`);
   const chParts = Object.entries(mh.perChannel || {}).map(([n, c]) => `${n} ${c}`).join(' · ');
   lines.push(`📥 message.help создал: ${mh.total}${chParts ? ` (${chParts})` : ''}`);
+  if (mh.truncated) lines.push('⚠️ данные неполные: реестр message.help обрезан потолком страниц — число занижено');
   lines.push(`✍️ Написали нам: ${reco.newContacts}`);
   lines.push(`✅ Реальных диалогов: ${reco.real}`);
   const b = reco.breakdown; const junk = [];
@@ -1537,9 +1618,10 @@ function parseUserDateRange(text, now) {
   return { label: 'период', dates, from: dates[0], to: dates[dates.length - 1] };
 }
 
-function formatSalesDay(s, mhTotal) {
+function formatSalesDay(s, mhTotal, mhTruncated) {
   const lines = [`📊 Отчёт «Отдел продаж» · день ${ddmmFromDate(s.date)}`];
   lines.push(`🎯 Таргетолог: ${s.target != null ? s.target : '—'} · 📥 message.help: ${mhTotal != null ? mhTotal : '—'} · ✍️ написали: ${s.wrote} · ✅ реальных: ${s.real}`);
+  if (mhTruncated) lines.push('⚠️ данные неполные: реестр message.help обрезан потолком страниц — число занижено');
   lines.push(`🆕 Новых заявок: ${s.newLeads} · ↩️ продолжений: ${s.ongoing}`);
   lines.push(`⏱ Медиана ответа: ${s.medianMin != null ? s.medianMin + ' мин' : '—'} · 🔴 без ответа: ${s.unanswered}`);
   if (s.kevN != null && (s.kevN || s.kevOverdue)) {
@@ -1589,7 +1671,7 @@ async function buildSalesReport(env, period, now, custom) {
     const snap = await buildDailySnapshot(env, now);
     await saveDailySnapshot(env, snap);
     const mh = await fetchMhNewContacts(env, snap.date);
-    return formatSalesDay(snap, mh.total);
+    return formatSalesDay(snap, mh.total, mh.truncated);
   }
   const range = custom || periodRange(period, now);
   const snaps = [];
@@ -1648,7 +1730,8 @@ async function fetchAltegioRecords(env, token, startDate, endDate) {
     if (!Array.isArray(arr) || !arr.length) break;
     out.push(...arr);
     if (arr.length < 200) break;
-    if (page === 25) console.warn(`[altegio] потолок 25 стр (${out.length} записей) — длинный диапазон мог быть обрезан`);
+    // Дошли до потолка страниц, а последняя ещё полная → данные обрезаны (honesty WS-1).
+    if (page === 25) { out.truncated = true; console.warn(`[altegio] потолок 25 стр (${out.length} записей) — диапазон обрезан`); }
   }
   return out;
 }
@@ -1681,6 +1764,26 @@ async function fetchAltegioTransactions(env, token, from, to) {
     if (arr.length < 200) break;
   }
   return { byRecord, total, goods, service, count };
+}
+
+// Деньги за сегодня (Алматы) для «Итога дня» (WS-1): выручка + разрез курсы/услуги
+// + число оформленных сегодня записей. Один проход Altegio (transactions + records);
+// результат кладём в metrics.money, откуда его берут и formatFinal, и персона РОП —
+// Altegio дважды не дёргаем. null = нет owner-токена / Altegio недоступен.
+async function fetchDayMoney(env, now) {
+  const token = await altegioUserToken(env);
+  if (!token) return null;
+  const day = almatyDateStr(now);
+  const txn = await fetchAltegioTransactions(env, token, day, day);
+  const records = await fetchAltegioRecords(env, token, day, day);
+  if (!txn && records == null) return null;
+  return {
+    total: txn ? txn.total : 0,
+    goods: txn ? txn.goods : 0,
+    service: txn ? txn.service : 0,
+    recordsCreated: records == null ? null : records.filter((r) => r && !r.deleted).length,
+    truncated: !!(records && records.truncated), // журнал обрезан потолком выгрузки (honesty WS-1)
+  };
 }
 
 // Карта user_id → имя администратора (кэш сутки). Фоллбэк — ADMIN_NAMES.
@@ -1739,7 +1842,8 @@ function computeAdminFunnel(records, usersMap, txn) {
     a.avgCheck = a.revenue && a.paidVisits ? Math.round(a.revenue / a.paidVisits) : null;
     a.discount = a.priceFull > 0 ? Math.round((1 - a.pricePay / a.priceFull) * 100) : null;
   }
-  return { ...agg, admins: [...by.values()].sort((x, y) => y.total - x.total), auto, money: txn || null };
+  return { ...agg, admins: [...by.values()].sort((x, y) => y.total - x.total), auto, money: txn || null,
+    recordsTruncated: !!(records && records.truncated) }; // журнал обрезан потолком выгрузки (honesty WS-1)
 }
 
 const pct = (num, den) => (den > 0 ? Math.round((num / den) * 100) : null);
@@ -1756,6 +1860,7 @@ function formatAdminReport(label, range, funnel) {
   const bits = [`📝 записей ${f.total}`, `✅ дошли ${f.attended}`, `❌ неявка ${f.noshow}`];
   if (f.waiting) bits.push(`⏳ ждут ${f.waiting}`);
   lines.push(bits.join(' · '));
+  if (f.recordsTruncated) lines.push('⚠️ данные неполные: журнал записей обрезан потолком выгрузки — цифры занижены, сузьте период');
   // Доходимость честна только когда визиты состоялись; если большинство впереди — помечаем «предварительно».
   if (resolved === 0) lines.push(`Доходимость: — (все ${f.waiting} визитов ещё впереди)`);
   else if (f.waiting > resolved) lines.push(`Доходимость (по ${resolved} состоявшимся): ${reach}% · ещё ${f.waiting} впереди`);
@@ -1817,6 +1922,16 @@ async function buildAdminReport(env, period, now, custom) {
  * ФОРМАТ ОТЧЁТА (раздел 6 ТЗ)
  * ============================================================ */
 
+// Честная строка о неполноте данных (WS-1): если потолок реально сработал —
+// называем, что обрезано, а не молчим. '' = всё посчитано полностью.
+function truncationNote(m) {
+  const bits = [];
+  if (m.judgeUnjudged) bits.push(`ИИ-проверку прошли не все зависшие (+${m.judgeUnjudged} без проверки)`);
+  if (m.refineUnchecked) bits.push(`${m.refineUnchecked} зависших не проверены на блокировку`);
+  if (m.money && m.money.truncated) bits.push('журнал записей Altegio обрезан потолком выгрузки');
+  return bits.length ? `⚠️ данные неполные: ${bits.join('; ')}` : '';
+}
+
 // Подпись зависшего диалога: телефон (для WhatsApp), иначе имя, иначе внутренний №.
 // Телефон message.help отдаёт как wa_id (цифры E.164 без «+») — добавляем «+».
 function contactLabel(u) {
@@ -1851,6 +1966,8 @@ function formatIntermediate(m, parts, smart) {
 
   const action = cleanSmart(smart);
   if (action) lines.push(`⚡ Действие: ${action}`);
+  const note = truncationNote(m);
+  if (note) lines.push(note);
   return lines.join('\n');
 }
 
@@ -1869,6 +1986,15 @@ function formatFinal(m, parts, smart) {
       + `(дольше всех ${top.isNew ? '🆕 ' : '↩️ '}${contactLabel(top)} — ${why}${top.waitedMin} мин)`);
   }
 
+  // Деньги дня (WS-1): выручка + разрез курсы/услуги + сколько записей оформлено.
+  if (m.money && (m.money.total || m.money.recordsCreated)) {
+    const mo = m.money;
+    let s = `💰 Выручка дня: ${fmtTg(mo.total)}₸`;
+    if (mo.total) s += ` (курсы ${fmtTg(mo.goods)}₸ · услуги ${fmtTg(mo.service)}₸)`;
+    if (mo.recordsCreated != null) s += ` · записей оформлено: ${mo.recordsCreated}`;
+    lines.push(s);
+  }
+
   const kevLine = formatKevLine(m.kev);
   if (kevLine) lines.push(kevLine);
   if (m.kev && m.kev.dirty && m.kev.dirtyIssues && m.kev.dirtyIssues.length) {
@@ -1881,6 +2007,8 @@ function formatFinal(m, parts, smart) {
   if (parsed[0]) lines.push(parsed[0]);
   const zavtra = parsed.slice(1).join(' ');
   if (zavtra) lines.push(`⚡ На завтра: ${zavtra}`);
+  const note = truncationNote(m);
+  if (note) lines.push(note);
   return lines.join('\n');
 }
 
@@ -1961,6 +2089,10 @@ function buildFinalPrompt(m, parts) {
       ? `- медиана первого ответа: ${m.todayMedianMin} мин`
       : '- медиана первого ответа: данных нет',
     `- осталось без ответа на конец дня: ${m.unanswered.length}`,
+    ...(m.money && (m.money.total || m.money.recordsCreated) ? [
+      `- выручка за день: ${m.money.total} ₸ (курсы ${m.money.goods} ₸, разовые услуги ${m.money.service} ₸`
+      + (m.money.recordsCreated != null ? `; оформлено записей ${m.money.recordsCreated}` : '') + ')',
+    ] : []),
     ...(m.kev && m.kev.n ? [
       `- КЭВ ночного бота: ${m.kev.n}, оформлено записей: ${m.kev.done}, `
       + `просрочено: ${m.kev.overdue}, «грязных» записей: ${m.kev.dirty}`
@@ -1969,7 +2101,8 @@ function buildFinalPrompt(m, parts) {
     '',
     'Это итоговый пульс дня в рабочий чат отдела. Дай ровно две строки, голосом РОП,',
     'конкретно, без заголовков:',
-    'Строка 1 — главный вывод дня одной фразой.',
+    'Строка 1 — главный вывод дня одной фразой; если есть выручка — опирайся на деньги',
+    '(курс важнее разовой услуги), а не только на число заявок.',
     'Строка 2 — одно конкретное действие на завтра.',
     'Не выдумывай цифр сверх тех, что выше. Не называй сотрудников по именам.',
     'Ответь только этими двумя строками, без нумерации и кавычек.',
@@ -2133,6 +2266,7 @@ async function judgeUnanswered(env, metrics, events) {
         if (needs) { u.aiReason = v ? v.reason : ''; keep.push(u); }
       });
       kept = keep.concat(afterBooked.slice(20)); // сверх лимита 20 — оставляем как есть
+      metrics.judgeUnjudged = Math.max(0, afterBooked.length - 20); // не прошли ИИ-проверку (honesty WS-1)
     } else {
       console.log('[judge] ответ ИИ не разобран — оставляю список');
     }
@@ -2400,6 +2534,15 @@ async function handleCallback(env, cq) {
     const closed = await closeOpenShift(env, now);
     await editTgMessage(env, chatId, msgId, shiftCardText(null), shiftKeyboard(sellers));
     await answer(closed ? `✅ Смена закрыта: ${closed.manager}` : 'Открытой смены не было');
+    return;
+  }
+  // Возобновить рассылку после автопаузы предохранителя (WS-1) — только управляющие.
+  if (data === 'bcast:resume') {
+    if (!isAdmin(env, fromId)) { await answer('Только для управляющих'); return; }
+    try { if (env.MH_KV && typeof env.MH_KV.delete === 'function') await env.MH_KV.delete(BROADCAST_PAUSE_KEY); }
+    catch (e) { console.error('[breaker] resume delete failed:', e && e.message); }
+    await editTgMessage(env, chatId, msgId, '▶️ Рассылка возобновлена. Бот продолжит по расписанию.', { inline_keyboard: [] });
+    await answer('Возобновлено');
     return;
   }
   // Управление сотрудниками по ролям (продавцы/администраторы) — только управляющие.
@@ -2688,9 +2831,11 @@ async function refineUnanswered(env, metrics, limit) {
   let budget = 30; // потолок субреквестов к message.help за прогон (защита от лимита Cloudflare)
   const keep = [];
   let blocked = 0;
+  let checked = 0; // сколько зависших реально проверили на блокировку (honesty WS-1)
   for (let i = 0; i < items.length; i++) {
     const u = items[i];
     if (i >= cap || budget <= 0) { keep.push(u); continue; } // сверх лимита/бюджета — не проверяем
+    checked++;
     const tryUuids = (u.channelId != null && map[String(u.channelId)]) ? [map[String(u.channelId)]] : allUuids;
     let card = null;
     for (const uuid of tryUuids) {
@@ -2713,7 +2858,9 @@ async function refineUnanswered(env, metrics, limit) {
   }
   metrics.unanswered = keep;
   metrics.blockedSkipped = (metrics.blockedSkipped || 0) + blocked;
+  metrics.refineUnchecked = Math.max(0, items.length - checked); // не проверены на блокировку (потолок/бюджет)
   if (blocked) console.log(`[digest] отброшено заблокированных «без ответа»: ${blocked}`);
+  if (metrics.refineUnchecked) console.log(`[digest] не проверено на блокировку: ${metrics.refineUnchecked}`);
   return blocked;
 }
 

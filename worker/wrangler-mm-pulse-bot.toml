@@ -20,9 +20,10 @@ crons = ["0 3-16 * * *"]
 binding = "PULSE_KV"
 id = "100bb068db2f410b8da6f760f9ad3970"
 
-# KV mh-bot (BOT_KV) — READ-ONLY по соглашению: pulse читает карточки КЭВ
+# KV mh-bot (BOT_KV) — почти READ-ONLY по соглашению: pulse читает карточки КЭВ
 # (kev:*) для сверки с Altegio и пометки sent:* для маркировки сообщений бота.
-# Писать в этот namespace из pulse ЗАПРЕЩЕНО (он принадлежит mh-bot).
+# ИСКЛЮЧЕНИЕ (WS-1): pulse пишет РОВНО один ключ — broadcast_pause (предохранитель
+# рассылки), его tick mh-bot читает и тормозит рассылку. Прочие ключи — НЕ трогать.
 # id — тот же, что в worker/wrangler-mh-bot.toml.
 [[kv_namespaces]]
 binding = "MH_KV"
