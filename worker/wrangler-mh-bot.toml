@@ -65,6 +65,22 @@ KEV_SLA_DAY_MIN = "60"          # SLA оформления дневного КЭ
 KEV_NIGHT_DEADLINE = "10:30"    # ночные КЭВ (21:00–07:00) оформить до этого часа утра
 KEV_MARKER = "[чат-бот]"        # маркер источника в комментарии записи Altegio (по нему чекер качества)
 
+# ── НОЧНАЯ АВТО-ЗАПИСЬ НА КОНСУЛЬТАЦИЮ (Altegio book_record) ──────────────────
+# Бот САМ записывает на бесплатную консультацию (услуга 13190960) к мастерам из
+# allowlist, только в окно 10:00–20:30. БЕЗОПАСНО при пустом allowlist → фоллбэк
+# на обычный КЭВ. РЕАЛЬНАЯ запись включится ТОЛЬКО после заполнения
+# ALTEGIO_CONSULT_STAFF_IDS (владелец настраивает консультантов bookable в
+# онлайн-записи Altegio → сверка ?staffdump=<WEBHOOK_SECRET> → вписать сюда).
+NIGHT_AUTOBOOK = "1"            # kill-switch (1 вкл / 0 выкл). При пустом allowlist всё равно фоллбэк
+AUTOBOOK_DAY_MODE = "off"       # днём НЕ записывает (только менеджеры). "on" — и днём
+ALTEGIO_CONSULT_STAFF_IDS = ''  # JSON {"<staff_id>":"Имя"} 1–3 консультантов. ПУСТО → фоллбэк (заполнить после ?staffdump)
+AUTOBOOK_START = "10:00"        # начало бронируемого окна (включительно)
+AUTOBOOK_END = "20:30"          # крайнее время старта консультации (включительно)
+AUTOBOOK_FORBID_START = "08:00" # запрещённый интервал начало
+AUTOBOOK_FORBID_END = "10:00"   # запрещённый интервал конец (10:00 уже можно)
+AUTOBOOK_HORIZON_DAYS = "3"     # на сколько дней вперёд предлагать слоты
+AUTOBOOK_MAX_OFFERS = "3"       # сколько слотов показать клиенту (2–3)
+
 # Секреты — ставятся отдельными командами, в этом файле НЕ хранятся:
 #   wrangler secret put ANTHROPIC_API_KEY     --config worker/wrangler-mh-bot.toml
 #   wrangler secret put MH_LOGIN              --config worker/wrangler-mh-bot.toml

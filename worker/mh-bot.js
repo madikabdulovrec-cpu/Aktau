@@ -127,7 +127,7 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 Гибкий, не жёсткий. Пропускай шаги, которые клиент уже закрыл сам.
 1. Приветствие — ТОЛЬКО ОДИН РАЗ за диалог. На первое сообщение клиента поздоровайся, представься как Алия, коротко обозначь студию — и сразу ответь по сути. Если в этой переписке уже было ЛЮБОЕ исходящее сообщение (твой ответ или системное автоприветствие) — НЕ ЗДОРОВАЙСЯ повторно, переходи сразу к содержанию. Никаких «Здравствуйте!», «Доброй ночи!», «Привет!» во втором и последующих ответах.
 2. Лёгкая квалификация: максимум 1-2 вопроса (зона / желаемый результат). Не анкета.
-3. Цена и условия: если спросили — цену пробного назови первой фразой. О расписании — общими словами («работаем с 10 до 19»), без конкретных временных слотов.
+3. Цена и условия: если спросили — цену пробного назови первой фразой. О расписании — общими словами («консультации с 10:00 до 20:30»), без конкретных временных слотов.
 4. Закрытие на визит АЛЬТЕРНАТИВОЙ: «Вам удобнее завтра до обеда или после 16:00?» / «В будни вечером или в выходные днём?». Цель шага — клиент выбрал день + интервал.
 5. Противопоказания — спрашивай ДО фиксации заявки.
 6. Сбор данных: имя и фамилия (обязательно — правило 8), процедура/зона. Телефон НЕ спрашивай. Чего-то не хватает — добери, по одному вопросу за сообщение.
@@ -137,7 +137,7 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 
 - Фабрика красивых тел M&M — студия коррекции фигуры и косметологии.
 - Адрес: г. Алматы, ул. Ауэзова 175Б, угол ул. Габдуллина.
-- Часы: 8:00-21:00 без выходных. Консультации — с 10:00 до 19:00.
+- Часы: 8:00-21:00 без выходных. Консультации — с 10:00 до 20:30.
 - Бесплатная консультация: аппаратная диагностика + индивидуальный план, без навязывания.
 - Первое посещение процедуры — пробное, со скидкой 50%, ~1 час, два этапа: консультация + процедура.
 - Отмена записи — минимум за 24 часа, иначе предоплата/посещение сгорает.
@@ -301,7 +301,7 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 - Не давай списки времён.
 - Пожелание клиента фиксируй: «Завтра в 11:00 — передаю администратору как пожелание. Администратор подтвердит точное время и пришлёт подтверждение; если 11:00 будет занято — предложит ближайшее» (сроки связи — по ВРЕМЕНИ СУТОК).
 
-Часы работы студии общими словами называть можно: «работаем 8:00–21:00 без выходных, консультации с 10 до 19». Но конкретные свободные/занятые окна — НИКОГДА.
+Часы работы студии общими словами называть можно: «работаем 8:00–21:00 без выходных, консультации с 10:00 до 20:30». Но конкретные свободные/занятые окна — НИКОГДА (кроме случая авто-записи, где окна показывает САМА СИСТЕМА после тега OFFER_SLOTS — см. ниже).
 
 # УПРАВЛЯЮЩИЕ ТЕГИ
 
@@ -323,6 +323,24 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 - Действующий клиент:
   [[HANDOFF | existing_client]]
 Если события нет — тег не ставь. Старый формат [[BOOKING | … | …]] не используй.
+
+# АВТО-ЗАПИСЬ НА КОНСУЛЬТАЦИЮ (через систему — ты время НЕ называешь)
+
+Иногда система может САМА записать клиента на бесплатную консультацию и показать ему реальные свободные окна. Твоя роль — только дать сигнал и потом передать выбор клиента. ТЫ НИКОГДА не пишешь конкретное время сам.
+
+Когда клиент готов прийти на консультацию (есть имя И фамилия, ответ по противопоказаниям, явное согласие прийти) — вместо BOOKING_JSON поставь тег:
+  [[OFFER_SLOTS|{"name":"Айгерим Сатпаева","contra":"нет","lang":"ru","temp":"hot","day_hint":"завтра после обеда"}]]
+- Это просьба к системе: «подбери реальные свободные окна и покажи клиенту». В ЭТОМ ответе ТЫ НЕ называешь, не предлагаешь и НЕ СПРАШИВАЕШЬ про время. НЕ пиши «до обеда или после 16:00», НЕ задавай «когда удобнее» — только короткая тёплая подводка из 3–5 слов, например «Секунду, подберу удобное время 🌷». Конкретные окна и выбор впишет САМА система сразу после твоего тега.
+- day_hint — пожелание клиента ПО ВРЕМЕНИ словами («завтра после обеда», «вечером», «в выходные»), если он его называл; если не называл — оставь пустым. НЕ клади сюда зону/процедуру.
+
+После того как СИСТЕМА показала клиенту варианты (1, 2, 3) и клиент выбрал один («второй», «давайте в 11», «вариант 1») — поставь тег:
+  [[BOOK_CONSULT|{"slot_ref":"2"}]]
+- slot_ref — это НОМЕР выбранного варианта из показанного системой списка (1, 2 или 3), НЕ время текстом. Если клиент назвал время словами — сопоставь его с номером показанного варианта и впиши номер.
+- Подтверждение с точным временем («Записала вас на …») напишет САМА система после реальной записи. ТЫ это подтверждение НЕ пишешь и время не печатаешь.
+
+Если система НЕ смогла записать (нет окон, ошибка) — она сама вернёт обычный сценарий, и тогда действует фоллбэк: «администратор подберёт время и подтвердит» (по ВРЕМЕНИ СУТОК). Ты по-прежнему НИКОГДА не выдумываешь время и не пишешь «свободно 11:00». Конкретное время появляется ТОЛЬКО в списке, который дописывает система.
+
+«Вы записаны / записала вас на <время>» — эту фразу пишет ТОЛЬКО система после реальной записи. Сам ты её не пишешь — ты ставишь тег, система подтверждает.
 
 # ЧЕГО НЕ ДЕЛАТЬ НИКОГДА
 
@@ -379,6 +397,28 @@ const KEV_MARKER_DEFAULT = '[чат-бот]';
 const KEV_NUDGE_HOUR_MAX = 2;     // отдельный потолок дожимов в час (поверх анти-бана)
 const KEV_NUDGE_MIN_AGE_H = 3;    // не раньше 3 ч после последнего хода бота
 const KEV_NUDGE_MAX_AGE_H = 26;   // старше ~суток — не дожимаем, поезд ушёл
+
+// ── НОЧНАЯ АВТО-ЗАПИСЬ НА КОНСУЛЬТАЦИЮ (Altegio book_record) ─────────────────
+// Бот САМ записывает клиента на бесплатную консультацию (услуга
+// ALTEGIO_CONSULT_SERVICE_ID=13190960), только к мастерам из allowlist
+// ALTEGIO_CONSULT_STAFF_IDS, только в окно 10:00–20:30. ЦЕНТРАЛЬНЫЙ ПРИНЦИП:
+// LLM НИКОГДА не называет/не выбирает время — слоты приходят из book_times,
+// код фильтрует окно, предлагает 2–3 реальных, клиент выбирает, код создаёт
+// запись через book_record, подтверждение печатает реальное время из ответа
+// Altegio. Любая неопределённость → фоллбэк на КЭВ-карточку. Управляется
+// kill-switch env.NIGHT_AUTOBOOK (по умолчанию выкл при пустом allowlist).
+const AUTOBOOK_OFFER_TTL = 1800;       // 30 мин — предложенные клиенту слоты в KV
+const AUTOBOOK_LOCK_TTL = 600;         // 10 мин — лок создания записи (booking:{phone}:{ymd})
+const AUTOBOOK_DONE_TTL = 86400;       // 24 ч — анти-повтор брони того же клиента
+const AUTOBOOK_RECORD_TTL = 432000;    // 5 дней — пометка для исключения из confirm-крона
+const AUTOBOOK_NIGHT_START = 21;       // «ночь» авто-записи: как ВРЕМЯ СУТОК промпта (21:00–08:59)
+const AUTOBOOK_NIGHT_END = 9;          // 09:00 — уже день
+const AUTOBOOK_START_DEFAULT = '10:00';
+const AUTOBOOK_END_DEFAULT = '20:30';
+const AUTOBOOK_FORBID_START_DEFAULT = '08:00';
+const AUTOBOOK_FORBID_END_DEFAULT = '10:00';
+const AUTOBOOK_HORIZON_DEFAULT = 3;
+const AUTOBOOK_MAX_OFFERS_DEFAULT = 3;
 
 // ── ГОЛОСОВЫЕ (Whisper, Workers AI) ─────────────────────────────────────────
 // Voice-note WhatsApp приходит как message_type=audio + file_url (.oga,
@@ -681,8 +721,28 @@ export default {
         const r = await simulateDialog(env,
           url.searchParams.get('u') || 'sim1',
           url.searchParams.get('text') || '',
-          url.searchParams.get('reset') === '1');
+          url.searchParams.get('reset') === '1',
+          url.searchParams.get('ab') === '1');
         return json(r);
+      }
+      // Ops: список мастеров под услугу-консультацию (сверка staff_id для
+      // ALTEGIO_CONSULT_STAFF_IDS) — GET ?staffdump=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('staffdump') === env.WEBHOOK_SECRET) {
+        return json(await staffDump(env));
+      }
+      // Ops: dry-run слотов авто-записи (какие вернутся и пройдут фильтр окна,
+      // БЕЗ создания записи) — GET ?autobooktest=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('autobooktest') === env.WEBHOOK_SECRET) {
+        const now = almatyNow();
+        const slots = await fetchConsultSlots(env, { dayHint: url.searchParams.get('hint') || '' });
+        return json({
+          ok: true,
+          enabled: autobookEnabled(env, now),
+          night: isAutobookNight(now),
+          staff: [...parseConsultStaff(env).entries()].map(([id, name]) => ({ id, name })),
+          window: `${env.AUTOBOOK_START || AUTOBOOK_START_DEFAULT}–${env.AUTOBOOK_END || AUTOBOOK_END_DEFAULT}`,
+          slots: slots.map((s) => ({ ref: s.ref, when: `${s.humanDate} ${s.hhmm}`, staff: s.staffName, datetime: s.datetime })),
+        });
       }
       return json({ status: 'ok', service: 'mh-bot', ts: new Date().toISOString() });
     }
@@ -947,21 +1007,42 @@ async function processMessage(msg, env) {
 
   const contextHistory = appendTurn(histBefore, 'user', msg.text);
 
-  // Слоты в промпт больше НЕ подмешиваем: бот не показывает временные окна,
-  // выбор времени делает менеджер. См. блок «ВРЕМЯ И РАСПИСАНИЕ» в SYSTEM_PROMPT.
+  // Слоты в промпт больше НЕ подмешиваем: бот не показывает временные окна.
+  // Но подмешиваем доступность авто-записи СЕЙЧАС: только тогда Claude эмитит
+  // OFFER_SLOTS (иначе ведёт обычный КЭВ). См. блок АВТО-ЗАПИСЬ в SYSTEM_PROMPT.
   const reply = await callClaude(env, contextHistory,
-    buildServiceNote(kevPending, kevMissing));
+    buildServiceNote(kevPending, kevMissing, autobookEnabled(env, almatyNow())));
 
   // Если Claude недоступен — НЕ молчим: мягкий ответ + handoff менеджеру.
   let clientText;
   let booking = null;
   let handoff = null;
   let claudeFailed = false;
+  let autobooked = false;
   if (reply) {
     const parsed = parseControlTags(reply);
     clientText = parsed.cleanText || 'Спасибо за сообщение! 🌸 Передаю вас менеджеру.';
     booking = parsed.booking;
     handoff = parsed.handoff;
+
+    // Авто-запись на консультацию (OFFER_SLOTS/BOOK_CONSULT). BOOK_CONSULT —
+    // легитимное продолжение, НЕ гасится при kev_pending (блокер #7); OFFER_SLOTS
+    // и BOOKING_JSON гасятся как раньше. handleAutoBook сам решает гейты/фоллбэк;
+    // при handled=true он подменяет текст клиенту и (при успехе) создаёт запись.
+    if (parsed.bookConsult || parsed.offerSlots) {
+      try {
+        const ab = await handleAutoBook(env, msg, parsed, kevPending, parsed.cleanText);
+        if (ab && ab.handled) {
+          clientText = ab.clientText || clientText;
+          if (ab.handoff) handoff = ab.handoff;
+          if (ab.autobooked) autobooked = true;
+          booking = null; // авто-флоу сам поставил карточку/решил фоллбэк
+        }
+      } catch (e) {
+        console.error('handleAutoBook failed:', e && e.message);
+        // фоллбэк: идём обычным КЭВ (booking/handoff из тегов, если были)
+      }
+    }
   } else {
     claudeFailed = true;
     clientText = 'Спасибо за сообщение! 🌸 Сейчас передам вас менеджеру — '
@@ -971,6 +1052,7 @@ async function processMessage(msg, env) {
 
   // После состоявшегося КЭВ повторные BOOKING-теги игнорируем (карточка уже у
   // менеджера). Запрос изменения/отмены Claude отдаёт HANDOFF'ом — он пройдёт.
+  // (Авто-запись BOOK_CONSULT выше kev_pending НЕ гасит — это отдельная ветка.)
   if (booking && kevPending) {
     console.log(`booking suppressed (kev already pending) ${tag}`);
     booking = null;
@@ -1024,29 +1106,40 @@ async function processMessage(msg, env) {
   if (booking) await handleBooking(env, msg, booking);
 
   console.log(`done ${tag} booking=${!!booking} handoff=${handoff || '-'}`
+    + `${autobooked ? ' AUTO-BOOKED' : ''}`
     + `${bookingMissing ? ` missing=${bookingMissing.length}` : ''}`
     + `${kevPending ? ' kev-pending' : ''}${claudeFailed ? ' claude-fail' : ''}`);
 }
 
 // Служебная заметка для Claude (клиент её не видит, в KV-историю не пишется):
-// контекст «КЭВ уже состоялся» либо «каких полей заявки не хватает».
-function buildServiceNote(kevPending, kevMissing) {
+// контекст «КЭВ уже состоялся» / «каких полей не хватает» / «авто-запись доступна».
+// autobookAvailable — авто-запись реально включена СЕЙЧАС (kill-switch + allowlist
+// + ночь): только тогда Claude эмитит OFFER_SLOTS, иначе ведёт обычный КЭВ.
+function buildServiceNote(kevPending, kevMissing, autobookAvailable) {
   if (kevPending) {
     const what = [kevPending.service, kevPending.day, kevPending.interval]
       .filter(Boolean).join(', ');
     return '[СЛУЖЕБНОЕ, КЛИЕНТ ЭТОГО НЕ ВИДИТ: заявка этого клиента УЖЕ передана '
       + `администратору${what ? ` (${what})` : ''}. Отвечай на уточняющие вопросы по сути. `
-      + 'Заявку заново НЕ собирай, теги BOOKING_JSON/BOOKING НЕ ставь. По вопросам '
-      + 'времени и записи: «администратор свяжется и подтвердит». Если клиент хочет '
-      + 'ИЗМЕНИТЬ или ОТМЕНИТЬ договорённость — поставь [[HANDOFF | изменение заявки]].]';
+      + 'Заявку заново НЕ собирай, теги BOOKING_JSON/BOOKING/OFFER_SLOTS НЕ ставь. По '
+      + 'вопросам времени и записи: «администратор свяжется и подтвердит». Если клиент '
+      + 'хочет ИЗМЕНИТЬ или ОТМЕНИТЬ договорённость — поставь [[HANDOFF | изменение заявки]].]';
+  }
+  const parts = [];
+  if (autobookAvailable) {
+    parts.push('АВТО-ЗАПИСЬ ДОСТУПНА СЕЙЧАС: когда клиент готов прийти на консультацию '
+      + '(есть имя И фамилия, ответ по противопоказаниям, согласие) — ставь [[OFFER_SLOTS|{...}]] '
+      + 'ВМЕСТО вопроса про день/время и вместо BOOKING_JSON. Система сама покажет реальные '
+      + 'окна. Время НЕ называй.');
+  } else {
+    parts.push('АВТО-ЗАПИСЬ СЕЙЧАС НЕДОСТУПНА: OFFER_SLOTS/BOOK_CONSULT НЕ ставь, '
+      + 'закрывай обычным путём — день+интервал словами и BOOKING_JSON.');
   }
   if (kevMissing && Array.isArray(kevMissing.missing) && kevMissing.missing.length) {
-    return '[СЛУЖЕБНОЕ, КЛИЕНТ ЭТОГО НЕ ВИДИТ: для заявки ещё не хватает: '
-      + kevMissing.missing.join(', ')
-      + '. Уточни недостающее естественно (по одному вопросу за сообщение) и поставь '
-      + 'полный BOOKING_JSON, когда всё соберёшь.]';
+    parts.push('Для заявки ещё не хватает: ' + kevMissing.missing.join(', ')
+      + '. Уточни недостающее естественно (по одному вопросу за сообщение).');
   }
-  return '';
+  return parts.length ? `[СЛУЖЕБНОЕ, КЛИЕНТ ЭТОГО НЕ ВИДИТ: ${parts.join(' ')}]` : '';
 }
 
 // ── Голосовые сообщения: распознавание через Workers AI (Whisper) ───────────
@@ -1318,45 +1411,79 @@ async function callClaude(env, history, serviceNote) {
   return '';
 }
 
-// ── Управляющие теги [[BOOKING_JSON|{...}]] / [[BOOKING|...]] / [[HANDOFF|...]] ──
-// Основной формат КЭВ — BOOKING_JSON (имя/телефон/процедура/день/интервал/
-// противопоказания/язык/температура). Старый позиционный [[BOOKING|a|b|c|d|e]]
-// поддержан для обратной совместимости: его «слот» считается «день+интервал»
-// одной строкой (поле day, legacy=true).
+// ── Управляющие теги ────────────────────────────────────────────────────────
+// [[BOOKING_JSON|{...}]] — КЭВ-карточка менеджеру (имя/процедура/день/интервал/…).
+// [[OFFER_SLOTS|{...}]]  — запрос авто-записи: «клиент готов», система покажет слоты.
+// [[BOOK_CONSULT|{...}]] — клиент выбрал слот (slot_ref — номер, НЕ время текстом).
+// [[BOOKING|a|b|c|d|e]]  — легаси-формат КЭВ (обратная совместимость).
+// [[HANDOFF|причина]]    — передать менеджеру.
+// helper: типобезопасный JSON-объект тега или null.
+function parseTagJson(raw) {
+  try {
+    const o = JSON.parse(raw);
+    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : null;
+  } catch (_) { return null; }
+}
+const tagStr = (v) => (typeof v === 'string' ? v.trim() : '');
+
 function parseControlTags(text) {
   let booking = null;
   let handoff = null;
+  let offerSlots = null;
+  let bookConsult = null;
 
-  // Новый формат: [[BOOKING_JSON|{...}]] (JSON одной строкой).
+  // [[BOOKING_JSON|{...}]]
   const jsonRe = /\[\[\s*BOOKING_JSON\s*\|\s*(\{[\s\S]*?\})\s*\]\]/gi;
   let jm;
   while ((jm = jsonRe.exec(text)) !== null) {
-    try {
-      const o = JSON.parse(jm[1]);
-      booking = {
-        name: String(o.name || '').trim(),
-        phone: String(o.phone || '').replace(/\D/g, ''),
-        service: String(o.service || '').trim(),
-        day: String(o.day || '').trim(),
-        interval: String(o.interval || '').trim(),
-        contraindications: String(o.contra || o.contraindications || '').trim(),
-        lang: (String(o.lang || '').trim().toLowerCase() === 'kz') ? 'kz' : 'ru',
-        temp: (String(o.temp || '').trim().toLowerCase() === 'hot') ? 'hot' : 'warm',
-      };
-    } catch (e) {
-      // Битый JSON = тега нет: диалог продолжится, Claude обычно чинит сам.
-      console.error('BOOKING_JSON parse error:', e && e.message);
-    }
+    const o = parseTagJson(jm[1]);
+    if (!o) { console.error('BOOKING_JSON parse error'); continue; }
+    booking = {
+      name: tagStr(o.name),
+      phone: tagStr(o.phone).replace(/\D/g, ''),
+      service: tagStr(o.service),
+      day: tagStr(o.day),
+      interval: tagStr(o.interval),
+      contraindications: tagStr(o.contra) || tagStr(o.contraindications),
+      lang: (tagStr(o.lang).toLowerCase() === 'kz') ? 'kz' : 'ru',
+      temp: (tagStr(o.temp).toLowerCase() === 'hot') ? 'hot' : 'warm',
+    };
   }
 
-  // Старый формат + HANDOFF.
+  // [[OFFER_SLOTS|{...}]] — запрос слотов авто-записи.
+  const offerRe = /\[\[\s*OFFER_SLOTS\s*\|\s*(\{[\s\S]*?\})\s*\]\]/gi;
+  let om;
+  while ((om = offerRe.exec(text)) !== null) {
+    const o = parseTagJson(om[1]);
+    if (!o) { console.error('OFFER_SLOTS parse error'); continue; }
+    offerSlots = {
+      name: tagStr(o.name),
+      contra: tagStr(o.contra) || tagStr(o.contraindications),
+      lang: (tagStr(o.lang).toLowerCase() === 'kz') ? 'kz' : 'ru',
+      temp: (tagStr(o.temp).toLowerCase() === 'hot') ? 'hot' : 'warm',
+      day_hint: tagStr(o.day_hint),
+    };
+  }
+
+  // [[BOOK_CONSULT|{"slot_ref":"2"}]] — выбор слота. slot_ref ТОЛЬКО как строка/число.
+  const bookRe = /\[\[\s*BOOK_CONSULT\s*\|\s*(\{[\s\S]*?\})\s*\]\]/gi;
+  let bm;
+  while ((bm = bookRe.exec(text)) !== null) {
+    const o = parseTagJson(bm[1]);
+    if (!o) { console.error('BOOK_CONSULT parse error'); continue; }
+    const ref = (typeof o.slot_ref === 'string' || typeof o.slot_ref === 'number')
+      ? String(o.slot_ref).trim() : '';
+    bookConsult = { slot_ref: ref };
+  }
+
+  // Легаси [[BOOKING|...]] + [[HANDOFF|...]]
   const re = /\[\[\s*(BOOKING|HANDOFF)\s*\|([^\]]*)\]\]/gi;
   let match;
   while ((match = re.exec(text)) !== null) {
     const kind = match[1].toUpperCase();
     const payload = match[2].trim();
     if (kind === 'BOOKING') {
-      if (!booking) { // BOOKING_JSON приоритетнее, если Claude поставил оба
+      if (!booking) {
         const p = payload.split('|').map((s) => s.trim());
         booking = { name: p[0] || '', phone: (p[1] || '').replace(/\D/g, ''),
           service: p[2] || '', day: p[3] || '', interval: '',
@@ -1367,9 +1494,10 @@ function parseControlTags(text) {
     }
   }
 
-  const cleanText = text.replace(jsonRe, '').replace(re, '')
+  const cleanText = text
+    .replace(jsonRe, '').replace(offerRe, '').replace(bookRe, '').replace(re, '')
     .replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText, booking, handoff };
+  return { cleanText, booking, handoff, offerSlots, bookConsult };
 }
 
 // Валидация карточки КЭВ. ok=false → тег не закрывает диалог, missing подмешается
@@ -1982,7 +2110,7 @@ async function runKevNudgeJob(env) {
 // Полный Claude-флоу на синтетическом пользователе sim_{id}: история в KV,
 // служебные заметки, валидация BOOKING, kev_pending. НИЧЕГО не шлёт ни клиенту,
 // ни в Telegram, карточек kev:/lead: не создаёт.
-async function simulateDialog(env, simId, text, reset) {
+async function simulateDialog(env, simId, text, reset, forceAutobook) {
   const userId = `sim_${String(simId).replace(/[^\w-]/g, '')}`;
   const histKey = `hist:${userId}`;
   if (reset) {
@@ -2004,10 +2132,24 @@ async function simulateDialog(env, simId, text, reset) {
 
   const histBefore = (await env.BOT_KV.get(histKey, { type: 'json' })) || [];
   const contextHistory = appendTurn(histBefore, 'user', text);
-  const note = buildServiceNote(kevPending, kevMissing);
+  // forceAutobook (&ab=1) — для golden-теста эмиссии OFFER_SLOTS, когда allowlist
+  // ещё пуст (в реале флаг = autobookEnabled).
+  const abAvail = forceAutobook || autobookEnabled(env, almatyNow());
+  const note = buildServiceNote(kevPending, kevMissing, abAvail);
   const reply = await callClaude(env, contextHistory, note);
   const parsed = reply ? parseControlTags(reply)
-    : { cleanText: '', booking: null, handoff: null };
+    : { cleanText: '', booking: null, handoff: null, offerSlots: null, bookConsult: null };
+
+  // Авто-запись в симуляции НЕ исполняем (никаких записей в Altegio) — только
+  // показываем, какие теги эмитил Claude (golden-тест промпта).
+  let autobookSim = null;
+  if (parsed.offerSlots || parsed.bookConsult) {
+    autobookSim = {
+      offerSlots: parsed.offerSlots || null,
+      bookConsult: parsed.bookConsult || null,
+      enabled: autobookEnabled(env, almatyNow()),
+    };
+  }
 
   let validation = null;
   let kevAccepted = false;
@@ -2040,8 +2182,545 @@ async function simulateDialog(env, simId, text, reset) {
     reply: parsed.cleanText || reply || '',
     booking: parsed.booking || null,
     handoff: parsed.handoff || null,
+    autobook: autobookSim,
     validation, kevAccepted, suppressed,
     serviceNote: note || undefined,
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// НОЧНАЯ АВТО-ЗАПИСЬ НА КОНСУЛЬТАЦИЮ (Altegio book_record)
+// LLM НИКОГДА не называет время — слоты из book_times, код фильтрует окно
+// 10:00–20:30, предлагает реальные, клиент выбирает, код создаёт запись,
+// подтверждение печатает реальное время из ответа Altegio.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Ops: сырой список мастеров под услугу-консультацию из Altegio (book_staff) —
+// владелец сверяет id/bookable, чтобы заполнить ALTEGIO_CONSULT_STAFF_IDS.
+async function staffDump(env) {
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_COMPANY_ID
+    || !env.ALTEGIO_CONSULT_SERVICE_ID) {
+    return { ok: false, error: 'altegio not configured' };
+  }
+  const co = env.ALTEGIO_COMPANY_ID;
+  const sid = encodeURIComponent(env.ALTEGIO_CONSULT_SERVICE_ID);
+  let svcTitle = null;
+  try {
+    const sRes = await fetch(`${ALTEGIO_API}/company/${co}/services/${sid}`,
+      { headers: altegioHeaders(env) });
+    if (sRes.ok) { const j = await sRes.json().catch(() => null); svcTitle = j && j.data && j.data.title; }
+  } catch (_) { /* best-effort */ }
+  let staff = [];
+  try {
+    const res = await fetch(`${ALTEGIO_API}/book_staff/${co}?service_ids[]=${sid}`,
+      { headers: { Authorization: `Bearer ${env.ALTEGIO_PARTNER_TOKEN}`, Accept: 'application/vnd.api.v2+json' } });
+    if (res.ok) {
+      const j = await res.json().catch(() => null);
+      const arr = (j && j.data) || [];
+      staff = (Array.isArray(arr) ? arr : []).map((s) => ({
+        id: s.id, name: s.name, bookable: s.bookable,
+      }));
+    } else {
+      return { ok: false, error: `book_staff ${res.status}` };
+    }
+  } catch (e) {
+    return { ok: false, error: e && e.message };
+  }
+  return {
+    ok: true,
+    serviceId: env.ALTEGIO_CONSULT_SERVICE_ID,
+    serviceTitle: svcTitle,
+    staff,
+    hint: 'Заполнить ALTEGIO_CONSULT_STAFF_IDS = {"<id>":"<имя>"} из bookable:true',
+  };
+}
+
+// Allowlist мастеров-консультантов: Map staffId(String)→name. Пусто → авто-запись
+// в фоллбэке (гейт). env.ALTEGIO_CONSULT_STAFF_IDS = JSON {"<id>":"Имя"}.
+function parseConsultStaff(env) {
+  const map = new Map();
+  if (!env.ALTEGIO_CONSULT_STAFF_IDS) return map;
+  try {
+    const obj = JSON.parse(env.ALTEGIO_CONSULT_STAFF_IDS);
+    for (const [id, name] of Object.entries(obj)) {
+      const sid = String(id).replace(/\D/g, '');
+      if (sid) map.set(sid, String(name || `#${sid}`));
+    }
+  } catch (e) {
+    console.error('ALTEGIO_CONSULT_STAFF_IDS parse:', e && e.message);
+  }
+  return map;
+}
+
+// «Ночь» авто-записи (Almaty 21:00–08:59) — ЕДИНСТВЕННАЯ функция (блокер #8).
+function isAutobookNight(now) {
+  const h = (now || almatyNow()).hour;
+  return h >= AUTOBOOK_NIGHT_START || h < AUTOBOOK_NIGHT_END;
+}
+
+// Авто-запись активна сейчас? kill-switch + конфигурация + время суток
+// (ночь всегда; день — только при AUTOBOOK_DAY_MODE=on) + непустой allowlist.
+function autobookEnabled(env, now) {
+  if (env.NIGHT_AUTOBOOK !== '1') return false;
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_COMPANY_ID
+    || !env.ALTEGIO_CONSULT_SERVICE_ID) return false;
+  if (!parseConsultStaff(env).size) return false;
+  if (env.AUTOBOOK_DAY_MODE === 'on') return true;
+  return isAutobookNight(now || almatyNow());
+}
+
+// hh:mm → минуты от полуночи (null при ошибке).
+function hmToMin(hm) {
+  const m = String(hm || '').match(/^(\d{1,2}):(\d{2})$/);
+  return m ? (+m[1]) * 60 + (+m[2]) : null;
+}
+
+// ymd (Almaty) по таймстампу.
+function ymdOfMs(ms) {
+  const d = new Date(ms + ALMATY_UTC_OFFSET * 3600000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-`
+    + `${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+// ЕДИНСТВЕННЫЙ фильтр окна слота (блокер #8). datetime — ISO с +05:00 (локальное
+// Almaty). Валиден, если HH:mm ∈ [START,END] И ∉ [FORBID_START,FORBID_END) И в
+// будущем (> now+60с). Возвращает {ok, ms}.
+function slotInWindow(env, datetimeISO, nowMs) {
+  const parts = parseAltegioParts(datetimeISO);
+  if (!parts) return { ok: false };
+  const ms = partsToAlmatyMs(parts);
+  if (!ms || ms < (nowMs || Date.now()) + 60000) return { ok: false }; // прошлое
+  const min = parts.hour * 60 + parts.minute;
+  const start = hmToMin(env.AUTOBOOK_START || AUTOBOOK_START_DEFAULT) ?? 600;
+  const end = hmToMin(env.AUTOBOOK_END || AUTOBOOK_END_DEFAULT) ?? 1230;
+  const fStart = hmToMin(env.AUTOBOOK_FORBID_START || AUTOBOOK_FORBID_START_DEFAULT) ?? 480;
+  const fEnd = hmToMin(env.AUTOBOOK_FORBID_END || AUTOBOOK_FORBID_END_DEFAULT) ?? 600;
+  if (min < start || min > end) return { ok: false };
+  if (min >= fStart && min < fEnd) return { ok: false };
+  return { ok: true, ms };
+}
+
+// Человеческая дата слота: «сегодня (пт 13.06)» / «завтра (сб 14.06)» / «(вс 15.06)».
+function humanizeSlotDate(ms, now) {
+  const d = new Date(ms + ALMATY_UTC_OFFSET * 3600000);
+  const WD = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const ymd = ymdOfMs(ms);
+  let prefix = '';
+  if (ymd === now.ymd) prefix = 'сегодня ';
+  else if (ymd === ymdDaysAhead(now, 1)) prefix = 'завтра ';
+  return `${prefix}(${WD[d.getUTCDay()]} ${dd}.${mm})`;
+}
+
+// Реальные свободные слоты консультации по мастерам allowlist, отфильтрованные
+// в окно. Возвращает [{ref, datetime, ms, staffId, staffName, hhmm, humanDate}]
+// (до maxOffers, сортировка по времени). dayHint — мягкий буст, не фильтр.
+async function fetchConsultSlots(env, opts = {}) {
+  const staff = parseConsultStaff(env);
+  if (!staff.size) return [];
+  const co = env.ALTEGIO_COMPANY_ID;
+  const sid = encodeURIComponent(env.ALTEGIO_CONSULT_SERVICE_ID);
+  const horizon = parseInt(env.AUTOBOOK_HORIZON_DAYS, 10) || AUTOBOOK_HORIZON_DEFAULT;
+  const maxOffers = parseInt(env.AUTOBOOK_MAX_OFFERS, 10) || AUTOBOOK_MAX_OFFERS_DEFAULT;
+  const now = almatyNow();
+  const allowedDates = new Set();
+  for (let i = 0; i <= horizon; i++) allowedDates.add(ymdDaysAhead(now, i));
+
+  const byDatetime = new Map(); // datetimeISO → {datetime, ms, staffId, hour}
+  for (const [staffId] of staff) {
+    let dates = [];
+    try {
+      const dRes = await fetch(
+        `${ALTEGIO_API}/book_dates/${co}?service_ids[]=${sid}&staff_id=${staffId}`,
+        { headers: altegioHeaders(env) });
+      if (dRes.ok) {
+        const dJson = await dRes.json().catch(() => null);
+        const d = dJson && dJson.data;
+        dates = (d && (d.booking_dates || d.working_dates)) || [];
+      }
+    } catch (e) { console.error('book_dates:', e && e.message); }
+    if (!Array.isArray(dates)) dates = [];
+    for (const date of dates) {
+      if (!allowedDates.has(date)) continue;
+      let times = [];
+      try {
+        const tRes = await fetch(
+          `${ALTEGIO_API}/book_times/${co}/${staffId}/${date}?service_ids[]=${sid}`,
+          { headers: altegioHeaders(env) });
+        if (tRes.ok) {
+          const tJson = await tRes.json().catch(() => null);
+          times = (tJson && tJson.data) || [];
+        }
+      } catch (e) { console.error('book_times:', e && e.message); }
+      for (const t of (Array.isArray(times) ? times : [])) {
+        const dtISO = t && t.datetime;
+        if (!dtISO || byDatetime.has(dtISO)) continue;
+        const w = slotInWindow(env, dtISO, now.ms);
+        if (!w.ok) continue;
+        const p = parseAltegioParts(dtISO);
+        byDatetime.set(dtISO, { datetime: dtISO, ms: w.ms, staffId, hour: p.hour });
+      }
+    }
+  }
+
+  let list = [...byDatetime.values()].sort((a, b) => a.ms - b.ms);
+  // dayHint — мягкий буст по части суток (не фильтр, слоты не удаляются).
+  const hint = String(opts.dayHint || '').toLowerCase();
+  const wantPeriod = /вечер/.test(hint) ? 'eve'
+    : /утр/.test(hint) ? 'morn' : /обед|днём|днем|день/.test(hint) ? 'day' : null;
+  if (wantPeriod) {
+    const periodOf = (h) => (h < 12 ? 'morn' : h < 17 ? 'day' : 'eve');
+    list = list
+      .map((s, i) => ({ s, i, hit: periodOf(s.hour) === wantPeriod ? 0 : 1 }))
+      .sort((a, b) => a.hit - b.hit || a.s.ms - b.s.ms)
+      .map((x) => x.s);
+  }
+  return list.slice(0, maxOffers).map((s, i) => {
+    const p = parseAltegioParts(s.datetime) || { hour: s.hour, minute: 0 };
+    return {
+      ref: String(i + 1),
+      datetime: s.datetime,
+      ms: s.ms,
+      staffId: s.staffId,
+      staffName: staff.get(s.staffId) || `#${s.staffId}`,
+      hhmm: `${p.hour}:${String(p.minute).padStart(2, '0')}`,
+      humanDate: humanizeSlotDate(s.ms, now),
+    };
+  });
+}
+
+// Создание записи на консультацию через book_record (только partner-токен).
+// Возвращает {ok, recordId, recordHash} | {ok:false, errCode, httpStatus} |
+// {ok:false, networkError:true}.
+async function createConsultRecord(env, opts) {
+  const co = env.ALTEGIO_COMPANY_ID;
+  const body = {
+    phone: opts.phone,
+    fullname: opts.fullname,
+    comment: `Запись через бота (КЭВ-консультация) ${kevMarker(env)}`,
+    api_id: `kev-${opts.userId}-${Date.now()}`,
+    appointments: [{
+      id: 1,
+      staff_id: Number(opts.staffId),
+      services: [Number(env.ALTEGIO_CONSULT_SERVICE_ID)],
+      datetime: opts.datetime,
+    }],
+  };
+  let res;
+  try {
+    res = await fetch(`${ALTEGIO_API}/book_record/${co}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.ALTEGIO_PARTNER_TOKEN}`,
+        Accept: 'application/vnd.api.v2+json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    console.error('book_record network:', e && e.message);
+    return { ok: false, networkError: true };
+  }
+  const data = await res.json().catch(() => null);
+  if (res.ok) {
+    const arr = (data && data.data) || [];
+    const rec = Array.isArray(arr) ? arr[0] : arr;
+    const recordId = rec && (rec.record_id || rec.id);
+    if (recordId) return { ok: true, recordId, recordHash: rec.record_hash || rec.hash };
+    console.error('book_record ok но без record_id:', JSON.stringify(data).slice(0, 200));
+    return { ok: false, httpStatus: res.status, errCode: 0 };
+  }
+  const meta = (data && data.meta) || {};
+  const errCode = Number(meta.code || (meta.errors && meta.errors.code)) || 0;
+  console.error(`book_record ${res.status} code=${errCode}:`,
+    JSON.stringify(meta).slice(0, 200));
+  return { ok: false, httpStatus: res.status, errCode };
+}
+
+// Предпроверка дублей по ТЕЛЕФОНУ (блокер #2): есть ли активная запись на
+// консультацию на дату ymd. Возвращает record (есть) | false (нет) | null (не
+// смогли проверить — KV-lock остаётся основным щитом).
+async function altegioHasConsultToday(env, phone, ymd) {
+  try {
+    const recs = await altegioFetchRecords(env, ymd, ymd);
+    if (!Array.isArray(recs)) return null;
+    const want = normalizePhone(phone);
+    const svc = Number(env.ALTEGIO_CONSULT_SERVICE_ID);
+    for (const r of recs) {
+      if (!r || r.deleted || Number(r.attendance) === -1) continue;
+      if (normalizePhone((r.client && r.client.phone) || '') !== want) continue;
+      const ids = (r.services || []).map((s) => Number(s.id));
+      if (ids.includes(svc)) return r;
+    }
+    return false;
+  } catch (e) { console.error('hasConsultToday:', e && e.message); return null; }
+}
+
+// Вырезать паттерны времени из текста Claude (анти-галлюцинация, блокер #4.6):
+// в ветке авто-записи время печатает ТОЛЬКО код.
+function stripTimePatterns(text) {
+  return String(text || '')
+    .replace(/\b\d{1,2}[:.]\d{2}\b/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// Диспетчер авто-записи. Возвращает {handled, clientText, handoff, kevCard}.
+// handled=false → теги были (но авто-запись недоступна), идём обычным КЭВ.
+async function handleAutoBook(env, msg, parsed, kevPending, baseText) {
+  const now = almatyNow();
+  // BOOK_CONSULT приоритетнее (клиент выбрал) и НЕ гасится при kev_pending (#7).
+  if (parsed.bookConsult) {
+    return handleBookConsult(env, msg, parsed.bookConsult, baseText, now);
+  }
+  if (parsed.offerSlots) {
+    if (!autobookEnabled(env, now)) return { handled: false };
+    return handleOfferSlots(env, msg, parsed.offerSlots, baseText, now);
+  }
+  return { handled: false };
+}
+
+// ШАГ 1–4: гейты → слоты → предложение клиенту.
+async function handleOfferSlots(env, msg, offer, baseText, now) {
+  const tag = `u${msg.userId}`;
+  // Имя+фамилия (≥2 слова): нет → не бронируем, добор обычным флоу.
+  const words = String((offer && offer.name) || '').trim().split(/\s+/).filter(Boolean);
+  if (words.length < 2) {
+    console.log(`autobook: имя неполное, добор ${tag}`);
+    return { handled: false };
+  }
+  // Телефон обязателен для book_record.
+  let phone = '';
+  try { phone = normalizePhone(await getContactPhone(env, msg)) || ''; }
+  catch (_) { phone = ''; }
+  if (!phone) {
+    await sendTelegramAlert(env, [
+      `⚠️ КЭВ БЕЗ ТЕЛЕФОНА — оформить вручную · ${almatyHHMM()}`,
+      `${(offer && offer.name) || '—'} · чат №${msg.userId}`,
+      'Клиент готов на консультацию, но телефон не определился — авто-запись невозможна.',
+    ].join('\n'));
+    return {
+      handled: true,
+      clientText: stripTimePatterns(baseText)
+        || 'Готова записать вас на консультацию 🌷 Передаю администратору — он(а) свяжется и подберёт удобное время.',
+      handoff: 'autobook: нет телефона',
+    };
+  }
+
+  let slots = [];
+  try { slots = await fetchConsultSlots(env, { dayHint: offer && offer.day_hint }); }
+  catch (e) { console.error('fetchConsultSlots:', e && e.message); slots = []; }
+
+  if (!slots.length) {
+    console.log(`autobook: 0 слотов, фоллбэк ${tag}`);
+    return {
+      handled: true,
+      clientText: stripTimePatterns(baseText)
+        || 'Готова записать на консультацию 🌷 Администратор подберёт удобное время и подтвердит.',
+      handoff: 'autobook: нет свободных слотов',
+    };
+  }
+
+  await env.BOT_KV.put(`autobook_offer:${msg.userId}`, JSON.stringify({
+    slots, name: offer.name, phone, at: now.ms,
+  }), { expirationTtl: AUTOBOOK_OFFER_TTL });
+
+  const lines = slots.map((s) => `${s.ref}) ${s.humanDate} в ${s.hhmm}`);
+  const podvodka = stripTimePatterns(baseText);
+  const offerText = (podvodka ? podvodka + '\n\n' : '')
+    + 'Подобрала свободное время на бесплатную консультацию:\n'
+    + lines.join('\n')
+    + `\n\nКакой вариант удобнее? Ответьте номером (${slots.map((s) => s.ref).join(', ')}).`;
+  console.log(`autobook: offered ${slots.length} ${tag}`);
+  return { handled: true, clientText: offerText };
+}
+
+// ШАГ 5–9: бронь выбранного слота + подтверждение реальным временем + карточки.
+async function handleBookConsult(env, msg, book, baseText, now) {
+  const tag = `u${msg.userId}`;
+  const offerRaw = await env.BOT_KV.get(`autobook_offer:${msg.userId}`);
+  let offer = null;
+  try { offer = offerRaw ? JSON.parse(offerRaw) : null; } catch (_) { offer = null; }
+
+  // Offer истёк/пуст: если авто-запись активна — мягко переспрашиваем день/время
+  // (на следующий ход Claude по истории заново эмитит OFFER_SLOTS с именем).
+  if (!offer || !Array.isArray(offer.slots) || !offer.slots.length) {
+    if (autobookEnabled(env, now)) {
+      return {
+        handled: true,
+        clientText: 'Подскажите ещё раз, какой день и время вам удобны — '
+          + 'и я подберу свободное окно для записи 🌷',
+      };
+    }
+    return { handled: false };
+  }
+
+  const ref = String((book && book.slot_ref) || '').trim();
+  let slot = offer.slots.find((s) => String(s.ref) === ref);
+  // slot_ref не индекс (Claude вписал время текстом) → переспрос.
+  if (!slot) {
+    const lines = offer.slots.map((s) => `${s.ref}) ${s.humanDate} в ${s.hhmm}`);
+    return {
+      handled: true,
+      clientText: 'Уточните, какой вариант — ответьте номером:\n' + lines.join('\n'),
+    };
+  }
+
+  const phone = normalizePhone(offer.phone) || '';
+  if (!phone) return { handled: false }; // не должно случиться (offer хранит phone)
+  const fullname = String(offer.name || '').trim();
+  const ymd = ymdOfMs(slot.ms);
+
+  // Идемпотентность: KV-lock по телефону+дате (read-then-write).
+  const lockKey = `booking:${phone}:${ymd}`;
+  if (await env.BOT_KV.get(lockKey)) {
+    console.log(`autobook: lock active ${tag}`);
+    return { handled: true, clientText: 'Секунду, оформляю запись… 🌷' };
+  }
+  await env.BOT_KV.put(lockKey, '1', { expirationTtl: AUTOBOOK_LOCK_TTL });
+
+  // Предпроверка дублей по телефону (блокер #2).
+  const existing = await altegioHasConsultToday(env, phone, ymd);
+  if (existing && existing.id) {
+    console.log(`autobook: уже записан ${tag} record=${existing.id}`);
+    return finalizeAutoBook(env, msg, {
+      recordId: existing.id, staffId: slot.staffId, staffName: slot.staffName,
+      datetime: existing.date || slot.datetime, ms: slot.ms, phone, fullname,
+      reused: true, now,
+    });
+  }
+
+  // Создание (ретрай только при network/5xx, перед ретраем — проверка дубля #6).
+  let result = await createConsultRecord(env, {
+    phone, fullname, datetime: slot.datetime, staffId: slot.staffId, userId: msg.userId,
+  });
+  if (!result.ok && (result.networkError || (result.httpStatus >= 500))) {
+    const recheck = await altegioHasConsultToday(env, phone, ymd);
+    if (recheck && recheck.id) {
+      result = { ok: true, recordId: recheck.id };
+    } else {
+      await sleep(1500);
+      result = await createConsultRecord(env, {
+        phone, fullname, datetime: slot.datetime, staffId: slot.staffId, userId: msg.userId,
+      });
+    }
+  }
+
+  if (result.ok && result.recordId) {
+    return finalizeAutoBook(env, msg, {
+      recordId: result.recordId, staffId: slot.staffId, staffName: slot.staffName,
+      datetime: slot.datetime, ms: slot.ms, phone, fullname, now,
+    });
+  }
+
+  // Слот увели между показом и бронью (422 / 433 / 436) → переспрос из остатка.
+  const slotTaken = result.httpStatus === 422
+    || result.errCode === 433 || result.errCode === 436;
+  await env.BOT_KV.delete(lockKey);
+  if (slotTaken) {
+    const rest = offer.slots.filter((s) => s.ref !== slot.ref);
+    if (rest.length) {
+      await env.BOT_KV.put(`autobook_offer:${msg.userId}`,
+        JSON.stringify({ ...offer, slots: rest }), { expirationTtl: AUTOBOOK_OFFER_TTL });
+      const lines = rest.map((s) => `${s.ref}) ${s.humanDate} в ${s.hhmm}`);
+      return {
+        handled: true,
+        clientText: 'Это время только что заняли 🙈 Вот другие свободные:\n'
+          + lines.join('\n') + '\n\nКакой подойдёт?',
+      };
+    }
+    return {
+      handled: true,
+      clientText: 'Это время только что заняли 🙈 Передаю администратору — '
+        + 'подберёт ближайшее свободное и подтвердит.',
+      handoff: 'autobook: слот занят, нет альтернатив',
+    };
+  }
+
+  // network/5xx исчерпаны → возможна повисшая запись (блокер #6): НЕ говорить
+  // «записала», предупредить менеджера.
+  if (result.networkError || result.httpStatus >= 500) {
+    await sendTelegramAlert(env, [
+      `⚠️ Возможна повисшая авто-запись — ПРОВЕРИТЬ ЖУРНАЛ · ${almatyHHMM()}`,
+      `${fullname} · ${fmtPhoneHuman(phone)}`,
+      `Консультация ${slot.humanDate} ${slot.hhmm}, мастер ${slot.staffName}`,
+      'book_record не ответил после ретрая — запись могла создаться или нет. Сверьте Altegio.',
+    ].join('\n'));
+    return {
+      handled: true,
+      clientText: 'Передаю администратору — он(а) подтвердит запись утром 🌷',
+      handoff: 'autobook: API не ответил, проверить журнал',
+    };
+  }
+
+  // Прочие ошибки (438 услуга/434 ЧС/прочее) → фоллбэк на КЭВ + алерт.
+  await sendTelegramAlert(env, [
+    `⚠️ Авто-запись не удалась (код ${result.errCode || result.httpStatus}) · ${almatyHHMM()}`,
+    `${fullname} · ${fmtPhoneHuman(phone)} · ${slot.humanDate} ${slot.hhmm}`,
+    'Оформите запись вручную.',
+  ].join('\n'));
+  return {
+    handled: true,
+    clientText: 'Передаю администратору — он(а) подберёт время и подтвердит 🌷',
+    handoff: `autobook: ошибка ${result.errCode || result.httpStatus}`,
+  };
+}
+
+// ШАГ 8–9: запись создана → подтверждение клиенту реальным временем + карточки.
+async function finalizeAutoBook(env, msg, d) {
+  const ts = Date.now();
+  // Реальное время из созданной записи (или из выбранного слота, что совпадает).
+  const parts = parseAltegioParts(d.datetime) || {};
+  const hhmm = `${parts.hour}:${String(parts.minute || 0).padStart(2, '0')}`;
+  const human = humanizeSlotDate(d.ms, almatyNow());
+
+  // Карточка КЭВ (контракт для pulse): source=autobook, услуга «Консультация».
+  const card = {
+    type: 'kev', source: 'autobook', status: 'auto-booked',
+    name: d.fullname, phone: d.phone, service: 'Консультация',
+    day: human, interval: hhmm,
+    contraindications: '', lang: 'ru', temp: 'warm',
+    recordId: d.recordId, staffId: d.staffId, staffName: d.staffName,
+    datetimeISO: d.datetime,
+    userId: msg.userId, channelId: msg.channelId,
+    createdAt: new Date(ts).toISOString(), kevAt: ts,
+  };
+  await env.BOT_KV.put(`kev:${msg.userId}:${ts}`, JSON.stringify(card),
+    { expirationTtl: KEV_CARD_TTL });
+  await env.BOT_KV.put(`lead:${msg.userId}:${ts}`, JSON.stringify(card),
+    { expirationTtl: LEAD_TTL });
+  // Исключение из confirm-крона (блокер #1): бот сам подтвердил при записи.
+  await env.BOT_KV.put(`autobook_record:${d.recordId}`, JSON.stringify({
+    userId: msg.userId, phone: d.phone, at: ts,
+  }), { expirationTtl: AUTOBOOK_RECORD_TTL });
+  // Анти-повтор + kev_pending (бот не умолкает, повторно не записывает).
+  await env.BOT_KV.put(`autobook_done:${msg.userId}:${d.recordId}`, '1',
+    { expirationTtl: AUTOBOOK_DONE_TTL });
+  await env.BOT_KV.put(`kev_pending:${msg.userId}`, JSON.stringify({
+    kevAt: ts, service: 'Консультация', day: human, interval: hhmm, autobooked: true,
+  }), { expirationTtl: KEV_PENDING_TTL });
+  await env.BOT_KV.delete(`kev_missing:${msg.userId}`);
+  await env.BOT_KV.delete(`autobook_offer:${msg.userId}`);
+
+  // Telegram-карточка менеджерам (информирование, без действий).
+  await sendTelegramAlert(env, [
+    `🤖 АВТО-ЗАПИСЬ (бот) · ${almatyHHMM()}`,
+    `${d.fullname} · ${fmtPhoneHuman(d.phone)}`,
+    `Консультация · ${human} ${hhmm} · мастер ${d.staffName}`,
+    `Altegio record #${d.recordId} · маркер ${kevMarker(env)}`,
+  ].join('\n'));
+
+  console.log(`autobook DONE u${msg.userId} record=${d.recordId} `
+    + `staff=${d.staffId} ${human} ${hhmm}${d.reused ? ' (reused)' : ''}`);
+
+  return {
+    handled: true,
+    clientText: `Записала вас на бесплатную консультацию: ${human} в ${hhmm}, `
+      + `мастер ${d.staffName}.\nАдрес: Ауэзова 175Б, угол Габдуллина. `
+      + 'Если планы изменятся — напишите, перенесём 🌷',
+    autobooked: true,
   };
 }
 
@@ -2149,6 +2828,12 @@ async function collectConfirmCandidates(env, records, now) {
   for (const r of records) {
     if (Number(r.attendance) !== 0) continue; // уже отработана
     if (r.deleted) continue;
+    // Блокер #1: авто-запись бота создаётся с attendance=0 и бот уже отправил
+    // клиенту подтверждение при записи. confirm-крон НЕ должен слать повторное
+    // «Вы записаны» — пропускаем записи с пометкой autobook_record:{id}.
+    if (await env.BOT_KV.get(`autobook_record:${r.id}`)) {
+      continue;
+    }
     // Поле `confirmed` в этом кабинете Altegio проставляется автоматически у
     // ВСЕХ записей при создании — не используем как сигнал. Признак ответа
     // клиента — только attendance=2.
