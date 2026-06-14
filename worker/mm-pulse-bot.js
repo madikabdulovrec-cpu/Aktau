@@ -478,6 +478,15 @@ export default {
       return json({ ok: true, dryResult, liveRisk: live ? live.broadcastRisks : null, currentPauseFlag: flag });
     }
 
+    // [ТЕСТ] авто-записи бота на консультацию за последние N часов — GET ?nightbook=<DIGEST_SECRET>[&hours=N].
+    // Показывает записи Altegio с комментарием «через бота», созданные в окне (вкл. created_user_id для сверки).
+    if (env.DIGEST_SECRET && url.searchParams.get('nightbook') === env.DIGEST_SECRET) {
+      const hours = Math.min(parseInt(url.searchParams.get('hours') || '12', 10) || 12, 96);
+      const nowTs = Date.now();
+      const nb = await fetchBotConsultBookings(env, nowTs - hours * 3600000, nowTs);
+      return json({ ok: true, hours, result: nb || { error: 'нет owner-токена или Altegio недоступен' } });
+    }
+
     // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
     if (env.DIGEST_SECRET && url.searchParams.get('report') === env.DIGEST_SECRET) {
       const sec = url.searchParams.get('sec') || 'sales';
@@ -733,6 +742,14 @@ async function runDigest(env, meta) {
       try { metrics.money = await fetchDayMoney(env, now); }
       catch (e) { console.error('[money] failed:', e && e.message); metrics.money = null; }
     }
+    // Ночные авто-записи бота на консультацию — в утренней сводке (08:00): что бот
+    // оформил за ночь (с 21:00 вчера до сейчас). Best-effort: нет Altegio → блока нет.
+    if (parts.hour === MORNING_HOUR) {
+      try {
+        const nightStart = almatyTimeTs(almatyDateStr(now - 86400000), 21);
+        metrics.nightBookings = await fetchBotConsultBookings(env, nightStart, now);
+      } catch (e) { console.error('[nightbook] failed:', e && e.message); metrics.nightBookings = null; }
+    }
 
     // Dry-run (?dry=1): вернуть диагностику без отправки в чат.
     if (meta.dry) {
@@ -759,10 +776,12 @@ async function runDigest(env, meta) {
     // «Тихо»: за 3 часа ничего нового и нет зависших — короткая строка, без LLM.
     if (!isFinal && metrics.deltaLeads === 0 && metrics.unanswered.length === 0) {
       const kevLine = formatKevLine(metrics.kev);
+      const nb = nightBookingsBlock(metrics.nightBookings); // ночные авто-записи (только в 08:00)
       const text = `📊 Пульс продаж · ${parts.hhmm} · ${parts.ddmm}\n`
         + `Тихо: 0 новых за час, все диалоги отвечены.\n`
         + `Всего за день: ${metrics.todayLeads} ${plural(metrics.todayLeads, ['обращение', 'обращения', 'обращений'])}, из них новых: ${metrics.newLeads}.`
-        + (kevLine ? `\n${kevLine}` : '');
+        + (kevLine ? `\n${kevLine}` : '')
+        + (nb.length ? `\n${nb.join('\n')}` : '');
       await sendTelegram(env, text);
       await maybeSendBroadcast(env, now); // отдельное письмо по летней рассылке
       console.log('[digest] quiet', { ...metricsSummary(metrics), ...meta });
@@ -1782,8 +1801,64 @@ async function fetchDayMoney(env, now) {
     goods: txn ? txn.goods : 0,
     service: txn ? txn.service : 0,
     recordsCreated: records == null ? null : records.filter((r) => r && !r.deleted).length,
+    // Авто-записи бота на консультацию, СОЗДАННЫЕ сегодня (из тех же записей — без доп. запроса).
+    botBookings: records == null ? null : countBotConsult(records, almatyTimeTs(day, 0), now),
     truncated: !!(records && records.truncated), // журнал обрезан потолком выгрузки (honesty WS-1)
   };
+}
+
+/* ── Ночные авто-записи бота на консультацию (Altegio book_record) ──────────────
+ * mh-bot ночью сам оформляет консультации через book_record с комментарием
+ * «Запись через бота (КЭВ-консультация) [чат-бот]». По фразе «через бота» отличаем
+ * их от РУЧНЫХ записей менеджеров (у тех маркер [чат-бот] есть, а этой фразы — нет).
+ * Пульс показывает их в утренней (за ночь) и вечерней (за день) сводке. */
+const BOT_BOOKING_COMMENT = /через\s*бота/i;
+function isBotConsultRecord(r) {
+  return !!(r && !r.deleted && BOT_BOOKING_COMMENT.test(String(r.comment || '')));
+}
+// Из массива записей Altegio — те, что бот оформил в окне [fromTs, toTs] по create_date.
+function countBotConsult(records, fromTs, toTs) {
+  const list = [];
+  for (const r of (records || [])) {
+    if (!isBotConsultRecord(r)) continue;
+    const created = parseAltegioCreateTs(r.create_date);
+    if (created == null || created < fromTs || created > toTs) continue;
+    list.push({
+      name: (r.client && r.client.name) || '',
+      phone: (r.client && r.client.phone) || '',
+      datetime: r.datetime || r.date || '',
+      staff: (r.staff && r.staff.name) || '',
+      createdBy: r.created_user_id != null ? r.created_user_id : null, // для диагностики ?nightbook=
+    });
+  }
+  list.sort((a, b) => String(a.datetime).localeCompare(String(b.datetime)));
+  return { count: list.length, list };
+}
+// Запрос + подсчёт авто-записей бота за окно [fromTs, toTs] (отдельный fetch — для утра).
+async function fetchBotConsultBookings(env, fromTs, toTs) {
+  const token = await altegioUserToken(env);
+  if (!token) return null;
+  const recs = await fetchAltegioRecords(env, token, almatyDateStr(fromTs), almatyDateStr(toTs));
+  if (recs == null) return null;
+  const r = countBotConsult(recs, fromTs, toTs);
+  r.truncated = !!(recs && recs.truncated);
+  return r;
+}
+// Блок строк для сводки: «🌙 Ночью бот записал на консультацию: N» + список.
+function nightBookingsBlock(nb) {
+  if (!nb || !nb.count) return [];
+  const out = [`🌙 Ночью бот записал на консультацию: ${nb.count}`];
+  for (const b of nb.list.slice(0, 8)) {
+    out.push(`• ${b.name || contactLabel({ phone: b.phone })} — ${fmtRecDatetime(b.datetime)}${b.staff ? ' · ' + b.staff : ''}`);
+  }
+  if (nb.list.length > 8) out.push(`…и ещё ${nb.list.length - 8}`);
+  if (nb.truncated) out.push('⚠️ данные неполные: журнал Altegio обрезан');
+  return out;
+}
+// «2026-06-14 16:00:00» → «14.06 16:00».
+function fmtRecDatetime(dt) {
+  const m = String(dt || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  return m ? `${m[3]}.${m[2]} ${m[4]}:${m[5]}` : String(dt || '—');
 }
 
 // Карта user_id → имя администратора (кэш сутки). Фоллбэк — ADMIN_NAMES.
@@ -1951,6 +2026,9 @@ function formatIntermediate(m, parts, smart) {
   if (m.todayMedianMin != null) l2 += ` · скорость первого ответа ${m.todayMedianMin} мин`;
   lines.push(l2);
 
+  // Утренняя сводка ночных авто-записей бота (заполняется только в 08:00).
+  for (const nbl of nightBookingsBlock(m.nightBookings)) lines.push(nbl);
+
   if (m.unanswered.length) {
     lines.push('🔴 Сейчас без ответа:');
     for (const u of m.unanswered.slice(0, 5)) {
@@ -1993,6 +2071,11 @@ function formatFinal(m, parts, smart) {
     if (mo.total) s += ` (курсы ${fmtTg(mo.goods)}₸ · услуги ${fmtTg(mo.service)}₸)`;
     if (mo.recordsCreated != null) s += ` · записей оформлено: ${mo.recordsCreated}`;
     lines.push(s);
+  }
+
+  // Авто-записи бота на консультацию за сегодня (ночная авто-запись mh-bot).
+  if (m.money && m.money.botBookings && m.money.botBookings.count) {
+    lines.push(`🤖 Бот оформил консультаций за день: ${m.money.botBookings.count}`);
   }
 
   const kevLine = formatKevLine(m.kev);
@@ -2896,6 +2979,13 @@ function parseTs(raw) {
 function almatyDateStr(ts) {
   const d = new Date((ts || Date.now()) + ALMATY_UTC_OFFSET * 3600 * 1000);
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+// UTC-ms момента «hour:00» по Алматы для даты dateStr (YYYY-MM-DD). null — кривая дата.
+function almatyTimeTs(dateStr, hour) {
+  const m = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], hour - ALMATY_UTC_OFFSET, 0, 0);
 }
 
 // Время по Алматы — час, HH:MM и DD.MM.
