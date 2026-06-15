@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260530-create-flow-fixes">
+<meta name="app-version" content="20260615-smart-search">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -376,7 +376,7 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
     </div>
 
     <div class="search-bar">
-      <input type="text" class="search-input" id="searchInput" placeholder="🔍 Поиск по ФИО, телефону или жалобам..." oninput="renderClientList()">
+      <input type="text" class="search-input" id="searchInput" placeholder="🔍 ФИО, телефон, жалоба, анамнез — можно с опечатками" oninput="renderClientList()">
       <select class="filter-select" id="filterSpecialist" onchange="renderClientList()">
         <option value="">Все специалисты</option>
       </select>
@@ -1419,9 +1419,94 @@ function refreshSpecialistFilter() {
   if(filterSel.dataset.opts !== opts) { filterSel.innerHTML = opts; filterSel.dataset.opts = opts; }
 }
 
+// ============================================================
+// УМНЫЙ ПОИСК (Round 3 фикс BUG-C, B, D, A)
+// ============================================================
+// Нормализация текста: lowercase, trim, схлопывание пробелов, ё→е, й→и
+// (мастер пишет «Алена», в базе «Алёна» — должны совпасть).
+function normalizeText(s) {
+  return String(s||'').toLowerCase()
+    .replace(/ё/g, 'е').replace(/й/g, 'и')
+    .replace(/\s+/g, ' ').trim();
+}
+// Нормализация телефона: только цифры, 8XXX → 7XXX (Altegio хранит +7..., а
+// мастер по привычке набирает 8... — без нормализации поиск возвращал 0).
+function normalizePhone(s) {
+  return String(s||'').replace(/\D/g, '').replace(/^8/, '7');
+}
+// Damerau-Levenshtein distance с early-exit по maxDist. Учитывает транспозиции
+// (Иваннова → Иванова: одна транспозиция, distance=1).
+function levenshteinDL(a, b, maxDist) {
+  const n = a.length, m = b.length;
+  if(Math.abs(n - m) > maxDist) return maxDist + 1;
+  if(n === 0) return m;
+  if(m === 0) return n;
+  const dp = new Array(n + 1);
+  for(let i = 0; i <= n; i++) { dp[i] = new Array(m + 1); dp[i][0] = i; }
+  for(let j = 0; j <= m; j++) dp[0][j] = j;
+  for(let i = 1; i <= n; i++) {
+    let rowMin = Infinity;
+    for(let j = 1; j <= m; j++) {
+      const cost = a.charCodeAt(i-1) === b.charCodeAt(j-1) ? 0 : 1;
+      dp[i][j] = Math.min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost);
+      if(i > 1 && j > 1 && a.charCodeAt(i-1) === b.charCodeAt(j-2) && a.charCodeAt(i-2) === b.charCodeAt(j-1)) {
+        dp[i][j] = Math.min(dp[i][j], dp[i-2][j-2] + 1);
+      }
+      if(dp[i][j] < rowMin) rowMin = dp[i][j];
+    }
+    if(rowMin > maxDist) return maxDist + 1;
+  }
+  return dp[n][m];
+}
+// Возвращает «оценку точного совпадения» карточки с запросом или null.
+// score меньше = лучше. exact-фаза.
+function matchCardExact(c, qText, qDigits) {
+  if(qDigits.length >= 4) {
+    const cp = normalizePhone(c.phone);
+    if(cp.includes(qDigits)) return { kind: 'exact', score: 0 };
+  }
+  if(!qText) return null;
+  const fio = normalizeText(c.fio);
+  if(fio.startsWith(qText)) return { kind: 'exact', score: 1 };
+  if(fio.includes(qText)) return { kind: 'exact', score: 2 };
+  // Расширенный поиск: жалобы, анамнез (массив + другое), рекомендации, возраст.
+  const ext = normalizeText(
+    (c.complaints||'') + ' ' + (c.anamnesisOther||'') + ' ' +
+    (c.recommendations||'') + ' ' +
+    ((c.anamnesis||[]).join(' ')) + ' ' + (c.age||'')
+  );
+  if(ext.includes(qText)) return { kind: 'exact', score: 3 };
+  return null;
+}
+// Нечёткий матч: каждое слово запроса сравнивается с каждым словом fio
+// через Damerau-Levenshtein. Допустимое расстояние зависит от длины слова.
+function matchCardFuzzy(c, qText) {
+  if(!qText || qText.length < 3) return null;
+  const fio = normalizeText(c.fio);
+  if(!fio) return null;
+  const qWords = qText.split(' ').filter(w => w.length >= 2);
+  const fWords = fio.split(' ').filter(w => w.length >= 2);
+  if(qWords.length === 0 || fWords.length === 0) return null;
+  let best = Infinity;
+  for(const qw of qWords) {
+    const maxD = qw.length <= 4 ? 1 : qw.length <= 7 ? 2 : 3;
+    for(const fw of fWords) {
+      if(Math.abs(qw.length - fw.length) > maxD) continue;
+      const d = levenshteinDL(qw, fw, maxD);
+      if(d < best) best = d;
+      if(best === 0) break;
+    }
+    if(best === 0) break;
+  }
+  if(best <= 3) return { kind: 'fuzzy', score: 100 + best, dist: best };
+  return null;
+}
+
 function renderClientList() {
   refreshSpecialistFilter();
-  const q = (document.getElementById('searchInput').value||'').toLowerCase().trim();
+  const qRaw = (document.getElementById('searchInput').value||'').trim();
+  const qText = normalizeText(qRaw);
+  const qDigits = normalizePhone(qRaw);
   const fSpec = document.getElementById('filterSpecialist').value;
   const sortBy = document.getElementById('sortBy').value;
 
@@ -1429,7 +1514,7 @@ function renderClientList() {
   // клиента в Altegio, deleteClient() — при удалении через UI. Физически
   // запись остаётся (анамнез/фото мастера не теряются, и merge-by-id не
   // воскрешает её обратно — иначе deleted-флаг просто проигнорировался бы).
-  let list = STATE.clients.filter(c => !c.deleted);
+  const allActive = STATE.clients.filter(c => !c.deleted);
   // Видимость для мастера: свои карточки (по staffId, fallback на имя для
   // старых записей) + «НИЧЬИ». Ничья = карточка без specialistId и без
   // specialist — её создал Worker по webhook'у из Altegio и не знал, кому
@@ -1438,32 +1523,82 @@ function renderClientList() {
   // карточку — она закрепится за ним (см. saveClient) и пропадёт у других.
   const visibleToMaster = c => {
     if(c.specialistId) return c.specialistId===STATE.session.staffId;
-    if((c.specialist||'').trim()) return (c.specialist||'').toLowerCase().trim()===STATE.session.name.toLowerCase().trim();
+    if((c.specialist||'').trim()) return normalizeText(c.specialist) === normalizeText(STATE.session.name);
     return true; // ничья — видна всем мастерам
   };
-  const totalForSession = (STATE.session && STATE.session.role==='master')
-    ? list.filter(visibleToMaster).length
-    : list.length;
-  if(STATE.session && STATE.session.role==='master') {
-    list = list.filter(visibleToMaster);
+  const isMaster = STATE.session && STATE.session.role === 'master';
+  let mine = isMaster ? allActive.filter(visibleToMaster) : allActive;
+  const totalForSession = mine.length;
+
+  // Применяем фильтр-селект «специалист» — сравниваем нормализованно (BUG-F).
+  let list = mine;
+  if(fSpec) list = list.filter(c => normalizeText(c.specialist) === normalizeText(fSpec));
+
+  let isFuzzyResult = false;
+  let otherMastersHits = 0;
+
+  if(qRaw) {
+    // ШАГ 1: точные совпадения у себя.
+    const exact = [];
+    for(const c of list) {
+      const m = matchCardExact(c, qText, qDigits);
+      if(m) exact.push({ c, m });
+    }
+    if(exact.length > 0) {
+      exact.sort((a, b) => a.m.score - b.m.score);
+      list = exact.map(x => x.c);
+    } else {
+      // ШАГ 2: fuzzy у себя (опечатки, перестановки букв).
+      const fuzzy = [];
+      for(const c of list) {
+        const m = matchCardFuzzy(c, qText);
+        if(m) fuzzy.push({ c, m });
+      }
+      if(fuzzy.length > 0) {
+        fuzzy.sort((a, b) => a.m.dist - b.m.dist);
+        list = fuzzy.map(x => x.c);
+        isFuzzyResult = true;
+      } else {
+        list = [];
+      }
+    }
+    // ШАГ 3: если у мастера ничего — проверяем чужие карточки (BUG-A).
+    // Это объясняет «карточка пропала»: на самом деле другой мастер её
+    // закрепил за собой. Покажем подсказку, не отдадим карточку.
+    if(isMaster && list.length === 0) {
+      const others = allActive.filter(c => !visibleToMaster(c));
+      let cnt = 0;
+      for(const c of others) {
+        if(matchCardExact(c, qText, qDigits) || matchCardFuzzy(c, qText)) cnt++;
+      }
+      otherMastersHits = cnt;
+    }
   }
-  const beforeSearch = list.length;
-  if(q) list = list.filter(c => (c.fio+' '+(c.phone||'')+' '+(c.complaints||'')).toLowerCase().includes(q));
-  if(fSpec) list = list.filter(c => c.specialist===fSpec);
-  if(sortBy==='created') list.sort((a,b) => (b.createdAt||0)-(a.createdAt||0));
-  else if(sortBy==='name') list.sort((a,b) => (a.fio||'').localeCompare(b.fio||'','ru'));
-  else list.sort((a,b) => (b.updatedAt||0)-(a.updatedAt||0));
+
+  // Сортировка применяется только если нет активного поиска — иначе порядок
+  // задаёт релевантность (exact-score → fuzzy-dist).
+  if(!qRaw) {
+    if(sortBy==='created') list.sort((a,b) => (b.createdAt||0)-(a.createdAt||0));
+    else if(sortBy==='name') list.sort((a,b) => (a.fio||'').localeCompare(b.fio||'','ru'));
+    else list.sort((a,b) => (b.updatedAt||0)-(a.updatedAt||0));
+  }
 
   const wrap = document.getElementById('clientList');
   const empty = document.getElementById('clientEmpty');
-  document.getElementById('dashSub').textContent = `Всего карточек: ${list.length}${list.length!==totalForSession?` из ${totalForSession}`:''}`;
+  let subTxt = `Всего карточек: ${list.length}${list.length!==totalForSession?` из ${totalForSession}`:''}`;
+  if(isFuzzyResult) subTxt += ' · похожие совпадения';
+  if(otherMastersHits > 0) subTxt += ` · ещё ${otherMastersHits} у других мастеров`;
+  document.getElementById('dashSub').textContent = subTxt;
 
   if(list.length===0) {
     wrap.innerHTML='';
     if(totalForSession===0) {
       empty.innerHTML = `<div class="ic">📋</div><h3>Карточек ещё нет</h3><p>Нажмите «+ Новый клиент», чтобы завести первую карточку</p>`;
+    } else if(otherMastersHits > 0) {
+      // BUG-A: вместо «ничего не найдено» подсказываем где карточка.
+      empty.innerHTML = `<div class="ic">👥</div><h3>Найдено у других мастеров</h3><p>По запросу «${escapeHtml(qRaw)}» — <b>${otherMastersHits}</b> карточек закреплены за другими мастерами. Попросите суперадмина переоткрепить нужного клиента на вас.</p>`;
     } else {
-      empty.innerHTML = `<div class="ic">🔍</div><h3>Ничего не найдено</h3><p>Попробуйте другой запрос или сбросьте фильтры</p>`;
+      empty.innerHTML = `<div class="ic">🔍</div><h3>Ничего не найдено</h3><p>Попробуйте другой запрос, проверьте опечатки или сбросьте фильтры</p>`;
     }
     empty.style.display='block';
     return;
@@ -1473,11 +1608,12 @@ function renderClientList() {
   wrap.innerHTML = list.map(c => {
     const sessions = c.sessions||[];
     const lastSes = sessions[sessions.length-1];
+    const fuzzyBadge = isFuzzyResult ? '<span title="Похожее совпадение (возможно, с опечаткой)" style="display:inline-block; padding:1px 6px; font-size:11px; background:#fff3cd; color:#8a6d3b; border-radius:8px; margin-left:6px;">~похожее</span>' : '';
     return `
       <div class="client-card" data-id="${escapeHtml(c.id)}" onclick="openClientCard(this.dataset.id)">
         ${c.specialist?`<div class="specialist">${escapeHtml(c.specialist)}</div>`:''}
-        <div class="name">${escapeHtml(c.fio||'—')}</div>
-        <div class="meta">${c.age?escapeHtml(c.age)+' лет':''}${c.weight?' · '+escapeHtml(c.weight)+' кг':''}${c.height?' · '+escapeHtml(c.height)+' см':''}</div>
+        <div class="name">${escapeHtml(c.fio||'—')}${fuzzyBadge}</div>
+        <div class="meta">${c.age?escapeHtml(c.age)+' лет':''}${c.weight?' · '+escapeHtml(c.weight)+' кг':''}${c.height?' · '+escapeHtml(c.height)+' см':''}${c.phone?' · '+escapeHtml(c.phone):''}</div>
         <div style="font-size:13px; color:#555; margin-bottom:10px; line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;">${escapeHtml(c.complaints||'—')}</div>
         <div class="stats">
           <span>📷 <b>${sessions.length}</b> сесс.</span>
