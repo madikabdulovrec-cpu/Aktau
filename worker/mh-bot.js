@@ -995,28 +995,31 @@ async function processMessage(msg, env) {
       console.log(`skip: human already in dialog ${tag} -> paused`);
       return;
     }
-    // 1.5) Ответ на напоминание о ЗАПИСИ. Если первое сообщение клиента — короткое
-    //      «Приду / Да / Нет / Не смогу» И в Altegio у его телефона есть запись на
-    //      сегодня..+2 дня — это подтверждение существующей записи (напоминание
-    //      слал внешний источник, иначе сработал бы confirm_pending выше), а НЕ
-    //      новый лид. НЕ допрашиваем имя/противопоказания (собраны при записи).
-    //      Гейт по реальной записи Altegio убирает регрессию: новый лид с голым
-    //      «Ок/Да» без записи сюда не попадает — идёт в обычный поток ниже.
-    const confirmKind = classifyConfirmationResponse(msg.text);
-    if (confirmKind) {
-      const bookedPhone = await getContactPhone(env, msg);
-      const booking = bookedPhone ? await altegioUpcomingBooking(env, bookedPhone) : null;
-      if (booking) {
-        await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
-        await handleBookedReminderReply(env, msg, confirmKind, booking, bookedPhone);
-        return;
+    // 2) Гейт «новый лид / действующий клиент» по РЕАЛЬНОЙ записи Altegio.
+    //    Если у телефона есть запись на сегодня..+2 дня — это НЕ новый лид:
+    //      • короткое «Приду/Да/Нет» → ответ на напоминание (внешнее — иначе
+    //        сработал бы confirm_pending выше) → подтверждение/передача менеджеру;
+    //      • иное (вопрос/просьба по своей записи) → вежливая передача администратору.
+    //    Имя/противопоказания НЕ спрашиваем (собраны при записи). Гейт по РЕАЛЬНОЙ
+    //    записи убирает регрессию: новый лид без записи сюда не попадает → лид-флоу.
+    //    NB: это рабочая ЗАМЕНА прежнего classifyContact — clients/search в этом
+    //    кабинете Altegio отдаёт 400 на quick_search и не возвращает visit_count,
+    //    т.е. altegioHasVisitHistory молча возвращал 'new' (гейт не работал).
+    const firstPhone = await getContactPhone(env, msg);
+    const booking = firstPhone ? await altegioUpcomingBooking(env, firstPhone) : null;
+    if (booking) {
+      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+      const confirmKind = classifyConfirmationResponse(msg.text);
+      if (confirmKind) {
+        await handleBookedReminderReply(env, msg, confirmKind, booking, firstPhone);
+      } else {
+        await sendMessage(env, msg,
+          'Вы уже записаны к нам 🌷 Передаю администратору — он(а) свяжется и поможет с вашей записью.');
+        if (msg.userId) {
+          await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+        }
+        console.log(`booked client non-confirm ${tag} -> handoff`);
       }
-    }
-
-    // 2) Гейт «только новые лиды»: действующих клиентов студии бот не трогает.
-    const cls = await classifyContact(msg, env);
-    if (cls === 'existing') {
-      console.log(`skip existing client ${tag}`);
       return;
     }
   }
@@ -1231,7 +1234,12 @@ function bufToBase64(buf) {
   return btoa(bin);
 }
 
-// ── Гейт: новый лид или действующий клиент ─────────────────────────────────
+// ── Гейт: новый лид или действующий клиент (УСТАРЕЛО — не вызывается) ───────
+// ⚠️ clients/search в кабинете 1330174 отдаёт 400 «Incorrect request filter
+// state format» на quick_search И не возвращает visit_count → эта функция молча
+// возвращала 'new' (гейт не работал). Заменено на altegioUpcomingBooking
+// (records, рабочий запрос) в processMessage. Оставлено до починки clients/search
+// (нужен рабочий формат фильтра по телефону / поддержка Altegio).
 // Возвращает 'new' | 'existing'. Действующий клиент = есть история визитов в
 // Altegio. Бот Altegio только ЧИТАЕТ.
 // Altegio-проверка опциональна: без токенов гейт опирается на остальные слои
