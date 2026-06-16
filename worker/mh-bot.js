@@ -2821,7 +2821,7 @@ async function fetchTomorrowRecordsSafe(env, tomorrowStr) {
 
 // Фильтры по записям. Возвращает массив {record, phone, parts, dedupKey, slotMs}
 // готовых к отправке. Сбрасывает записи в прошлом, без телефона, со статусом
-// уже отработанным, вне окна 24-32ч до визита, со слотом в будущем.
+// уже отработанным, вне окна 18-30ч до визита, со слотом в будущем.
 async function collectConfirmCandidates(env, records, now) {
   // Сегодняшние границы Almaty для clamp слота: 09:00 и CONFIRM_LATE_FALLBACK_H
   const todayCalUtcMs = Date.UTC(now.year, now.month - 1, now.day, 0, 0, 0)
@@ -2853,17 +2853,17 @@ async function collectConfirmCandidates(env, records, now) {
     const apptMs = partsToAlmatyMs(parts);
     if (!apptMs || apptMs < now.ms + 60000) continue; // запись в прошлом — мимо
 
-    // ОКНО ОТПРАВКИ: 30ч ≥ время-до-визита ≥ 20ч.
-    // Расширено по запросу владельца — не строгое 24ч, а гибкое 20–30ч окно.
-    // < 20ч — слишком близко к визиту, помечаем late_notice (менеджер вручную).
+    // ОКНО ОТПРАВКИ: 30ч ≥ время-до-визита ≥ 18ч.
+    // Расширено по запросу владельца (16.06.2026: нижняя 20→18ч) — гибкое 18–30ч окно.
+    // < 18ч — слишком близко к визиту, помечаем late_notice (менеджер вручную).
     // > 30ч — ещё рано, ждём следующих cron-тиков.
     const apptToNow = apptMs - now.ms;
     if (apptToNow > 30 * 3600000) continue;
-    if (apptToNow < 20 * 3600000) {
+    if (apptToNow < 18 * 3600000) {
       const noticeKey = `confirm_late_notice:${r.id}`;
       if (!(await env.BOT_KV.get(noticeKey))) {
         console.log(`confirm: skip rec ${r.id} — appt ${r.date} осталось `
-          + `<24h до визита, менеджер обзвонит вручную`);
+          + `<18h до визита, менеджер обзвонит вручную`);
         await env.BOT_KV.put(noticeKey, '1', { expirationTtl: CONFIRM_DEDUP_TTL });
         // Карточка менеджерам: бот напоминание уже не отправит (политика
         // «отмена за 24ч» не успевает) — подтвердить запись нужно вручную.
@@ -2871,7 +2871,7 @@ async function collectConfirmCandidates(env, records, now) {
           `⏰ Запись без авто-напоминания · ${almatyHHMM()}`,
           `${(r.client && r.client.name) ? r.client.name + ' · ' : ''}${fmtPhoneHuman(phone)}`,
           `Визит: ${r.date} (осталось ~${Math.round(apptToNow / 3600000)} ч)`,
-          'Бот напоминание не отправит (<20ч до визита) — подтвердите запись звонком.',
+          'Бот напоминание не отправит (<18ч до визита) — подтвердите запись звонком.',
         ].join('\n'));
       }
       continue;
