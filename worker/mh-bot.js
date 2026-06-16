@@ -816,6 +816,8 @@ export default {
       console.error('kev digest failed:', e && e.message)));
     ctx.waitUntil(runKevNudgeJob(env).catch((e) =>
       console.error('kev nudge failed:', e && e.message)));
+    ctx.waitUntil(runConsultFollowupJob(env).catch((e) =>
+      console.error('consult followup failed:', e && e.message)));
   },
 };
 
@@ -2871,6 +2873,95 @@ async function runConfirmationJob(env) {
     + `${groups.length} groups, ${stats.ok} sent ${JSON.stringify(stats.channels)}, `
     + `${stats.dedup} dedup, ${stats.phoneDup} phone-day-dup, `
     + `${stats.cold} cold, ${stats.cap} cap`);
+}
+
+// ── FOLLOW-UP ПОСЛЕ КОНСУЛЬТАЦИИ ─────────────────────────────────────────────
+// Вечером того же дня всем, кто СЕГОДНЯ пришёл на консультацию (Altegio
+// attendance==1 у записи на услугу ALTEGIO_CONSULT_SERVICE_ID), бот шлёт тёплое
+// сообщение: спасибо + индивидуальный план + открытый вопрос. Ответ клиента
+// ведёт обычный диалоговый флоу. Анти-бан — через mhSendByPhone (cold-фильтр +
+// часовой/дневной потолок канала). Дедуп per-record (consult_fu:{id}).
+// Kill-switch CONSULT_FOLLOWUP_ACTIVE='1'; окно часов CONSULT_FU_HOUR_START..END.
+const CONSULT_FU_DEDUP_TTL = 3 * 24 * 3600;  // 3 дня — не слать повторно
+const CONSULT_FU_TICK_MAX = 6;               // потолок отправок за один tick
+
+// Имя для обращения: обычно первое слово, но если оно похоже на фамилию
+// («Арсланова Сабина») — берём второе.
+function firstName(full) {
+  const p = String(full || '').trim().split(/\s+/).filter(Boolean);
+  if (!p.length) return '';
+  if (p.length >= 2 && /(ова|ева|ёва|ина|ына|ская|цкая|ов|ёв|ев|ин|ын|ский|цкий|енко|ко|швили|дзе|оглы|кызы|улы)$/i.test(p[0])) return p[1];
+  return p[0];
+}
+
+function buildConsultFollowupText(name) {
+  const hello = name ? `${name}, спасибо` : 'Спасибо';
+  return `${hello}, что были сегодня у нас на консультации в Фабрике красивых тел M&M 🌸\n\n`
+    + 'Мастер составил для вас индивидуальный план под вашу цель. Подскажите, всё ли было '
+    + 'понятно — остались вопросы по программе или стоимости? С радостью помогу 🤍';
+}
+
+// Сегодняшние записи на консультацию, где клиент ПРИШЁЛ (attendance==1). Один
+// клиент (телефон) — одно сообщение, даже если записей несколько.
+function collectConsultFollowupCandidates(env, records) {
+  const svc = String(env.ALTEGIO_CONSULT_SERVICE_ID || '');
+  const seen = new Set();
+  const out = [];
+  for (const r of records || []) {
+    if (r.deleted) continue;
+    if (Number(r.attendance) !== 1) continue;            // 1 = пришёл (−1 = не пришёл, 2 = подтвердил)
+    if (!(r.services || []).some((s) => String(s.id) === svc)) continue;
+    const c = r.client || {};
+    const phone = normalizePhone(c.phone || c.surname_with_phone || r.client_phone || '');
+    if (!phone || seen.has(phone)) continue;
+    seen.add(phone);
+    out.push({ recordId: r.id, phone, name: firstName(c.name) });
+  }
+  return out;
+}
+
+async function runConsultFollowupJob(env) {
+  if (env.CONSULT_FOLLOWUP_ACTIVE !== '1') return;
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
+    || !env.ALTEGIO_COMPANY_ID || !env.ALTEGIO_CONSULT_SERVICE_ID) return;
+
+  const now = almatyNow();
+  const hStart = Number(env.CONSULT_FU_HOUR_START) || 19;
+  const hEnd = Number(env.CONSULT_FU_HOUR_END) || 22;
+  if (now.hour < hStart || now.hour >= hEnd) return;
+
+  let records = null;
+  try { records = await altegioFetchRecords(env, now.ymd, now.ymd); }
+  catch (e) { console.error('consultfu fetch:', e && e.message); return; }
+  if (!Array.isArray(records) || !records.length) return;
+
+  const cand = collectConsultFollowupCandidates(env, records);
+  if (!cand.length) { console.log('consultfu: 0 кандидатов сегодня'); return; }
+
+  let sent = 0, dedup = 0, skip = 0;
+  for (const c of cand) {
+    if (sent >= CONSULT_FU_TICK_MAX) break;
+    const dk = `consult_fu:${c.recordId}`;
+    if (await env.BOT_KV.get(dk)) { dedup++; continue; }
+    let res = null;
+    try { res = await mhSendByPhone(env, c.phone, buildConsultFollowupText(c.name)); }
+    catch (e) { console.error('consultfu send:', e && e.message); }
+    if (res && res.ok) {
+      await env.BOT_KV.put(dk, new Date().toISOString(), { expirationTtl: CONSULT_FU_DEDUP_TTL });
+      if (res.channelId != null) {
+        await incChannelHourCount(env, res.channelId);
+        await incChannelDayCount(env, res.channelId);
+      }
+      sent++;
+    } else {
+      // cold / нет WA-контакта — повтор не поможет, гасим дедупом; cap — оставим на след. tick
+      if (res && (res.reason === 'cold' || res.reason === 'no_contact')) {
+        await env.BOT_KV.put(dk, `skip:${res.reason}`, { expirationTtl: CONSULT_FU_DEDUP_TTL });
+      }
+      skip++;
+    }
+  }
+  console.log(`consultfu tick: ${cand.length} cand, ${sent} sent, ${dedup} dedup, ${skip} skip`);
 }
 
 // Pre-flight проверки конфигурации для confirmation job.
