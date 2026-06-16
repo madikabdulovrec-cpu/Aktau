@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260615-smart-search">
+<meta name="app-version" content="20260616-dup-prevention">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -441,7 +441,14 @@ body { font-family:'Space Grotesk',sans-serif; background:var(--cream); color:va
         </div>
         <div class="form-field">
           <label>Телефон <span style="color:#aaa; font-weight:400;">(для связи и Altegio)</span></label>
-          <input type="tel" id="f_phone" placeholder="+7 ___ ___ __ __">
+          <input type="tel" id="f_phone" placeholder="+7 ___ ___ __ __" oninput="checkPhoneDuplicate()" onblur="checkPhoneDuplicate()">
+          <!-- Banner про существующего клиента — показывается если телефон совпадает с уже существующим -->
+          <div id="phoneDupBanner" style="display:none; margin-top:8px; padding:10px 12px; background:#fff3cd; border:1px solid #ffe69c; border-radius:8px; font-size:13px; color:#856404;">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+              <div id="phoneDupText" style="flex:1; min-width:200px;"></div>
+              <button type="button" class="btn-mini primary" onclick="openExistingByDup()" style="white-space:nowrap;">Открыть существующую</button>
+            </div>
+          </div>
         </div>
         <div class="form-row three">
           <div class="form-field">
@@ -1636,6 +1643,11 @@ function openClientForm(id) {
   editingInitialPhotos = [];
   document.getElementById('formTitle').textContent = id?'Редактирование карточки':'Новая карточка клиента';
   document.getElementById('btnDelete').style.display = id?'inline-block':'none';
+  // Сброс баннера дубликата — он показывается только при создании новой карточки
+  // когда телефон совпадает с существующим клиентом.
+  const dupBanner = document.getElementById('phoneDupBanner');
+  if(dupBanner) dupBanner.style.display = 'none';
+  phoneDupCandidateId = null;
 
   // отрендерить чекбоксы
   document.getElementById('sourceGrid').innerHTML = SOURCES.map(s => `
@@ -1746,6 +1758,54 @@ function addInitialPhoto() {
 
 function getChecked(group) {
   return [...document.querySelectorAll(`[data-group="${group}"] input:checked`)].map(i => i.value);
+}
+
+// Предотвращение создания дубликатов: при вводе телефона в форме НОВОЙ
+// карточки проверяем не существует ли клиент с таким номером.
+// Если есть — показываем баннер «Уже есть Иванова Анна, открыть?».
+// Это предотвращает повторение истории «мастер не нашёл клиента в поиске
+// → создал новую карточку → реальный клиент с пустой Altegio-копией → дубль».
+let phoneDupCandidateId = null;
+function checkPhoneDuplicate() {
+  // Срабатывает только для НОВОЙ карточки (редактируемая уже привязана к id).
+  const banner = document.getElementById('phoneDupBanner');
+  const txt = document.getElementById('phoneDupText');
+  if(!banner || !txt) return;
+  if(editingClientId) { banner.style.display = 'none'; phoneDupCandidateId = null; return; }
+  const phoneRaw = document.getElementById('f_phone')?.value || '';
+  const qDigits = normalizePhone(phoneRaw);
+  if(qDigits.length < 7) { banner.style.display = 'none'; phoneDupCandidateId = null; return; }
+  // Ищем кандидата (активный клиент с тем же телефоном).
+  const candidate = STATE.clients.find(c => !c.deleted && normalizePhone(c.phone) === qDigits);
+  if(!candidate) { banner.style.display = 'none'; phoneDupCandidateId = null; return; }
+  // Показываем баннер.
+  phoneDupCandidateId = candidate.id;
+  const owner = candidate.specialist ? ` (${candidate.specialist})` : '';
+  const altInfo = candidate.altegioId ? ' • из Altegio' : '';
+  txt.innerHTML = `📞 Уже есть клиент <b>${escapeHtml(candidate.fio || '—')}</b>${escapeHtml(owner)}${altInfo} с этим номером. Откройте существующую карточку, чтобы не создавать дубликат.`;
+  banner.style.display = 'block';
+}
+function openExistingByDup() {
+  if(!phoneDupCandidateId) return;
+  const id = phoneDupCandidateId;
+  // Если у мастера НЕТ доступа к этой карточке (она привязана к другому
+  // мастеру) — открыть всё равно нельзя, но мы скажем кто её ведёт.
+  const c = STATE.clients.find(x => x.id === id);
+  if(!c) { toast('Карточка не найдена в облаке — обнови страницу','error'); return; }
+  const isMine = !STATE.session || STATE.session.role !== 'master' ||
+    (c.specialistId ? c.specialistId === STATE.session.staffId : !c.specialist);
+  if(!isMine) {
+    toast(`Карточка закреплена за «${c.specialist}». Попросите суперадмина переоткрепить её на вас.`,'error');
+    return;
+  }
+  // Открываем существующую карточку (выходим из формы создания новой).
+  if(formDirty) {
+    if(!confirm('У вас есть несохранённые данные в новой карточке. Открыть существующую без сохранения?')) return;
+  }
+  formDirty = false;
+  stopAutoSave();
+  setSaveStatus('idle');
+  openClientForm(id);
 }
 
 async function saveClient() {
