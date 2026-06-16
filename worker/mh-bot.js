@@ -915,6 +915,12 @@ async function processMessage(msg, env) {
     await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
     if (kind === 'yes' || kind === 'no') {
       await handleConfirmationResponse(env, msg, kind, pending);
+    } else if (arrivalWithinTolerance(msg.text, pending && pending.apptMin,
+      Number(env.CONFIRM_LATE_TOLERANCE_MIN) || 10)) {
+      // Не явное «да/нет», но клиент назвал время прихода в пределах допуска
+      // опоздания (≤ N мин от брони) — считаем запись подтверждённой, менеджера
+      // не дёргаем. Большее опоздание → handleConfirmationFollowUp (администратор).
+      await handleConfirmationResponse(env, msg, 'yes', pending);
     } else {
       await handleConfirmationFollowUp(env, msg, pending);
     }
@@ -1010,8 +1016,14 @@ async function processMessage(msg, env) {
     if (booking) {
       await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
       const confirmKind = classifyConfirmationResponse(msg.text);
+      const ap = parseAltegioParts(booking.date);
+      const apptMin = ap ? ap.hour * 60 + ap.minute : null;
+      const tolMin = Number(env.CONFIRM_LATE_TOLERANCE_MIN) || 10;
       if (confirmKind) {
         await handleBookedReminderReply(env, msg, confirmKind, booking, firstPhone);
+      } else if (arrivalWithinTolerance(msg.text, apptMin, tolMin)) {
+        // Назвал время прихода в пределах допуска опоздания → подтверждение.
+        await handleBookedReminderReply(env, msg, 'yes', booking, firstPhone);
       } else {
         await sendMessage(env, msg,
           'Вы уже записаны к нам 🌷 Передаю администратору — он(а) свяжется и поможет с вашей записью.');
@@ -3075,11 +3087,13 @@ async function markGroupSent(env, g, phoneDayKey, sent) {
 // handleConfirmationResponse / handleConfirmationFollowUp.
 async function persistPending(env, g, firstRecord, sent) {
   if (!sent.userId) return;
+  const ap = parseAltegioParts(firstRecord.date || firstRecord.datetime);
   await env.BOT_KV.put(`confirm_pending:user:${sent.userId}`, JSON.stringify({
     recordId: firstRecord.id,
     recordIds: g.recordIds,
     phone: g.phone,
     channelUuid: sent.channelUuid,
+    apptMin: ap ? ap.hour * 60 + ap.minute : null, // время брони (мин от полуночи) — для допуска опоздания
   }), { expirationTtl: CONFIRM_PENDING_TTL });
 }
 
@@ -3511,19 +3525,54 @@ function classifyConfirmationResponse(rawText) {
   if (t.length > 50) return null;
   if (t.indexOf('?') !== -1) return null;
 
-  // Сначала «нет», потому что фразы «не приду / не получится» содержат «не»,
-  // а «да» в них нет.
-  if (/(^|\W)(нет|жок|joq|отмен|не приду|не буду|не получ|не смог|не прид|перенес|отказ|no|нету|👎|❌|✖|✗)(\W|$)/i.test(t)) {
+  // Эмодзи-сигналы (в любом месте текста). «Нет» проверяем раньше «да».
+  if (/[👎❌✖✗]/u.test(t)) return 'no';
+
+  // Разбиваем на слова (только буквы). КОРОТКИЕ маркеры матчим ТОЧНО по слову
+  // (иначе «да» ловит «даже», «ок» — «около», «буду» — «забуду»: в JS \W матчит
+  // кириллицу, и старый regex давал ложные срабатывания). Основы
+  // (подтвержд…, отмен…, перенес…) — по префиксу слова; «нет приду» — «не»+глагол.
+  const words = t.split(/[^a-zа-яёі]+/i).filter(Boolean);
+  const wset = new Set(words);
+  const exact = (arr) => arr.some((x) => wset.has(x));
+  const prefix = (arr) => words.some((w) => arr.some((p) => w.startsWith(p)));
+
+  const negVerb = ['приду', 'прийду', 'буду', 'смог', 'получ', 'прид', 'приед', 'дойд'];
+  if (exact(['нет', 'нету', 'жок', 'joq', 'no', 'отказ'])
+    || prefix(['отмен', 'перенес', 'отказыва'])
+    || (wset.has('не') && words.some((w) => negVerb.some((v) => w.startsWith(v))))) {
     return 'no';
   }
-  if (/(^|\W)(да|ия|иә|плюс|ок|окей|хорошо|подтвержд|конечно|приду|буду|yes|ага|угу|👍|✅|☑|✔)(\W|$)/i.test(t)
-    || t === '1' || t === '+' || /(^|\W)\+(\W|$)/.test(t)) {
+
+  if (/[👍✅☑✔❤🌷👌]/u.test(t)) return 'yes';
+  if (exact(['да', 'ия', 'иә', 'плюс', 'ок', 'окей', 'хорошо', 'конечно', 'приду', 'прийду', 'буду', 'ага', 'угу', 'yes'])
+    || prefix(['подтвержд'])
+    || t === '1' || t === '+' || /(?:^|\s)\+(?:\s|$)/.test(t)) {
     return 'yes';
   }
-  // Эмодзи-only без слов
-  if (/^[\s👍✅☑✔❤❤️🌷👌]+$/u.test(t)) return 'yes';
-  if (/^[\s👎❌✖✗]+$/u.test(t)) return 'no';
   return null;
+}
+
+// Клиент в ответ на напоминание назвал ВРЕМЯ прихода без явного «да/нет»
+// («буду к 10:05», «в 10.20 думаю»). Если названное время в пределах допуска
+// опоздания (tolMin) от времени брони (apptMin — минуты от полуночи) — считаем
+// запись подтверждённой. Берём МАКСИМАЛЬНОЕ из названных времён (худший случай:
+// «10:20, даже 10:30» → 30 мин). Длинные/вопросительные сообщения не трогаем
+// (там может быть реальный вопрос) — пусть идут к менеджеру.
+function arrivalWithinTolerance(text, apptMin, tolMin) {
+  if (apptMin == null) return false;
+  const t = String(text || '');
+  if (t.length > 60 || t.indexOf('?') !== -1) return false;
+  const re = /(\d{1,2})[:.](\d{2})/g;
+  let m, maxDev = -1;
+  while ((m = re.exec(t)) !== null) {
+    const h = Number(m[1]), mi = Number(m[2]);
+    if (h > 23 || mi > 59) continue;
+    const dev = Math.abs(h * 60 + mi - apptMin);
+    if (dev > maxDev) maxDev = dev;
+  }
+  if (maxDev < 0) return false;          // время не названо
+  return maxDev <= (Number(tolMin) || 10);
 }
 
 async function handleConfirmationResponse(env, msg, kind, pending) {
