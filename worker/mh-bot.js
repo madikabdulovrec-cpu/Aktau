@@ -268,6 +268,7 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 
 - НОВЫЙ ЛИД (ведёшь ты): вопрос про процедуру, цену, «хочу записаться», реакция на рекламу.
 - ДЕЙСТВУЮЩИЙ КЛИЕНТ (НЕ веди как лида): перенос записи, «не смогу прийти», вопрос про текущий курс/визит. Вежливо передай администратору и поставь тег [[HANDOFF | existing_client]].
+- ОТВЕТ НА НАПОМИНАНИЕ О ЗАПИСИ: если клиент в первом же сообщении просто подтверждает приход («Приду», «Буду», «Да») БЕЗ вопроса о процедуре/цене — он, скорее всего, отвечает на напоминание об УЖЕ существующей записи. НЕ начинай с него сбор имени/фамилии и противопоказаний (они собраны при записи). Тепло подтверди: «Спасибо, будем рады видеть вас 🌷». Если «не приду / перенесите / отмена» — передай администратору [[HANDOFF | existing_client]].
 - НЕЯСНО: один уточняющий вопрос.
 
 # ВОЗРАЖЕНИЯ
@@ -994,6 +995,24 @@ async function processMessage(msg, env) {
       console.log(`skip: human already in dialog ${tag} -> paused`);
       return;
     }
+    // 1.5) Ответ на напоминание о ЗАПИСИ. Если первое сообщение клиента — короткое
+    //      «Приду / Да / Нет / Не смогу» И в Altegio у его телефона есть запись на
+    //      сегодня..+2 дня — это подтверждение существующей записи (напоминание
+    //      слал внешний источник, иначе сработал бы confirm_pending выше), а НЕ
+    //      новый лид. НЕ допрашиваем имя/противопоказания (собраны при записи).
+    //      Гейт по реальной записи Altegio убирает регрессию: новый лид с голым
+    //      «Ок/Да» без записи сюда не попадает — идёт в обычный поток ниже.
+    const confirmKind = classifyConfirmationResponse(msg.text);
+    if (confirmKind) {
+      const bookedPhone = await getContactPhone(env, msg);
+      const booking = bookedPhone ? await altegioUpcomingBooking(env, bookedPhone) : null;
+      if (booking) {
+        await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+        await handleBookedReminderReply(env, msg, confirmKind, booking, bookedPhone);
+        return;
+      }
+    }
+
     // 2) Гейт «только новые лиды»: действующих клиентов студии бот не трогает.
     const cls = await classifyContact(msg, env);
     if (cls === 'existing') {
@@ -1313,6 +1332,42 @@ async function altegioHasVisitHistory(env, phone) {
   if (!Array.isArray(list) || !list.length) return false;
   // Действующий клиент — тот, кто уже был в студии (есть визиты).
   return list.some((c) => Number(c && c.visit_count) > 0);
+}
+
+// Ближайшая активная запись клиента (по телефону) на сегодня..+2 дня.
+// Источник правды «клиент уже записан» (отвечает на напоминание, а не новый лид).
+// Берём через records (start_date/end_date = ДАТА ВИЗИТА; clients/search в этом
+// кабинете Altegio отдаёт 400 на quick_search). Бот только читает. Любая
+// ошибка / нет токенов / нет телефона → null (безопасный фоллбэк на обычный поток).
+async function altegioUpcomingBooking(env, phone) {
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN || !env.ALTEGIO_COMPANY_ID) return null;
+  const tail = String(phone || '').replace(/\D/g, '').slice(-10);
+  if (tail.length < 10) return null;
+  const now = almatyNow();
+  const url = `${ALTEGIO_API}/records/${env.ALTEGIO_COMPANY_ID}`
+    + `?start_date=${now.ymd}&end_date=${ymdDaysAhead(now, 2)}&count=300&page=1`;
+  let res;
+  try {
+    res = await fetch(url, { headers: altegioHeaders(env) });
+  } catch (e) {
+    console.error('upcoming booking fetch:', e && e.message);
+    return null;
+  }
+  if (!res.ok) { console.error('upcoming booking:', res.status); return null; }
+  const data = await res.json().catch(() => null);
+  const list = (data && data.data) || [];
+  if (!Array.isArray(list)) return null;
+  let best = null;
+  for (const r of list) {
+    if (!r || r.deleted) continue;
+    const cph = String((r.client && r.client.phone) || '').replace(/\D/g, '').slice(-10);
+    if (cph !== tail) continue;
+    const parts = parseAltegioParts(r.date || r.datetime);
+    const ms = parts ? partsToAlmatyMs(parts) : null;
+    if (!ms) continue;
+    if (!best || ms < best.ms) best = { recordId: r.id, date: r.date, ms };
+  }
+  return best;
 }
 
 // Заголовки Altegio API (двойной токен: партнёр + пользователь).
@@ -3547,6 +3602,33 @@ async function handleConfirmationFollowUp(env, msg, pending) {
   console.log(`confirm reply FOLLOWUP u${msg.userId} `
     + `record=${pending && pending.recordId} `
     + `text="${String(msg.text || '').slice(0, 60)}"`);
+}
+
+// Клиент УЖЕ записан (нашли запись в Altegio) и первым сообщением отвечает на
+// напоминание (внешнее — наше прошло бы через confirm_pending). «Да/Приду» →
+// тёплое подтверждение БЕЗ опроса; «Нет/не приду» → передаём менеджеру
+// (перенос/отмена). Имя/противопоказания НЕ спрашиваем — собраны при записи.
+async function handleBookedReminderReply(env, msg, kind, booking, phone) {
+  if (kind === 'yes') {
+    if (booking && booking.recordId) {
+      try { await markAttendanceConfirmed(env, booking.recordId); }
+      catch (e) { console.error('booked-reply attendance:', e && e.message); }
+    }
+    await sendMessage(env, msg, 'Спасибо! Будем рады видеть вас 🌷');
+    console.log(`booked-reminder YES u${msg.userId} record=${booking && booking.recordId}`);
+    return;
+  }
+  await sendMessage(env, msg, 'Поняла, передаю менеджеру — он(а) свяжется и поможет с записью 🤍');
+  if (msg.userId) {
+    await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+  }
+  await assignToManager(env, msg);
+  await sendTelegramAlert(env, [
+    `🔴 «${String(msg.text || '').slice(0, 30)}» на напоминание о записи · ${almatyHHMM()}`,
+    `${phone ? fmtPhoneHuman(phone) : `Чат №${msg.userId}`} · запись Altegio №${(booking && booking.recordId) || '—'}`,
+    'Клиент, похоже, не придёт или хочет перенести. Свяжитесь — перенос или отмена.',
+  ].join('\n'));
+  console.log(`booked-reminder NO u${msg.userId} record=${booking && booking.recordId}`);
 }
 
 // ── Ответы клиента на engage-сообщение рассылки ────────────────────────────
