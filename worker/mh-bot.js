@@ -935,6 +935,10 @@ async function processMessage(msg, env) {
       // опоздания (≤ N мин от брони) — считаем запись подтверждённой, менеджера
       // не дёргаем. Большее опоздание → handleConfirmationFollowUp (администратор).
       await handleConfirmationResponse(env, msg, 'yes', pending);
+    } else if (isPoliteClosing(msg.text)) {
+      // «Спасибо» / 🙏 — вежливое закрытие, менеджера не дёргаем.
+      await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
+      await sendMessage(env, msg, 'Будем рады видеть вас! 🌷');
     } else {
       await handleConfirmationFollowUp(env, msg, pending);
     }
@@ -1038,6 +1042,10 @@ async function processMessage(msg, env) {
       } else if (arrivalWithinTolerance(msg.text, apptMin, tolMin)) {
         // Назвал время прихода в пределах допуска опоздания → подтверждение.
         await handleBookedReminderReply(env, msg, 'yes', booking, firstPhone);
+      } else if (isPoliteClosing(msg.text)) {
+        // «Спасибо» / 🙏 — вежливое закрытие, БЕЗ передачи менеджеру.
+        await sendMessage(env, msg, 'Будем рады видеть вас! 🌷');
+        console.log(`booked client polite-closing ${tag}`);
       } else {
         await sendMessage(env, msg,
           'Вы уже записаны к нам 🌷 Передаю администратору — он(а) свяжется и поможет с вашей записью.');
@@ -3662,6 +3670,20 @@ function classifyConfirmationResponse(rawText) {
 // запись подтверждённой. Берём МАКСИМАЛЬНОЕ из названных времён (худший случай:
 // «10:20, даже 10:30» → 30 мин). Длинные/вопросительные сообщения не трогаем
 // (там может быть реальный вопрос) — пусть идут к менеджеру.
+// Короткое вежливое закрытие диалога: «спасибо», «договорились», 🙏 — это НЕ
+// вопрос, НЕ отказ и НЕ просьба. Записанному клиенту на такое менеджера дёргать
+// НЕ нужно — достаточно тёплого «будем рады видеть вас».
+function isPoliteClosing(text) {
+  const t = String(text || '').trim().toLowerCase();
+  if (!t || t.length > 40 || t.indexOf('?') !== -1) return false;
+  const grat = /(спасиб|спс|благодар|пожалуйст|договорил|понятн|поняла|ясно|хорошо|отличн|супер|класс)/i.test(t);
+  const emojiClose = /^[\s🙏🌷❤❤️👍🤍✨😊🙂👌🌸💐🙌]+$/u.test(t);
+  if (!grat && !emojiClose) return false;
+  // …но НЕ если это вопрос/просьба/перенос/отмена.
+  if (/(перенес|отмен|нельзя|можно ли|во сколько|когда|почему|вопрос|поменя|измен|верн|деньг|оплат|не\s)/i.test(t)) return false;
+  return true;
+}
+
 function arrivalWithinTolerance(text, apptMin, tolMin) {
   if (apptMin == null) return false;
   const t = String(text || '');
