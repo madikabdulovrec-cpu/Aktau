@@ -939,8 +939,18 @@ async function processMessage(msg, env) {
       // «Спасибо» / 🙏 — вежливое закрытие, менеджера не дёргаем.
       await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
       await sendMessage(env, msg, 'Будем рады видеть вас! 🌷');
+    } else if (isQuestionOrRequest(msg.text)) {
+      await handleConfirmationFollowUp(env, msg, pending);   // реальный вопрос/просьба → менеджер
     } else {
-      await handleConfirmationFollowUp(env, msg, pending);
+      // Приветствие / неясное, но НЕ вопрос — мягко переспрашиваем; pending
+      // активен (следующее «Да/приеду» поймается). Один re-prompt, дальше → менеджер.
+      const rk = `confirm_reprompt:${msg.userId}`;
+      if (await env.BOT_KV.get(rk)) {
+        await handleConfirmationFollowUp(env, msg, pending);
+      } else {
+        await env.BOT_KV.put(rk, '1', { expirationTtl: 7200 });
+        await sendMessage(env, msg, 'Здравствуйте! 🌷 Подскажите, подтверждаете запись — придёте?');
+      }
     }
     return;
   }
@@ -1046,13 +1056,24 @@ async function processMessage(msg, env) {
         // «Спасибо» / 🙏 — вежливое закрытие, БЕЗ передачи менеджеру.
         await sendMessage(env, msg, 'Будем рады видеть вас! 🌷');
         console.log(`booked client polite-closing ${tag}`);
-      } else {
+      } else if (isQuestionOrRequest(msg.text)) {
         await sendMessage(env, msg,
           'Вы уже записаны к нам 🌷 Передаю администратору — он(а) свяжется и поможет с вашей записью.');
         if (msg.userId) {
           await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
         }
-        console.log(`booked client non-confirm ${tag} -> handoff`);
+        console.log(`booked client question ${tag} -> handoff`);
+      } else {
+        // Приветствие / неясное — мягко переспрашиваем; один re-prompt, дальше → менеджер.
+        const rk = `confirm_reprompt:${msg.userId}`;
+        if (await env.BOT_KV.get(rk)) {
+          await sendMessage(env, msg,
+            'Вы уже записаны к нам 🌷 Передаю администратору — он(а) свяжется и поможет.');
+          if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+        } else {
+          await env.BOT_KV.put(rk, '1', { expirationTtl: 7200 });
+          await sendMessage(env, msg, 'Здравствуйте! 🌷 Подтверждаете запись — придёте?');
+        }
       }
       return;
     }
@@ -3659,7 +3680,7 @@ function classifyConfirmationResponse(rawText) {
 
   if (/[👍✅☑✔❤🌷👌]/u.test(t)) return 'yes';
   if (exact(['да', 'ия', 'иә', 'плюс', 'ок', 'окей', 'хорошо', 'конечно', 'приду', 'прийду', 'буду', 'ага', 'угу', 'yes'])
-    || prefix(['подтвержд'])
+    || prefix(['подтвержд', 'приед', 'подойд', 'подъед'])
     || t === '1' || t === '+' || /(?:^|\s)\+(?:\s|$)/.test(t)) {
     return 'yes';
   }
@@ -3684,6 +3705,16 @@ function isPoliteClosing(text) {
   // …но НЕ если это вопрос/просьба/перенос/отмена.
   if (/(перенес|отмен|нельзя|можно ли|во сколько|когда|почему|вопрос|поменя|измен|верн|деньг|оплат|не\s)/i.test(t)) return false;
   return true;
+}
+
+// Реальный вопрос или просьба, на которые нужен ЧЕЛОВЕК (перенос, отмена,
+// «во сколько?», сомнение, перезвон). ТОЛЬКО это эскалируем менеджеру —
+// приветствие и прочее benign к человеку не отправляем.
+function isQuestionOrRequest(text) {
+  const t = String(text || '').trim().toLowerCase();
+  if (!t) return false;
+  if (t.indexOf('?') !== -1) return true;
+  return /(перенес|перенест|отмен|можно ли|во ?сколько|когда|почему|поменя|измен|деньг|оплат|перезвон|позвон|не получ|не увер|не знаю|подума|посмотр|болею|заболе|приболе|плохо себя|друг(ой|ое) (день|врем)|опозда|вопрос|уточн|пробле|сомнева)/i.test(t);
 }
 
 function arrivalWithinTolerance(text, apptMin, tolMin) {
