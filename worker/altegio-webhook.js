@@ -131,56 +131,81 @@ export default {
 };
 
 /* ============================================================
- * FIRESTORE — upsert/delete карточки в документ mmClients/data
- * ============================================================ */
+ * FIRESTORE V2 — каждая карточка в отдельном документе mmClientsV2/{id}
+ * ============================================================
+ *
+ * Раньше Worker дёргал /mmClients/data (один документ с массивом всех клиентов),
+ * мерджил весь массив в памяти и писал PATCH с precondition. Это создавало:
+ *  - блокировку всего массива при любом write,
+ *  - PRECONDITION_FAILED при параллельных webhook'ах + retry,
+ *  - риск упереться в лимит 1 МБ при росте базы.
+ *
+ * Теперь Worker:
+ *  - findClientByAltegioId: поиск через runQuery (Firestore index на altegioId),
+ *  - setFirestoreClient: PATCH одного документа mmClientsV2/{id} с precondition,
+ *  - markCardDeletedInFirestore: PATCH флага deleted у одного документа.
+ *
+ * Это полностью убирает contention между параллельными webhook'ами —
+ * Firestore сам управляет lock'ами на уровне документа.
+ */
 
-async function fetchFirestoreDoc(env) {
-  const url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/mmClients/data?key=${env.FIREBASE_API_KEY}`;
-  const resp = await fetch(url);
-  if (resp.status === 404) {
-    // Документ ещё не создавался — стартуем с пустого state.
-    return { staff: [], clients: [], _exists: false, _updateTime: null };
-  }
+const FIRESTORE_COLLECTION = 'mmClientsV2';
+
+// Поиск карточки в коллекции mmClientsV2 по полю altegioId. Использует
+// Firestore runQuery REST endpoint с structuredQuery. Возвращает объект
+// карточки + _docName + _updateTime, либо null если не найдено.
+async function findClientByAltegioId(env, altegioId) {
+  const url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery?key=${env.FIREBASE_API_KEY}`;
+  const body = {
+    structuredQuery: {
+      from: [{ collectionId: FIRESTORE_COLLECTION }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: 'altegioId' },
+          op: 'EQUAL',
+          value: { stringValue: String(altegioId) },
+        },
+      },
+      limit: 1,
+    },
+  };
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
   if (!resp.ok) {
     const txt = await resp.text();
-    throw new Error(`firestore GET failed: ${resp.status} ${txt.slice(0, 200)}`);
+    throw new Error(`firestore runQuery failed: ${resp.status} ${txt.slice(0, 200)}`);
   }
-  const json = await resp.json();
-  const decoded = decodeFirestoreFields(json.fields || {});
+  const arr = await resp.json();
+  const hit = Array.isArray(arr) ? arr.find(x => x && x.document) : null;
+  if (!hit) return null;
   return {
-    staff: Array.isArray(decoded.staff) ? decoded.staff : [],
-    clients: Array.isArray(decoded.clients) ? decoded.clients : [],
-    _exists: true,
-    // updateTime нужен для optimistic-locking: PATCH пройдёт только если
-    // документ не менялся с этого момента (см. patchFirestoreDoc).
-    _updateTime: json.updateTime || null,
+    ...decodeFirestoreFields(hit.document.fields || {}),
+    _docName: hit.document.name,
+    _updateTime: hit.document.updateTime || null,
   };
 }
 
-async function patchFirestoreDoc(env, state) {
-  let url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/mmClients/data?key=${env.FIREBASE_API_KEY}`;
-  // OPTIMISTIC CONCURRENCY: пишем документ только если он не изменился с
-  // момента нашего GET. Если другой webhook или платформа записали раньше —
-  // Firestore вернёт 400/409 FAILED_PRECONDITION, и withFirestoreRetry
-  // повторит весь цикл fetch→modify→patch со свежим снимком. Без этого два
-  // одновременных webhook'а теряли карточки (инциденты Лоры и Айнагуль).
-  if (state._exists && state._updateTime) {
-    url += `&currentDocument.updateTime=${encodeURIComponent(state._updateTime)}`;
-  } else if (!state._exists) {
-    url += `&currentDocument.exists=false`;
+// PATCH одного документа в коллекции. Если client._updateTime есть — пишем
+// с precondition (optimistic locking). Если нет — обычный create-or-replace.
+// Возвращает новый updateTime; бросает с .code='PRECONDITION_FAILED' если
+// документ изменился параллельно.
+async function setFirestoreClient(env, client) {
+  const id = String(client.id || '');
+  if (!id) throw new Error('setFirestoreClient: missing client.id');
+  // Не пишем служебные поля _docName/_updateTime в саму карточку
+  const { _docName, _updateTime, ...payload } = client;
+  let url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${FIRESTORE_COLLECTION}/${encodeURIComponent(id)}?key=${env.FIREBASE_API_KEY}`;
+  if (_updateTime) {
+    url += `&currentDocument.updateTime=${encodeURIComponent(_updateTime)}`;
   }
-  const fields = encodeFirestoreFields({
-    staff: state.staff,
-    clients: state.clients,
-    ts: Date.now(),
-  });
   const resp = await fetch(url, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ fields }),
+    body: JSON.stringify({ fields: encodeFirestoreFields(payload) }),
   });
-  // Firestore REST на проваленный precondition отвечает 400 (с status
-  // FAILED_PRECONDITION в теле) либо 409. Распознаём оба и сигналим retry.
   if (resp.status === 409 || resp.status === 412 || resp.status === 400) {
     const txt = await resp.text();
     if (resp.status !== 400 || /FAILED_PRECONDITION|exists|updateTime/i.test(txt)) {
@@ -188,19 +213,19 @@ async function patchFirestoreDoc(env, state) {
       err.code = 'PRECONDITION_FAILED';
       throw err;
     }
-    // 400 по другой причине — это реальная ошибка, не ретраим
     throw new Error(`firestore PATCH failed: 400 ${txt.slice(0, 200)}`);
   }
   if (!resp.ok) {
     const txt = await resp.text();
     throw new Error(`firestore PATCH failed: ${resp.status} ${txt.slice(0, 200)}`);
   }
+  const json = await resp.json();
+  return json.updateTime || null;
 }
 
-// Optimistic-concurrency retry. fn() делает полный цикл fetch→modify→patch.
-// Если patchFirestoreDoc упал с PRECONDITION_FAILED (кто-то записал документ
-// параллельно) — повторяем весь цикл со свежим GET. Экспоненциальный backoff
-// с jitter разводит конкурентов во времени, чтобы они не толкались бесконечно.
+// Optimistic-concurrency retry. fn() делает полный цикл find→modify→set.
+// Если setFirestoreClient упал с PRECONDITION_FAILED — повторяем со свежим
+// find. Экспоненциальный backoff с jitter.
 async function withFirestoreRetry(fn) {
   const MAX_ATTEMPTS = 6;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -216,7 +241,6 @@ async function withFirestoreRetry(fn) {
       throw e;
     }
   }
-  // Сюда не доходим — последняя попытка либо вернёт значение, либо бросит.
   throw new Error('firestore retry exhausted');
 }
 
@@ -224,61 +248,39 @@ async function upsertCardInFirestore({ env, altegioClient }) {
   const altegioIdStr = String(altegioClient.id || '');
   if (!altegioIdStr) throw new Error('altegio client missing id');
 
-  // Весь цикл fetch→modify→patch — внутри retry с optimistic-locking.
   return await withFirestoreRetry(async () => {
-    const state = await fetchFirestoreDoc(env);
-    const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
+    const existing = await findClientByAltegioId(env, altegioIdStr);
 
-    let cardId;
-    if (idx >= 0) {
-      // Обновление существующей — синкаем только поля, которые приходят из Altegio.
-      // Поля, заполненные мастером (анамнез, фото, замеры, рекомендации) — НЕ ТРОГАЕМ.
-      // updatedAt бампаем ТОЛЬКО при реальном изменении: иначе remote-копия
-      // искусственно «свежеет» и merge на платформе может откатить правки мастера.
-      const c = state.clients[idx];
-      cardId = c.id;
+    if (existing) {
+      // Обновление существующей. Синкаем ТОЛЬКО поля, которые приходят из Altegio.
+      // Поля, заполненные мастером (анамнез, фото, замеры) — НЕ ТРОГАЕМ.
+      const c = existing;
       let changed = false;
       if (altegioClient.name && c.fio !== altegioClient.name) { c.fio = altegioClient.name; changed = true; }
       if (altegioClient.phone && c.phone !== altegioClient.phone) { c.phone = altegioClient.phone; changed = true; }
       if (String(c.altegioId || '') !== altegioIdStr) { c.altegioId = altegioIdStr; changed = true; }
       if (c.deleted) { c.deleted = false; changed = true; }
-      if (changed) {
-        c.updatedAt = Date.now();
-      } else {
-        // Ничего не изменилось — выходим без записи, чтобы не дёргать Firestore
-        // и не плодить лишние ts-апдейты.
-        return cardId;
+      if (!changed) {
+        // Ничего не изменилось — не пишем, не плодим ts-апдейты.
+        return c.id;
       }
-    } else {
-      // Новая карточка — заводим скелет, мастер дозаполнит при следующем визите клиента.
-      cardId = `alt_${altegioIdStr}_${shortRand()}`;
-      state.clients.push({
-        id: cardId,
-        date: new Date().toISOString().slice(0, 10),
-        specialist: '',
-        specialistId: '',
-        fio: altegioClient.name || '',
-        phone: altegioClient.phone || '',
-        age: '',
-        weight: '',
-        height: '',
-        source: [],
-        complaints: '',
-        anamnesis: [],
-        anamnesisOther: '',
-        recommendations: '',
-        initialPhotos: [],
-        altegioId: altegioIdStr,
-        altegioLink: '',
-        sessions: [],
-        measurements: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+      c.updatedAt = Date.now();
+      await setFirestoreClient(env, c);
+      return c.id;
     }
 
-    await patchFirestoreDoc(env, state);
-    return cardId;
+    // Новой карточки нет — создаём с пустыми master-полями.
+    const newCardId = `alt_${altegioIdStr}_${shortRand()}`;
+    const newCard = {
+      id: newCardId,
+      fio: altegioClient.name || '',
+      phone: altegioClient.phone || '',
+      altegioId: altegioIdStr,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    await setFirestoreClient(env, newCard);
+    return newCardId;
   });
 }
 
@@ -287,20 +289,13 @@ async function markCardDeletedInFirestore({ env, altegioId }) {
   if (!altegioIdStr) return null;
 
   return await withFirestoreRetry(async () => {
-    const state = await fetchFirestoreDoc(env);
-    const idx = state.clients.findIndex(c => String(c.altegioId || '') === altegioIdStr);
-    if (idx < 0) return null;
-
-    // Soft-delete: помечаем флагом, реальные данные/фото сохраняем — мастер мог
-    // потратить часы на анамнез, нельзя потерять при случайном удалении в Altegio.
-    if (state.clients[idx].deleted === true) {
-      // Уже помечена — не пишем повторно.
-      return state.clients[idx].id;
-    }
-    state.clients[idx].deleted = true;
-    state.clients[idx].updatedAt = Date.now();
-    await patchFirestoreDoc(env, state);
-    return state.clients[idx].id;
+    const existing = await findClientByAltegioId(env, altegioIdStr);
+    if (!existing) return null;
+    if (existing.deleted === true) return existing.id; // уже soft-deleted
+    existing.deleted = true;
+    existing.updatedAt = Date.now();
+    await setFirestoreClient(env, existing);
+    return existing.id;
   });
 }
 

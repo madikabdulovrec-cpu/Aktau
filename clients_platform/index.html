@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260616-dup-prevention">
+<meta name="app-version" content="20260617-v2-collection">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -945,171 +945,242 @@ function initCloud() {
   }
 }
 // ============================================================
-// DIRTY TRACKING (фикс Bug #2 + Bug #8 от 2026-05-29 ревью)
+// V2 АРХИТЕКТУРА: коллекции mmClientsV2 / mmStaffV2
 // ============================================================
-// Раньше: cloudSubscribe мерджил remote с локалом и присваивал STATE.clients
-// НОВОЙ ССЫЛКЕ. Если в этот момент saveClient делал
-//   STATE.clients[prevIdx] = {...prevSnapshot, ...data}
-// между этой строкой и `await cloudPushFlush()` — запись уходила в осиротевший
-// старый массив, а cloudPush отправлял в облако НОВЫЙ массив без правок.
-// Симптом: «UI говорит "Сохранено", через час карточка снова пустая».
+// Раньше всё хранилось в одном документе mmClients/data. Лимит Firestore 1 МБ
+// был общим на ВСЕХ клиентов — при росте до 2000+ клиентов упирались в 90%
+// использования. Плюс одно блокирующее обновление всего массива при правке
+// любой карточки.
 //
-// Фикс: cloudDirtyIds — set id'ов, которые мастер сейчас редактирует или
-// которые в pending-push'е. cloudSubscribe НЕ ПЕРЕТИРАЕТ эти карточки из remote.
-// А все merge'ы теперь МУТИРУЮТ STATE.clients in-place — без создания нового
-// массива. Поэтому ссылка STATE.clients[i] остаётся валидной через await.
+// В V2 каждая карточка — свой документ mmClientsV2/{id}, каждый мастер —
+// mmStaffV2/{id}. Лимит 1 МБ применяется к каждому документу отдельно.
+// Параллельные правки разных карточек не конфликтуют.
+//
+// DIRTY TRACKING:
+//   cloudDirtyIds         — карточки, которые мастер сейчас редактирует или
+//                           которые ждут push в облако. cloudSubscribe НЕ
+//                           перетирает их remote-копией.
+//   cloudPendingClientIds — клиенты с локальными правками, ждущие push в облако.
+//   cloudPendingStaffIds  — мастера с локальными правками, ждущие push.
+//   cloudDeletedClientIds — клиенты которые нужно физически удалить из облака.
+//   cloudDeletedStaffIds  — мастера которые нужно физически удалить.
 const cloudDirtyIds = new Set();
-function markCardDirty(id) { if(id) cloudDirtyIds.add(id); }
+const cloudPendingClientIds = new Set();
+const cloudPendingStaffIds = new Set();
+const cloudDeletedClientIds = new Set();
+const cloudDeletedStaffIds = new Set();
+function markCardDirty(id) {
+  if(!id) return;
+  cloudDirtyIds.add(id);
+  cloudPendingClientIds.add(id); // меняется локально → запушить
+}
 function clearCardDirty(id) { if(id) cloudDirtyIds.delete(id); }
+function markStaffDirty(id) {
+  if(!id) return;
+  cloudPendingStaffIds.add(id);
+}
+function markClientHardDeleted(id) {
+  if(!id) return;
+  cloudDeletedClientIds.add(id);
+  cloudPendingClientIds.delete(id);
+  cloudDirtyIds.delete(id);
+}
+function markStaffHardDeleted(id) {
+  if(!id) return;
+  cloudDeletedStaffIds.add(id);
+  cloudPendingStaffIds.delete(id);
+}
 
 function cloudLoad() {
   if(!db) return;
-  db.collection('mmClients').doc('data').get().then(snap => {
-    if(!snap.exists) {
-      console.log('[cloud] empty doc — first time, push local seed');
+  // V2: загружаем обе коллекции параллельно
+  Promise.all([
+    db.collection('mmClientsV2').get(),
+    db.collection('mmStaffV2').get(),
+  ]).then(([clientsSnap, staffSnap]) => {
+    const remoteClients = clientsSnap.docs.map(d => d.data());
+    const remoteStaff = staffSnap.docs.map(d => d.data());
+    console.log('[cloud V2] load:', remoteClients.length, 'clients,', remoteStaff.length, 'staff');
+
+    // Защита от затирания: если ВСЯ облачная коллекция пуста (миграция не
+    // прошла или коллекция только что создана), а локально что-то есть —
+    // пушим локал, не теряем данные.
+    if(remoteClients.length === 0 && remoteStaff.length === 0 && (STATE.clients.length > 0 || STATE.staff.length > 0)) {
       cloudInitialLoadDone = true;
-      cloudPush(); // безопасно: документа нет, пушим что есть
+      for(const c of STATE.clients) cloudPendingClientIds.add(c.id);
+      for(const s of STATE.staff) cloudPendingStaffIds.add(s.id);
+      cloudPush().catch(e => console.error('[cloud V2] initial push fail', e));
       cloudSubscribe();
       setCloudBadge('on');
       refreshLoginGate();
       return;
     }
-    const data = snap.data();
-    // Защита от затирания: если cloud пустой, но локально что-то есть — не затираем
-    if((!data.clients || data.clients.length===0) && (!data.staff || data.staff.length===0) && (STATE.clients.length>0 || STATE.staff.length>0)) {
-      cloudInitialLoadDone = true;
-      cloudPush();
-      cloudSubscribe();
-      setCloudBadge('on');
-      refreshLoginGate();
-      return;
-    }
-    // MERGE in-place: НЕ создаём новый STATE.clients массив. Поэтому ссылки
-    // на индексы (как в saveClient → prevIdx) переживают через await.
-    if(data.staff)   mergeIntoLocal(STATE.staff,   data.staff,   null);
-    if(data.clients) mergeIntoLocal(STATE.clients, data.clients, cloudDirtyIds);
+
+    // MERGE in-place: НЕ создаём новый массив (ссылки на STATE.clients[i]
+    // переживают через async await в saveClient).
+    mergeIntoLocal(STATE.staff, remoteStaff, null);
+    mergeIntoLocal(STATE.clients, remoteClients, cloudDirtyIds);
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     cloudInitialLoadDone = true;
     cloudSubscribe();
     setCloudBadge('on');
-    // Если у пользователя был persisted master-логин, но мастера в актуальном
-    // staff[] больше нет (или он деактивирован) — выкидываем из приложения.
     validatePersistedSession();
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
     refreshLoginGate();
-    // Если в localStorage остались правки, которые ещё не дошли до cloud —
-    // (например, мастер закрыл вкладку до cloudPush) — догонит сейчас.
-    if(cloudLastHash !== quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}))) {
-      console.log('[cloud] local has unsaved changes — pushing now');
-      cloudPush().catch(e => console.error('[cloud] catch-up push failed', e));
+    // Catch-up push: если localStorage имеет более свежие правки чем cloud
+    if(cloudPendingClientIds.size > 0 || cloudPendingStaffIds.size > 0) {
+      cloudPush().catch(e => console.error('[cloud V2] catch-up push fail', e));
     }
   }).catch(e => {
-    console.error('[cloud] load fail', e);
+    console.error('[cloud V2] load fail', e);
     cloudInitialLoadDone = true;
-    // Показываем мастеру, что облако не подключилось — иначе он будет думать,
-    // что всё ок, и потерять данные при закрытии вкладки.
     setCloudBadge('off');
     if(typeof toast === 'function') toast('Облако недоступно. Изменения сохраняются локально','error');
     refreshLoginGate();
   });
 }
+
 function cloudSubscribe() {
   if(!db || cloudUnsubscribe) return;
-  cloudUnsubscribe = db.collection('mmClients').doc('data').onSnapshot(snap => {
-    if(!snap.exists) return;
-    // КРИТИЧНО (фикс инцидента Оксаны 27.05):
-    // 1) Firebase SDK триггерит onSnapshot ДВАЖДЫ на каждый собственный write —
-    //    сначала с metadata.hasPendingWrites=true (local optimistic cache),
-    //    потом с false (после server-ack). Если мы реагируем на первый snapshot,
-    //    мы можем перетереть STATE данными, которые сами только что начали пушить.
-    // 2) fromCache=true — это offline-кэш, тоже не источник правды для merge.
-    if(snap.metadata && snap.metadata.hasPendingWrites) return;
-    if(snap.metadata && snap.metadata.fromCache) return;
-
-    const data = snap.data();
-    // Не затираем своими пустыми данными (cloud=пусто, локально что-то есть)
-    if((!data.clients || data.clients.length===0) && (!data.staff || data.staff.length===0) && (STATE.clients.length>0 || STATE.staff.length>0)) return;
-
-    // MERGE in-place (фикс Bug #2 от 2026-05-29 ревью):
-    // Раньше STATE.clients = mergeArraysById(...) создавало НОВЫЙ массив.
-    // Это убивало правки мастера, если saveClient был между записью в STATE и
-    // await cloudPushFlush — наша запись уходила в осиротевший массив.
-    // Теперь mergeIntoLocal мутирует STATE.clients на месте.
-    // Плюс: карточки в cloudDirtyIds (которые мастер сейчас редактирует или
-    // которые в pending push) — НЕ перетираются remote-копией.
-    if(data.staff)   mergeIntoLocal(STATE.staff,   data.staff,   null);
-    if(data.clients) mergeIntoLocal(STATE.clients, data.clients, cloudDirtyIds);
-    cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
+  // V2: подписываемся на ОБА коллекции через onSnapshot c docChanges.
+  // Firebase SDK эффективно отправляет только реально изменённые документы,
+  // мы получаем только diff. Это в десятки раз дешевле по reads чем V1
+  // где каждый чужой write триггерил выгрузку всего документа.
+  const unsubClients = db.collection('mmClientsV2').onSnapshot(qs => {
+    qs.docChanges().forEach(change => {
+      // Skip собственные локальные writes (Firebase эмитит docChange ДВАЖДЫ
+      // на каждый локальный set — сначала с hasPendingWrites=true, потом с
+      // false после ack от сервера). Только server-ack — источник правды.
+      if(change.doc.metadata.hasPendingWrites) return;
+      if(change.doc.metadata.fromCache) return;
+      const c = change.doc.data();
+      if(!c || !c.id) return;
+      // Skip dirty карточки — мастер их сейчас редактирует или они в pending push.
+      if(cloudDirtyIds.has(c.id)) return;
+      const i = STATE.clients.findIndex(x => x.id === c.id);
+      if(change.type === 'removed') {
+        if(i >= 0) STATE.clients.splice(i, 1);
+        return;
+      }
+      // added или modified — мерджим по той же логике что mergeIntoLocal
+      if(i < 0) {
+        STATE.clients.unshift(c);
+      } else {
+        const local = STATE.clients[i];
+        const lTs = Number(local.updatedAt) || 0;
+        const rTs = Number(c.updatedAt) || 0;
+        if(rTs > lTs) {
+          STATE.clients[i] = mergeRecordFields(local, c);
+        }
+        // если local не старше — оставляем как есть
+      }
+    });
     saveLocalOnly();
-    // Real-time: если суперадмин деактивировал мастера прямо сейчас — выкидываем
-    // его текущую сессию даже если он уже работает в платформе.
     validatePersistedSession();
-    if(currentScreen==='dashScreen') renderClientList();
-    if(currentScreen==='adminScreen') renderAdmin();
+    if(currentScreen === 'dashScreen') renderClientList();
+    if(currentScreen === 'adminScreen') renderAdmin();
+  }, err => {
+    console.error('[cloud V2] clients subscribe error', err);
   });
+
+  const unsubStaff = db.collection('mmStaffV2').onSnapshot(qs => {
+    qs.docChanges().forEach(change => {
+      if(change.doc.metadata.hasPendingWrites) return;
+      if(change.doc.metadata.fromCache) return;
+      const s = change.doc.data();
+      if(!s || !s.id) return;
+      const i = STATE.staff.findIndex(x => x.id === s.id);
+      if(change.type === 'removed') {
+        if(i >= 0) STATE.staff.splice(i, 1);
+        return;
+      }
+      if(i < 0) {
+        STATE.staff.push(s);
+      } else {
+        STATE.staff[i] = s;
+      }
+    });
+    saveLocalOnly();
+    validatePersistedSession();
+    if(currentScreen === 'adminScreen') renderAdmin();
+  }, err => {
+    console.error('[cloud V2] staff subscribe error', err);
+  });
+
+  cloudUnsubscribe = () => { unsubClients(); unsubStaff(); };
 }
-// MERGE-ON-WRITE: cloudPush делает Firestore transaction вместо прямого set().
-// Сценарий, который мы лечим: Worker за миллисекунды до cloudPush добавил
-// карточку через REST PATCH (например, новый клиент из Altegio). Старый код
-// делал set() локального STATE — мы не видели свежую карточку и затирали её.
-// Теперь: внутри транзакции GET-им актуальный remote → мерджим по id с локальным
-// (для конфликтов берём свежий по updatedAt) → set. Если кто-то изменил
-// документ между read и write, Firestore сам retry-нёт транзакцию.
+
+// V2 cloudPush: пушит ТОЛЬКО грязные карточки/мастеров через batch.
+// Каждая карточка — свой документ, не блокирует другие. Параллельные пуши
+// разных карточек не конфликтуют. Firestore batch имеет лимит 500 операций
+// на коммит — разбиваем на чанки.
 async function cloudPush() {
   if(!db) return;
-  if(!cloudInitialLoadDone) { console.log('[cloud] skip push — initial load not done'); return; }
-  if(STATE.clients.length===0 && STATE.staff.length===0) { console.log('[cloud] skip push — empty state'); return; }
-  const h = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
-  if(h===cloudLastHash) return;
+  if(!cloudInitialLoadDone) { console.log('[cloud V2] skip push — initial load not done'); return; }
+  const pendingC = [...cloudPendingClientIds];
+  const pendingS = [...cloudPendingStaffIds];
+  const deletedC = [...cloudDeletedClientIds];
+  const deletedS = [...cloudDeletedStaffIds];
+  if(pendingC.length === 0 && pendingS.length === 0 && deletedC.length === 0 && deletedS.length === 0) {
+    return; // ничего не изменилось локально
+  }
 
   try {
-    const ref = db.collection('mmClients').doc('data');
-    await db.runTransaction(async tx => {
-      const snap = await tx.get(ref);
-      const remote = snap.exists ? (snap.data() || {}) : {};
-      // MERGE in-place в STATE: мутируем массивы, ссылки сохраняются. Это
-      // важно для одновременного saveClient(): его prevIdx был валиден до
-      // await, и должен остаться валидным после tx.set.
-      // dirtyIds=null здесь — внутри транзакции мы хотим merge'нуть ВСЕ remote
-      // изменения, чтобы tx.set отправил полный консистентный массив (иначе
-      // remote-only записи от Worker'а потеряются при следующем push).
-      mergeIntoLocal(STATE.staff,   remote.staff   || [], null);
-      mergeIntoLocal(STATE.clients, remote.clients || [], null);
-      // tx.set отправляет полный массив — сериализуем сейчас, чтобы зафиксировать
-      // снимок и избежать гонки с дальнейшими мутациями STATE.
-      tx.set(ref, { staff: [...STATE.staff], clients: [...STATE.clients], ts: Date.now() });
-    });
+    // Собираем все операции в один массив для batching
+    const ops = [];
+    for(const id of pendingC) {
+      const c = STATE.clients.find(x => x.id === id);
+      if(c) ops.push({ type:'set', col:'mmClientsV2', id, data:c });
+    }
+    for(const id of pendingS) {
+      const s = STATE.staff.find(x => x.id === id);
+      if(s) ops.push({ type:'set', col:'mmStaffV2', id, data:s });
+    }
+    for(const id of deletedC) ops.push({ type:'delete', col:'mmClientsV2', id });
+    for(const id of deletedS) ops.push({ type:'delete', col:'mmStaffV2', id });
+
+    // Firestore batch лимит — 500 операций. Разбиваем на чанки.
+    const BATCH_LIMIT = 400;
+    for(let i = 0; i < ops.length; i += BATCH_LIMIT) {
+      const chunk = ops.slice(i, i + BATCH_LIMIT);
+      const batch = db.batch();
+      for(const op of chunk) {
+        const ref = db.collection(op.col).doc(op.id);
+        if(op.type === 'set') batch.set(ref, op.data);
+        else if(op.type === 'delete') batch.delete(ref);
+      }
+      await batch.commit();
+    }
+
+    // Успех — очищаем pending
+    cloudPendingClientIds.clear();
+    cloudPendingStaffIds.clear();
+    cloudDeletedClientIds.clear();
+    cloudDeletedStaffIds.clear();
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
-    // Bug #16 фикс: если предыдущий push упал и был выставлен saveStatus='error',
-    // а ретрай через 3с УСПЕХ — мастер видит «Не сохранено» вечно, пока сам не
-    // ткнёт в форму. Сбрасываем error indicator при первом успешном push'е.
+    // Bug #16 фикс: если предыдущий push упал — сбрасываем error indicator
     if(typeof saveStatusState !== 'undefined' && saveStatusState === 'error') {
       try { setSaveStatus(isFormScreen() ? 'saved' : 'idle'); } catch(_){}
     }
   } catch(e) {
-    console.error('[cloud] push fail', e);
+    console.error('[cloud V2] push fail', e);
     if(String(e.message||'').includes('exceeds')) {
-      toast('Документ слишком большой — настройте Cloudinary для фото','error');
+      toast('Карточка слишком большая — настройте Cloudinary для фото','error');
     } else {
-      // Видимо для мастера: критично, чтобы он понял, что его правки НЕ ушли
-      // в облако и НЕ закрывал вкладку. Без этого — тихая потеря данных.
       toast('Не удалось сохранить в облако — попробуйте ещё раз','error');
     }
-    // hash НЕ обновляем — пусть следующий push повторит попытку.
-    // Запускаем повторный push через 3 сек на случай временной сетевой проблемы.
+    // Pending НЕ очищаем — следующий push повторит попытку.
     if(!cloudPushRetryTimer) {
       cloudPushRetryTimer = setTimeout(() => {
         cloudPushRetryTimer = null;
         cloudPush().catch(()=>{});
       }, 3000);
     }
-    // Прокидываем ошибку для await-вызовов (saveClient и т.д.), чтобы они
-    // могли её показать и не вели пользователя дальше как при успехе.
     throw e;
   }
 }
@@ -2067,6 +2138,7 @@ function setAltegioLink() {
   const m = link.match(/clients?\/(\d+)/);
   if(m) c.altegioId = m[1];
   c.updatedAt = Date.now();
+  markCardDirty(viewingClientId);
   saveState();
   openClientCard(viewingClientId);
   toast('Связь с Altegio сохранена');
@@ -2145,6 +2217,7 @@ function saveSession() {
   c.sessions = c.sessions || [];
   c.sessions.push(editingSession);
   c.updatedAt = Date.now();
+  markCardDirty(viewingClientId);
   saveState();
   closeSessionForm();
   openClientCard(viewingClientId);
@@ -2156,6 +2229,7 @@ function deleteSession(sid) {
   const c = STATE.clients.find(x => x.id===viewingClientId);
   c.sessions = (c.sessions||[]).filter(s => s.id!==sid);
   c.updatedAt = Date.now();
+  markCardDirty(viewingClientId);
   saveState();
   openClientCard(viewingClientId);
 }
@@ -2323,6 +2397,7 @@ function saveMeasurement() {
   if(i>=0) c.measurements[i] = editingMeasurement;
   else c.measurements.push(editingMeasurement);
   c.updatedAt = Date.now();
+  markCardDirty(viewingClientId);
   saveState();
   closeMeasurementForm();
   openClientCard(viewingClientId);
@@ -2334,6 +2409,7 @@ function deleteMeasurement(mid) {
   const c = STATE.clients.find(x => x.id===viewingClientId);
   c.measurements = (c.measurements||[]).filter(m => m.id!==mid);
   c.updatedAt = Date.now();
+  markCardDirty(viewingClientId);
   saveState();
   openClientCard(viewingClientId);
 }
@@ -2459,12 +2535,17 @@ async function saveMaster() {
     const oldName = m.name;
     m.name = name; m.login = login;
     if(pass) m.passHash = await hashPass(pass);
+    markStaffDirty(m.id);
     // Если имя поменялось — обновим строку specialist в существующих карточках, привязанных по id
     if(oldName !== name) {
-      STATE.clients.forEach(c => { if(c.specialistId===m.id) c.specialist = name; });
+      STATE.clients.forEach(c => {
+        if(c.specialistId===m.id) { c.specialist = name; markCardDirty(c.id); }
+      });
     }
   } else {
-    STATE.staff.push({ id:uid(), name, login, passHash:await hashPass(pass), role:'master', active:true });
+    const newM = { id:uid(), name, login, passHash:await hashPass(pass), role:'master', active:true };
+    STATE.staff.push(newM);
+    markStaffDirty(newM.id);
   }
   saveState();
   closeMasterForm();
@@ -2474,11 +2555,14 @@ async function saveMaster() {
 function toggleMaster(id) {
   const m = STATE.staff.find(s => s.id===id);
   if(!m) return;
-  m.active = !m.active; saveState(); renderAdmin();
+  m.active = !m.active;
+  markStaffDirty(id);
+  saveState(); renderAdmin();
 }
 function deleteMaster(id) {
   if(!confirm('Удалить мастера? Его карточки клиентов останутся.')) return;
   STATE.staff = STATE.staff.filter(s => s.id!==id);
+  markStaffHardDeleted(id); // удалит документ из mmStaffV2 при следующем push
   saveState(); renderAdmin();
 }
 
@@ -2510,8 +2594,14 @@ function importClients() {
         `Отмена — НЕ импортировать.`
       );
       if(!choice) { toast('Импорт отменён'); return; }
-      if(d.staff) STATE.staff = d.staff;
-      if(d.clients) STATE.clients = d.clients;
+      if(d.staff) {
+        STATE.staff = d.staff;
+        for(const s of d.staff) markStaffDirty(s.id);
+      }
+      if(d.clients) {
+        STATE.clients = d.clients;
+        for(const c of d.clients) markCardDirty(c.id);
+      }
       saveState(); renderAdmin();
       if(currentScreen==='dashScreen') renderClientList();
       toast('Импорт завершён');
