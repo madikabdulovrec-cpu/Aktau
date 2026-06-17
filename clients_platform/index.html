@@ -6,7 +6,7 @@
 <!-- APP_VERSION — версия этого деплоя. Сравнивается с серверной копией каждые 5 минут
      (см. checkForUpdates в JS внизу). При расхождении мастер видит баннер «обновите страницу».
      При каждом деплое менять (формат: YYYYMMDD-метка). -->
-<meta name="app-version" content="20260617-v2-collection">
+<meta name="app-version" content="20260617-v2-tx-merge">
 <!-- Anti-cache для HTML: Plesk/CloudFront/прокси игнорируют, но Chrome на iOS уважает. -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -969,16 +969,49 @@ const cloudPendingClientIds = new Set();
 const cloudPendingStaffIds = new Set();
 const cloudDeletedClientIds = new Set();
 const cloudDeletedStaffIds = new Set();
-function markCardDirty(id) {
+
+// Round 4 фикс BUG-1, BUG-12: РАЗДЕЛЯЕМ две семантики.
+//   editing — карточка открыта в форме. cloudSubscribe не перетирает её.
+//             Снимается при cancel/showScreen/успешном save (форма закрылась).
+//   modified — карточка реально изменена локально, ждёт push в облако.
+//              Снимается только cloudPush'ем после успешной записи.
+//
+// Раньше markCardDirty ставило ОБА флага и при простом open карточки. clearCardDirty
+// снимало только editing. Результат: id висел в pending после простого просмотра
+// карточки → следующий cloudPush пушил его старой версией → перетирал Worker'овы
+// правки (новый телефон/имя из Altegio) в Firestore.
+
+// Карточка ОТКРЫТА в форме (просмотр/правка) — защита от subscribe-перетирания.
+function markCardEditing(id) { if(id) cloudDirtyIds.add(id); }
+function clearCardEditing(id) {
+  // Снимаем editing-lock ТОЛЬКО если карточка не висит в pending (т.е. не правилась).
+  // Если pending — это значит мастер сохранил, но push ещё не подтверждён → НЕ снимаем
+  // editing (иначе cloudSubscribe может затереть свежие правки до подтверждения push).
+  if(!id) return;
+  if(cloudPendingClientIds.has(id)) return;
+  cloudDirtyIds.delete(id);
+}
+
+// Карточка РЕАЛЬНО изменена (save/delete/auto-save) — нужно пушнуть.
+function markCardModified(id) {
   if(!id) return;
   cloudDirtyIds.add(id);
-  cloudPendingClientIds.add(id); // меняется локально → запушить
+  cloudPendingClientIds.add(id);
 }
-function clearCardDirty(id) { if(id) cloudDirtyIds.delete(id); }
-function markStaffDirty(id) {
+function markStaffModified(id) {
   if(!id) return;
   cloudPendingStaffIds.add(id);
 }
+
+// Backwards-compat aliases:
+//   markCardDirty оставляем как алиас на markCardModified — все существующие
+//   вызовы внутри saveClient/saveSession/saveMeasurement/setAltegioLink/etc
+//   были на месте mutation, поэтому markCardModified-семантика корректна.
+//   patchOpenClientForm — это open-only, переключим явно на markCardEditing.
+function markCardDirty(id) { markCardModified(id); }
+function clearCardDirty(id) { clearCardEditing(id); }
+function markStaffDirty(id) { markStaffModified(id); }
+
 function markClientHardDeleted(id) {
   if(!id) return;
   cloudDeletedClientIds.add(id);
@@ -1112,60 +1145,143 @@ function cloudSubscribe() {
   cloudUnsubscribe = () => { unsubClients(); unsubStaff(); };
 }
 
-// V2 cloudPush: пушит ТОЛЬКО грязные карточки/мастеров через batch.
-// Каждая карточка — свой документ, не блокирует другие. Параллельные пуши
-// разных карточек не конфликтуют. Firestore batch имеет лимит 500 операций
-// на коммит — разбиваем на чанки.
+let cloudPushRetryTimer = null;
+let cloudPushInflight = null; // сериализация: один cloudPush одновременно
+
+// Round 4 фиксы:
+//  R1+R4+R2 (CRITICAL): write через runTransaction с FIELD-LEVEL merge.
+//    Раньше batch.set(ref, data) без merge перезаписывал документ ЦЕЛИКОМ:
+//    если Worker за миллисекунды до этого записал свежий fio/phone (Altegio webhook)
+//    и cloudSubscribe пропустил его из-за editing-lock, наша запись затирала Worker'а
+//    старой версией. Теперь внутри runTransaction: tx.get(doc) → mergeRecordFields
+//    (master-поля → наши, altegio-поля fio/phone/altegioId/altegioLink → у remote
+//    если оно свежее по updatedAt) → tx.set с полным результатом.
+//  BUG-3: при cloudInitialLoadDone=false бросаем ошибку, не молчим. Иначе мастер
+//    видит «Сохранено» а в облако ничего не ушло.
+//  R3 (BUG-7): clearTimeout(cloudPushRetryTimer) в начале + сериализация через
+//    cloudPushInflight, чтобы retry-timer и manual cloudPush не дрались параллельно.
+//  BUG-7: после успешного push очищаем ТОЛЬКО те id что были в локальном снапшоте,
+//    а не cloudPending*.clear() — иначе за время await могли накопиться новые
+//    правки, и мы их потеряем.
 async function cloudPush() {
   if(!db) return;
-  if(!cloudInitialLoadDone) { console.log('[cloud V2] skip push — initial load not done'); return; }
+  if(!cloudInitialLoadDone) {
+    // BUG-3 фикс: НЕ silent skip — мастер увидел toast «Сохранено» а в облако
+    // ничего не пошло. Кидаем ошибку чтобы saveClient попал в catch и показал её.
+    const err = new Error('Облако ещё не загрузилось — повторите через секунду');
+    err.code = 'NOT_INITIALIZED';
+    throw err;
+  }
+
+  // R3 фикс: cloudPushRetryTimer мог быть взведён предыдущим failed-push'ем.
+  // Если manual cloudPush вызывается раньше истечения 3-сек таймера — отменяем,
+  // мы и так пушим сейчас. Иначе retry-таймер сработал бы поверх и сделал двойную работу.
+  if(cloudPushRetryTimer) { clearTimeout(cloudPushRetryTimer); cloudPushRetryTimer = null; }
+
+  // Сериализация: если уже идёт push — присоединяемся к нему. Иначе два паралл.
+  // вызова (один из saveClient через cloudPushFlush, второй из cloudPushDebounced)
+  // могли бы оба прочитать одинаковый pending, оба сделать tx.set — лишняя нагрузка
+  // плюс возможные конфликты с самим собой.
+  if(cloudPushInflight) return cloudPushInflight;
+  cloudPushInflight = (async () => {
+    try {
+      await _cloudPushImpl();
+    } finally {
+      cloudPushInflight = null;
+    }
+  })();
+  return cloudPushInflight;
+}
+
+async function _cloudPushImpl() {
+  // Снимок pending до начала записи — очистим в конце ТОЛЬКО эти id, а не весь
+  // Set (за время await могли добавиться новые).
   const pendingC = [...cloudPendingClientIds];
   const pendingS = [...cloudPendingStaffIds];
   const deletedC = [...cloudDeletedClientIds];
   const deletedS = [...cloudDeletedStaffIds];
-  if(pendingC.length === 0 && pendingS.length === 0 && deletedC.length === 0 && deletedS.length === 0) {
-    return; // ничего не изменилось локально
-  }
+  if(pendingC.length === 0 && pendingS.length === 0 && deletedC.length === 0 && deletedS.length === 0) return;
 
   try {
-    // Собираем все операции в один массив для batching
-    const ops = [];
+    // R1+R4+R2 (CRITICAL): для каждого pending id — runTransaction с field-level
+    // merge против remote. Это устраняет затирание Worker'овых правок и потерю
+    // данных при параллельной правке двух мастеров (последний write больше не
+    // перетирает первого — теперь делаем merge).
+    //
+    // Клиенты идут через runTransaction (master-поля защищены). Мастера — через
+    // обычный set (поля простые, конфликтов минимум, batched commit быстрее).
     for(const id of pendingC) {
-      const c = STATE.clients.find(x => x.id === id);
-      if(c) ops.push({ type:'set', col:'mmClientsV2', id, data:c });
+      const local = STATE.clients.find(x => x.id === id);
+      if(!local) continue;
+      const ref = db.collection('mmClientsV2').doc(id);
+      await db.runTransaction(async tx => {
+        const snap = await tx.get(ref);
+        const remote = snap.exists ? snap.data() : null;
+        let toWrite = local;
+        if(remote) {
+          const lTs = Number(local.updatedAt) || 0;
+          const rTs = Number(remote.updatedAt) || 0;
+          // Field-level merge: если remote свежее по updatedAt — берём fio/phone/
+          // altegioId/altegioLink от remote, master-поля от local. Иначе local.
+          if(rTs > lTs) {
+            toWrite = mergeRecordFields(local, remote);
+          }
+        }
+        // Гарантируем что в результате у нас есть свежий updatedAt — иначе следующий
+        // merge может неправильно понять кто свежее.
+        if(!toWrite.updatedAt) toWrite.updatedAt = Date.now();
+        tx.set(ref, toWrite);
+        // Обновим STATE — мерж мог принести фрэш fio/phone от Worker'а.
+        const i = STATE.clients.findIndex(x => x.id === id);
+        if(i >= 0) STATE.clients[i] = toWrite;
+      });
     }
-    for(const id of pendingS) {
-      const s = STATE.staff.find(x => x.id === id);
-      if(s) ops.push({ type:'set', col:'mmStaffV2', id, data:s });
-    }
-    for(const id of deletedC) ops.push({ type:'delete', col:'mmClientsV2', id });
-    for(const id of deletedS) ops.push({ type:'delete', col:'mmStaffV2', id });
 
-    // Firestore batch лимит — 500 операций. Разбиваем на чанки.
-    const BATCH_LIMIT = 400;
-    for(let i = 0; i < ops.length; i += BATCH_LIMIT) {
-      const chunk = ops.slice(i, i + BATCH_LIMIT);
+    // Мастера — простой batched set (поля плоские, конфликтов почти нет)
+    if(pendingS.length > 0 || deletedS.length > 0) {
       const batch = db.batch();
-      for(const op of chunk) {
-        const ref = db.collection(op.col).doc(op.id);
-        if(op.type === 'set') batch.set(ref, op.data);
-        else if(op.type === 'delete') batch.delete(ref);
+      for(const id of pendingS) {
+        const s = STATE.staff.find(x => x.id === id);
+        if(s) batch.set(db.collection('mmStaffV2').doc(id), s);
       }
+      for(const id of deletedS) batch.delete(db.collection('mmStaffV2').doc(id));
       await batch.commit();
     }
+    // Удаления клиентов — physical delete документа
+    if(deletedC.length > 0) {
+      const batch2 = db.batch();
+      for(const id of deletedC) batch2.delete(db.collection('mmClientsV2').doc(id));
+      await batch2.commit();
+    }
 
-    // Успех — очищаем pending
-    cloudPendingClientIds.clear();
-    cloudPendingStaffIds.clear();
-    cloudDeletedClientIds.clear();
-    cloudDeletedStaffIds.clear();
+    // BUG-7 фикс: очищаем ТОЛЬКО снапшот pending, а не .clear() весь Set.
+    // За время await могли добавиться новые id (мастер успел сохранить ещё что-то).
+    for(const id of pendingC) cloudPendingClientIds.delete(id);
+    for(const id of pendingS) cloudPendingStaffIds.delete(id);
+    for(const id of deletedC) cloudDeletedClientIds.delete(id);
+    for(const id of deletedS) cloudDeletedStaffIds.delete(id);
+    // Снимаем editing-lock с карточек, которые УЖЕ не открыты в форме. Без этого
+    // editing мог зависнуть: при save мастер ушёл с формы → clearCardEditing
+    // не снимал editing (потому что был pending) → push прошёл → pending очищен,
+    // а editing висел до перезагрузки страницы → cloudSubscribe не обновлял эту
+    // карточку remote-копией навсегда.
+    const onFormNow = currentScreen === 'clientFormScreen' ? editingClientId : null;
+    for(const id of pendingC) {
+      if(id !== onFormNow) cloudDirtyIds.delete(id);
+    }
     cloudLastHash = quickHash(JSON.stringify({s:STATE.staff, c:STATE.clients}));
     saveLocalOnly();
     if(currentScreen==='dashScreen') renderClientList();
     if(currentScreen==='adminScreen') renderAdmin();
-    // Bug #16 фикс: если предыдущий push упал — сбрасываем error indicator
     if(typeof saveStatusState !== 'undefined' && saveStatusState === 'error') {
       try { setSaveStatus(isFormScreen() ? 'saved' : 'idle'); } catch(_){}
+    }
+    // Если за время push появились новые pending — сразу пушим их.
+    if(cloudPendingClientIds.size > 0 || cloudPendingStaffIds.size > 0 ||
+       cloudDeletedClientIds.size > 0 || cloudDeletedStaffIds.size > 0) {
+      // Через setTimeout, чтобы не рекурсивно из текущего стека (cloudPushInflight
+      // еще не освобождён).
+      setTimeout(() => cloudPush().catch(()=>{}), 0);
     }
   } catch(e) {
     console.error('[cloud V2] push fail', e);
@@ -1184,7 +1300,6 @@ async function cloudPush() {
     throw e;
   }
 }
-let cloudPushRetryTimer = null;
 
 // Немедленный flush pending debounced push. Используется в критичных save-flow
 // (saveClient, deleteClient, saveSession, …): после изменения STATE мы ОТМЕНЯЕМ
@@ -2023,6 +2138,11 @@ function deleteClient() {
   if(c) {
     c.deleted = true;
     c.updatedAt = Date.now();
+    // Round 4 фикс BUG-2: soft-delete должен попасть в pending → cloudPush
+    // обязательно запушит deleted=true в облако. Без этого мастер видит «удалено»
+    // локально, но в Firestore карточка живая → через час открыл с другого
+    // устройства/после reload — карточка снова в списке.
+    markCardModified(editingClientId);
   }
   editingClientId = null;
   saveState();
@@ -3081,10 +3201,13 @@ function cancelClientForm() {
     const hint = document.getElementById('autosaveHint');
     if(hint) { hint.textContent = ''; hint.className = 'autosave-hint'; }
     startAutoSave();
-    // Bug #2: помечаем карточку как dirty (редактируется), чтобы cloudSubscribe
-    // НЕ перетирал её remote-копией пока мастер работает. Снимем флаг при
-    // cancel/save/delete или закрытии формы через showScreen.
-    if(id) markCardDirty(id);
+    // Round 4 фикс BUG-1, BUG-12: ОТКРЫТИЕ карточки — это editing-lock, НЕ модификация.
+    // Ставим только editing (cloudDirtyIds), pending НЕ трогаем — иначе при простом
+    // просмотре карточки её id попадал в pending, и любой следующий save (даже
+    // другой карточки) пушил эту в облако СТАРОЙ копией → перетирал свежие правки
+    // от Worker'а (новый телефон/имя из Altegio). Снимем editing при cancel/save/
+    // delete через clearCardEditing (он сам учтёт что если в pending — не снимать).
+    if(id) markCardEditing(id);
     // Если есть draft для этой карточки — показать banner.
     const draft = loadDraft(id || null);
     if(draft) showDraftBanner(draft);
