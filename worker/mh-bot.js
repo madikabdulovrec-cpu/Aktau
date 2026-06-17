@@ -763,6 +763,11 @@ export default {
           slots: slots.map((s) => ({ ref: s.ref, when: `${s.humanDate} ${s.hhmm}`, staff: s.staffName, datetime: s.datetime })),
         });
       }
+      // Ops: dry-run follow-up после консультации (кто в какую ветку попадёт +
+      // тексты, БЕЗ отправки) — GET ?consultfutest=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('consultfutest') === env.WEBHOOK_SECRET) {
+        return json(await consultFollowupDryRun(env));
+      }
       return json({ status: 'ok', service: 'mh-bot', ts: new Date().toISOString() });
     }
     if (request.method !== 'POST') {
@@ -2904,15 +2909,39 @@ async function runConfirmationJob(env) {
     + `${stats.cold} cold, ${stats.cap} cap`);
 }
 
-// ── FOLLOW-UP ПОСЛЕ КОНСУЛЬТАЦИИ ─────────────────────────────────────────────
-// Вечером того же дня всем, кто СЕГОДНЯ пришёл на консультацию (Altegio
-// attendance==1 у записи на услугу ALTEGIO_CONSULT_SERVICE_ID), бот шлёт тёплое
-// сообщение: спасибо + индивидуальный план + открытый вопрос. Ответ клиента
-// ведёт обычный диалоговый флоу. Анти-бан — через mhSendByPhone (cold-фильтр +
-// часовой/дневной потолок канала). Дедуп per-record (consult_fu:{id}).
-// Kill-switch CONSULT_FOLLOWUP_ACTIVE='1'; окно часов CONSULT_FU_HOUR_START..END.
+// ── FOLLOW-UP ПОСЛЕ КОНСУЛЬТАЦИИ (две ветки) ─────────────────────────────────
+// Кто СЕГОДНЯ пришёл на консультацию (Altegio attendance==1 у услуги
+// ALTEGIO_CONSULT_SERVICE_ID) делится на ДВЕ непересекающиеся группы по тому,
+// взял ли клиент процедуру:
+//   • НЕ взял («ушёл думать») → в ТОТ ЖЕ день в CONSULT_FU_THINK_HOUR (20:00)
+//     тёплый дожим, средний тон (забота + мягкий CTA подобрать время).
+//   • ВЗЯЛ процедуру (сделал в тот же день ИЛИ записался на будущее) →
+//     на СЛЕДУЮЩИЙ день в CONSULT_FU_CARE_HOUR (12:00): сделал → «как
+//     самочувствие?»; записался → «спасибо, ждём вас <дата>».
+// Конверсия определяется по записям клиента в Altegio (рабочий records-запрос,
+// НЕ сломанный clients/search). Анти-бан — общий mhSendByPhone (cold + потолки).
+// Дедуп per-record: consult_fu_think:{id} / consult_fu_care:{id} (взаимоисключающие).
+// Kill-switch CONSULT_FOLLOWUP_ACTIVE='1'.
 const CONSULT_FU_DEDUP_TTL = 3 * 24 * 3600;  // 3 дня — не слать повторно
 const CONSULT_FU_TICK_MAX = 6;               // потолок отправок за один tick
+const CONSULT_FU_PROC_HORIZON_DEFAULT = 14;  // на сколько дней вперёд искать запись на процедуру
+
+const RU_MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+  'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+// «2026-06-15» → «15 июня» (для фразы «ждём вас …»).
+function humanDateRu(ymd) {
+  const m = String(ymd || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return '';
+  return `${Number(m[3])} ${RU_MONTHS[Number(m[2]) - 1] || ''}`.trim();
+}
+// Название процедуры (первый НЕ-консультационный сервис записи) — опц. для текста.
+function procName(services, consultSvcId) {
+  const svc = String(consultSvcId || '');
+  for (const s of services || []) {
+    if (String(s.id) !== svc && s.title) return String(s.title);
+  }
+  return '';
+}
 
 // Имя для обращения: обычно первое слово, но если оно похоже на фамилию
 // («Арсланова Сабина») — берём второе.
@@ -2923,74 +2952,205 @@ function firstName(full) {
   return p[0];
 }
 
-function buildConsultFollowupText(name) {
-  const hello = name ? `${name}, спасибо` : 'Спасибо';
-  return `${hello}, что были сегодня у нас на консультации в Фабрике красивых тел M&M 🌸\n\n`
-    + 'Мастер составил для вас индивидуальный план под вашу цель. Подскажите, всё ли было '
-    + 'понятно — остались вопросы по программе или стоимости? С радостью помогу 🤍';
+// Постранично собрать записи окна (records count=200, до maxPages страниц) —
+// окно follow-up шире одного дня (день консультации + горизонт процедур).
+async function altegioFetchRecordsPaged(env, start, end, maxPages = 5) {
+  const out = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `${ALTEGIO_API}/records/${env.ALTEGIO_COMPANY_ID}`
+      + `?start_date=${start}&end_date=${end}&count=200&page=${page}`;
+    let res;
+    try { res = await fetch(url, { headers: altegioHeaders(env) }); }
+    catch (e) { console.error('records paged fetch:', e && e.message); break; }
+    if (!res.ok) { console.error('records paged:', res.status); break; }
+    const data = await res.json().catch(() => null);
+    const list = (data && data.data) || [];
+    if (!Array.isArray(list) || !list.length) break;
+    out.push(...list);
+    if (list.length < 200) break;
+  }
+  return out;
 }
 
-// Сегодняшние записи на консультацию, где клиент ПРИШЁЛ (attendance==1). Один
-// клиент (телефон) — одно сообщение, даже если записей несколько.
-function collectConsultFollowupCandidates(env, records) {
+// Пришедшие на консультацию (att==1) за конкретный день ymd. Один телефон —
+// один кандидат. Возвращает [{recordId, phone, phoneTail, name}].
+function collectConsultAttendees(env, records, ymd) {
   const svc = String(env.ALTEGIO_CONSULT_SERVICE_ID || '');
   const seen = new Set();
   const out = [];
   for (const r of records || []) {
-    if (r.deleted) continue;
+    if (!r || r.deleted) continue;
     if (Number(r.attendance) !== 1) continue;            // 1 = пришёл (−1 = не пришёл, 2 = подтвердил)
+    if (String(r.date || r.datetime || '').slice(0, 10) !== ymd) continue;
     if (!(r.services || []).some((s) => String(s.id) === svc)) continue;
     const c = r.client || {};
     const phone = normalizePhone(c.phone || c.surname_with_phone || r.client_phone || '');
-    if (!phone || seen.has(phone)) continue;
-    seen.add(phone);
-    out.push({ recordId: r.id, phone, name: firstName(c.name) });
+    if (!phone) continue;
+    const tail = phone.replace(/\D/g, '').slice(-10);
+    if (seen.has(tail)) continue;
+    seen.add(tail);
+    out.push({ recordId: r.id, phone, phoneTail: tail, name: firstName(c.name) });
   }
   return out;
+}
+
+// Взял ли клиент процедуру (НЕ консультацию) на/после дня консультации.
+//   null                              — не взял («ушёл думать»)
+//   {mode:'done', serviceName}        — сделал процедуру в день консультации
+//   {mode:'booked', day, serviceName} — записан на процедуру (сегодня позже/вперёд)
+function clientProcedureStatus(env, windowRecords, phoneTail, consultYmd) {
+  const svc = String(env.ALTEGIO_CONSULT_SERVICE_ID || '');
+  let done = null, booked = null;
+  for (const r of windowRecords || []) {
+    if (!r || r.deleted) continue;
+    const cph = String((r.client && r.client.phone) || '').replace(/\D/g, '').slice(-10);
+    if (cph !== phoneTail) continue;
+    const services = r.services || [];
+    if (!services.length) continue;
+    if (!services.some((s) => String(s.id) !== svc)) continue;   // только консультация — не процедура
+    const att = Number(r.attendance);
+    if (att === -1) continue;                                    // не пришёл — не считаем
+    const day = String(r.date || r.datetime || '').slice(0, 10);
+    if (!day) continue;
+    if (day === consultYmd && att === 1) {
+      if (!done) done = { mode: 'done', serviceName: procName(services, svc) };
+    } else if (day >= consultYmd) {
+      if (!booked || day < booked.day) booked = { mode: 'booked', day, serviceName: procName(services, svc) };
+    }
+  }
+  return done || booked || null;
+}
+
+// ── Тексты follow-up ─────────────────────────────────────────────────────────
+// A) Ушёл думать — средний тон: забота + мягкий CTA.
+function buildThinkFollowupText(name) {
+  const hi = name ? `${name}, спасибо` : 'Спасибо';
+  return `${hi}, что были сегодня у нас на консультации в Фабрике красивых тел M&M 🌸\n\n`
+    + 'Мастер составил для вас индивидуальный план под вашу цель. Если остались вопросы по '
+    + 'программе или стоимости — с радостью отвечу. Хотите, подберу удобное время для первой '
+    + 'процедуры? 🤍';
+}
+// B1) Сделал процедуру в день консультации — пост-уход.
+function buildPostCareText(name) {
+  const hi = name ? `${name}, здравствуйте` : 'Здравствуйте';
+  return `${hi}! 🌸 Как ваше самочувствие после вчерашней процедуры в Фабрике красивых тел M&M? `
+    + 'Если есть вопросы по уходу или ощущениям — пишите, подскажу. Будем рады видеть вас снова 🤍';
+}
+// B2) Записался на процедуру вперёд — благодарность + ждём.
+function buildBookedThanksText(name, dayYmd) {
+  const hi = name ? `${name}, спасибо` : 'Спасибо';
+  const d = humanDateRu(dayYmd);
+  const when = d ? ` Будем рады видеть вас ${d}.` : ' Будем рады видеть вас снова.';
+  return `${hi}, что выбрали Фабрику красивых тел M&M! 🌸${when} `
+    + 'Если появятся вопросы по подготовке к процедуре — просто напишите, всё подскажу 🤍';
+}
+
+// Отправка одного follow-up с дедупом и учётом потолков канала.
+async function consultFuSend(env, cand, text, dedupKey, counters) {
+  if (await env.BOT_KV.get(dedupKey)) { counters.dedup++; return; }
+  let res = null;
+  try { res = await mhSendByPhone(env, cand.phone, text); }
+  catch (e) { console.error('consultfu send:', e && e.message); }
+  if (res && res.ok) {
+    await env.BOT_KV.put(dedupKey, new Date().toISOString(), { expirationTtl: CONSULT_FU_DEDUP_TTL });
+    if (res.channelId != null) {
+      await incChannelHourCount(env, res.channelId);
+      await incChannelDayCount(env, res.channelId);
+    }
+    counters.sent++;
+  } else {
+    // cold / нет WA-контакта — повтор не поможет, гасим дедупом; cap — оставим на след. tick
+    if (res && (res.reason === 'cold' || res.reason === 'no_contact')) {
+      await env.BOT_KV.put(dedupKey, `skip:${res.reason}`, { expirationTtl: CONSULT_FU_DEDUP_TTL });
+    }
+    counters.skip++;
+  }
 }
 
 async function runConsultFollowupJob(env) {
   if (env.CONSULT_FOLLOWUP_ACTIVE !== '1') return;
   if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
     || !env.ALTEGIO_COMPANY_ID || !env.ALTEGIO_CONSULT_SERVICE_ID) return;
-
   const now = almatyNow();
-  const hStart = Number(env.CONSULT_FU_HOUR_START) || 19;
-  const hEnd = Number(env.CONSULT_FU_HOUR_END) || 22;
-  if (now.hour < hStart || now.hour >= hEnd) return;
+  const thinkHour = Number(env.CONSULT_FU_THINK_HOUR) || 20;
+  const careHour = Number(env.CONSULT_FU_CARE_HOUR) || 12;
+  if (now.hour === thinkHour) await runConsultThinkTrack(env, now);
+  else if (now.hour === careHour) await runConsultCareTrack(env, now);
+}
 
-  let records = null;
-  try { records = await altegioFetchRecords(env, now.ymd, now.ymd); }
-  catch (e) { console.error('consultfu fetch:', e && e.message); return; }
-  if (!Array.isArray(records) || !records.length) return;
-
-  const cand = collectConsultFollowupCandidates(env, records);
-  if (!cand.length) { console.log('consultfu: 0 кандидатов сегодня'); return; }
-
-  let sent = 0, dedup = 0, skip = 0;
-  for (const c of cand) {
-    if (sent >= CONSULT_FU_TICK_MAX) break;
-    const dk = `consult_fu:${c.recordId}`;
-    if (await env.BOT_KV.get(dk)) { dedup++; continue; }
-    let res = null;
-    try { res = await mhSendByPhone(env, c.phone, buildConsultFollowupText(c.name)); }
-    catch (e) { console.error('consultfu send:', e && e.message); }
-    if (res && res.ok) {
-      await env.BOT_KV.put(dk, new Date().toISOString(), { expirationTtl: CONSULT_FU_DEDUP_TTL });
-      if (res.channelId != null) {
-        await incChannelHourCount(env, res.channelId);
-        await incChannelDayCount(env, res.channelId);
-      }
-      sent++;
-    } else {
-      // cold / нет WA-контакта — повтор не поможет, гасим дедупом; cap — оставим на след. tick
-      if (res && (res.reason === 'cold' || res.reason === 'no_contact')) {
-        await env.BOT_KV.put(dk, `skip:${res.reason}`, { expirationTtl: CONSULT_FU_DEDUP_TTL });
-      }
-      skip++;
-    }
+// Ветка A — тот же день: пришёл на консультацию сегодня и НЕ взял процедуру.
+async function runConsultThinkTrack(env, now) {
+  const horizon = Number(env.CONSULT_FU_PROC_HORIZON_DAYS) || CONSULT_FU_PROC_HORIZON_DEFAULT;
+  const win = await altegioFetchRecordsPaged(env, now.ymd, ymdDaysAhead(now, horizon));
+  if (!win.length) return;
+  const attendees = collectConsultAttendees(env, win, now.ymd);
+  if (!attendees.length) { console.log('consultfu/think: 0 пришедших'); return; }
+  const c8 = { sent: 0, dedup: 0, skip: 0, proc: 0 };
+  for (const c of attendees) {
+    if (c8.sent >= CONSULT_FU_TICK_MAX) break;
+    if (clientProcedureStatus(env, win, c.phoneTail, now.ymd)) { c8.proc++; continue; }  // взял процедуру → ветка B завтра
+    await consultFuSend(env, c, buildThinkFollowupText(c.name), `consult_fu_think:${c.recordId}`, c8);
   }
-  console.log(`consultfu tick: ${cand.length} cand, ${sent} sent, ${dedup} dedup, ${skip} skip`);
+  console.log(`consultfu/think: ${attendees.length} att, ${c8.proc} с процедурой, `
+    + `${c8.sent} sent, ${c8.dedup} dedup, ${c8.skip} skip`);
+}
+
+// Ветка B — следующий день: был на консультации вчера и ВЗЯЛ процедуру.
+async function runConsultCareTrack(env, now) {
+  const horizon = Number(env.CONSULT_FU_PROC_HORIZON_DAYS) || CONSULT_FU_PROC_HORIZON_DEFAULT;
+  const yYmd = ymdDaysAhead(now, -1);
+  const win = await altegioFetchRecordsPaged(env, yYmd, ymdDaysAhead(now, horizon));
+  if (!win.length) return;
+  const attendees = collectConsultAttendees(env, win, yYmd);
+  if (!attendees.length) { console.log('consultfu/care: 0 вчерашних'); return; }
+  const c8 = { sent: 0, dedup: 0, skip: 0, think: 0, none: 0 };
+  for (const c of attendees) {
+    if (c8.sent >= CONSULT_FU_TICK_MAX) break;
+    // Уже получил вчерашний дожим (поздно записался) — второй раз не трогаем.
+    if (await env.BOT_KV.get(`consult_fu_think:${c.recordId}`)) { c8.think++; continue; }
+    const st = clientProcedureStatus(env, win, c.phoneTail, yYmd);
+    if (!st) { c8.none++; continue; }                                // не взял процедуру — это была ветка A
+    const text = st.mode === 'done' ? buildPostCareText(c.name) : buildBookedThanksText(c.name, st.day);
+    await consultFuSend(env, c, text, `consult_fu_care:${c.recordId}`, c8);
+  }
+  console.log(`consultfu/care: ${attendees.length} att, ${c8.sent} sent, ${c8.dedup} dedup, `
+    + `${c8.think} think-skip, ${c8.none} no-proc, ${c8.skip} skip`);
+}
+
+// Dry-run для ops-эндпоинта ?consultfutest — кто в какую ветку попадёт + тексты,
+// БЕЗ отправки. Телефоны маскируются.
+async function consultFollowupDryRun(env) {
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN
+    || !env.ALTEGIO_COMPANY_ID || !env.ALTEGIO_CONSULT_SERVICE_ID) {
+    return { ok: false, error: 'altegio_not_configured' };
+  }
+  const now = almatyNow();
+  const horizon = Number(env.CONSULT_FU_PROC_HORIZON_DAYS) || CONSULT_FU_PROC_HORIZON_DEFAULT;
+  const thinkHour = Number(env.CONSULT_FU_THINK_HOUR) || 20;
+  const careHour = Number(env.CONSULT_FU_CARE_HOUR) || 12;
+  const yYmd = ymdDaysAhead(now, -1);
+  const winA = await altegioFetchRecordsPaged(env, now.ymd, ymdDaysAhead(now, horizon));
+  const todayThink = collectConsultAttendees(env, winA, now.ymd).map((c) => {
+    const st = clientProcedureStatus(env, winA, c.phoneTail, now.ymd);
+    return st
+      ? { name: c.name, phone: maskPhone(c.phone), bucket: 'процедура→ветка B (молчим сегодня)', mode: st.mode, when: st.day || now.ymd }
+      : { name: c.name, phone: maskPhone(c.phone), bucket: 'дожим «ушёл думать»', text: buildThinkFollowupText(c.name) };
+  });
+  const winB = await altegioFetchRecordsPaged(env, yYmd, ymdDaysAhead(now, horizon));
+  const yesterdayCare = collectConsultAttendees(env, winB, yYmd).map((c) => {
+    const st = clientProcedureStatus(env, winB, c.phoneTail, yYmd);
+    if (!st) return { name: c.name, phone: maskPhone(c.phone), bucket: 'без процедуры (дожим был вчера)' };
+    const text = st.mode === 'done' ? buildPostCareText(c.name) : buildBookedThanksText(c.name, st.day);
+    return { name: c.name, phone: maskPhone(c.phone), bucket: st.mode === 'done' ? 'пост-уход' : 'спасибо/ждём', when: st.day || yYmd, text };
+  });
+  return {
+    ok: true,
+    active: env.CONSULT_FOLLOWUP_ACTIVE === '1',
+    now: `${now.ymd} ${String(now.hour).padStart(2, '0')}:${String(now.minute).padStart(2, '0')}`,
+    schedule: { think: `${thinkHour}:00 в день консультации`, care: `${careHour}:00 на следующий день` },
+    today_think: todayThink,
+    yesterday_care: yesterdayCare,
+  };
 }
 
 // Pre-flight проверки конфигурации для confirmation job.
