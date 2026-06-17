@@ -3631,9 +3631,11 @@ function buildConfirmationText(partsList, variant) {
 function classifyConfirmationResponse(rawText) {
   if (!rawText) return null;
   let t = String(rawText).trim().toLowerCase();
-  // Длинные/вопросительные ответы не считаем коротким Да/Нет — пусть Claude
-  // разбирает в обычном flow (либо менеджер).
-  if (t.length > 50) return null;
+  // Очень длинные / вопросительные ответы не считаем коротким Да/Нет — пусть
+  // Claude разбирает (либо менеджер). Лимит 120: вежливое подтверждение с
+  // приветствием и благодарностью («Здравствуйте, спасибо за напоминание,
+  // завтра буду 👍») должно распознаваться как «да», а не уходить менеджеру.
+  if (t.length > 120) return null;
   if (t.indexOf('?') !== -1) return null;
 
   // Эмодзи-сигналы (в любом месте текста). «Нет» проверяем раньше «да».
@@ -3675,7 +3677,7 @@ function classifyConfirmationResponse(rawText) {
 // НЕ нужно — достаточно тёплого «будем рады видеть вас».
 function isPoliteClosing(text) {
   const t = String(text || '').trim().toLowerCase();
-  if (!t || t.length > 40 || t.indexOf('?') !== -1) return false;
+  if (!t || t.length > 60 || t.indexOf('?') !== -1) return false;
   const grat = /(спасиб|спс|благодар|пожалуйст|договорил|понятн|поняла|ясно|хорошо|отличн|супер|класс)/i.test(t);
   const emojiClose = /^[\s🙏🌷❤❤️👍🤍✨😊🙂👌🌸💐🙌]+$/u.test(t);
   if (!grat && !emojiClose) return false;
