@@ -1,12 +1,20 @@
 /**
- * M&M Backup Worker — ежедневный snapshot Firestore в R2 bucket.
+ * M&M Backup Worker V2 — ежедневный snapshot Firestore в R2 bucket.
  *
- * Сценарий: раз в сутки cron triggers fetch → GET документа mmClients/data →
- * PUT в R2 с ключом backups/YYYY-MM-DD.json. Дополнительно cleanup'ит файлы
- * старше RETENTION_DAYS, чтобы bucket не разрастался.
+ * V2 архитектура: бэкапим ДВЕ коллекции через listDocuments REST endpoint:
+ *   mmClientsV2/{id}  — карточки клиентов
+ *   mmStaffV2/{id}    — мастера (вместе с SHA-256 passHash для логина)
+ *
+ * Также бэкапим старый mmClients/data — он остался как frozen snapshot на
+ * случай отката, и пока не удалён, обновляется лишь в фолбэке.
+ *
+ * Сценарий: раз в сутки cron triggers fetch → listDocuments по mmClientsV2
+ * (с pagination, pageSize=300) → склейка в один JSON → PUT в R2 с ключом
+ * backups/YYYY-MM-DD.json. Дополнительно cleanup'ит файлы старше
+ * RETENTION_DAYS, чтобы bucket не разрастался.
  *
  * Восстановление: открыть R2 dashboard → скачать нужный YYYY-MM-DD.json →
- * PATCH через Firestore REST на mmClients/data (или ручной импорт).
+ * восстановить через worker/restore_from_backup.js (есть локально).
  *
  * Endpoints:
  *   GET /         — healthcheck + список последних снапшотов
@@ -28,7 +36,9 @@
  */
 
 const FIRESTORE_API = 'https://firestore.googleapis.com/v1';
-const FIRESTORE_DOC_PATH = 'mmClients/data';
+const COLLECTION_CLIENTS = 'mmClientsV2';
+const COLLECTION_STAFF = 'mmStaffV2';
+const LEGACY_DOC_PATH = 'mmClients/data'; // оставлен для совместимости
 
 const REQUIRED_ENV = ['FIREBASE_PROJECT_ID', 'FIREBASE_API_KEY', 'BACKUP_SECRET'];
 
@@ -108,53 +118,99 @@ export default {
  * ============================================================ */
 
 async function doBackup(env) {
-  // 1. GET документ из Firestore (полный raw JSON — сохраняем как есть)
-  const fsUrl = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${FIRESTORE_DOC_PATH}?key=${env.FIREBASE_API_KEY}`;
-  const resp = await fetch(fsUrl);
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`firestore GET failed: ${resp.status} ${txt.slice(0, 200)}`);
-  }
-  const raw = await resp.text();
+  // V2: листаем ОБЕ коллекции через listDocuments REST (pagination, pageSize=300).
+  // Каждый документ — отдельная запись. Собираем в один JSON-блоб:
+  //   { clientsV2: [{id, name, fields}, ...], staffV2: [...], legacy: {...}, meta }
+  // Это и есть наш дневной снапшот, его кладём в R2.
+  const clientsV2 = await listAllDocuments(env, COLLECTION_CLIENTS);
+  const staffV2 = await listAllDocuments(env, COLLECTION_STAFF);
+
+  // Также берём старый mmClients/data — он остался как frozen snapshot после
+  // миграции, в нём могут быть исторические данные что не дошли до V2. Не
+  // критично если он 404, тогда просто опускаем.
+  let legacy = null;
+  try {
+    const legacyResp = await fetch(`${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${LEGACY_DOC_PATH}?key=${env.FIREBASE_API_KEY}`);
+    if (legacyResp.ok) {
+      legacy = await legacyResp.json();
+    }
+  } catch (e) { /* legacy опционален */ }
+
+  const snapshot = {
+    schemaVersion: 2,
+    backed_up_at: new Date().toISOString(),
+    project: env.FIREBASE_PROJECT_ID,
+    clientsV2,
+    staffV2,
+    legacy, // null если уже удалён или 404
+    counts: {
+      clients: clientsV2.length,
+      staff: staffV2.length,
+    },
+  };
+
+  const raw = JSON.stringify(snapshot);
   const size = raw.length;
 
-  // 2. Парсим для метаданных (для логов и healthcheck)
-  let clientCount = 0;
-  let staffCount = 0;
-  try {
-    const doc = JSON.parse(raw);
-    clientCount = doc?.fields?.clients?.arrayValue?.values?.length || 0;
-    staffCount  = doc?.fields?.staff?.arrayValue?.values?.length   || 0;
-  } catch (e) { /* не критично */ }
-
-  // 3. PUT в R2 — ключ по дате (YYYY-MM-DD). Если за день уже есть — перезапишем
-  //    свежим (так мы сохраним последний snapshot каждого дня).
-  const dateKey = new Date().toISOString().slice(0, 10); // 2026-05-19
+  // PUT в R2 — ключ по дате (YYYY-MM-DD). Если за день уже есть — перезапишем
+  // свежим (последний snapshot каждого дня).
+  const dateKey = new Date().toISOString().slice(0, 10);
   const r2Key = `backups/${dateKey}.json`;
   await env.BACKUPS.put(r2Key, raw, {
-    httpMetadata: {
-      contentType: 'application/json; charset=utf-8',
-    },
+    httpMetadata: { contentType: 'application/json; charset=utf-8' },
     customMetadata: {
-      clients: String(clientCount),
-      staff: String(staffCount),
-      backed_up_at: new Date().toISOString(),
-      source: 'mm-backup-worker',
+      schema_version: '2',
+      clients: String(clientsV2.length),
+      staff: String(staffV2.length),
+      legacy_present: legacy ? '1' : '0',
+      backed_up_at: snapshot.backed_up_at,
+      source: 'mm-backup-worker-v2',
     },
   });
 
-  // 4. Cleanup — удаляем файлы старше RETENTION_DAYS
+  // Cleanup — удаляем файлы старше RETENTION_DAYS
   const retention = parseRetention(env);
   const cleanup = await cleanupOldBackups(env, retention);
 
   return {
     key: r2Key,
     size_bytes: size,
-    clients: clientCount,
-    staff: staffCount,
+    clients: clientsV2.length,
+    staff: staffV2.length,
+    legacy_present: !!legacy,
     retention_days: retention,
     cleaned: cleanup,
   };
+}
+
+// Постранично выкачиваем все документы из коллекции через listDocuments REST.
+// Возвращаем массив объектов вида { name, fields, createTime, updateTime } —
+// это формат Firestore REST, как его сохраняет Firebase. Восстановление через
+// restore_from_backup.js знает как декодировать.
+async function listAllDocuments(env, collectionId) {
+  const all = [];
+  let pageToken = null;
+  let page = 0;
+  while (true) {
+    page++;
+    if (page > 50) break; // safety cap: 50 страниц × 300 = 15000 документов
+    const params = new URLSearchParams({
+      key: env.FIREBASE_API_KEY,
+      pageSize: '300',
+    });
+    if (pageToken) params.set('pageToken', pageToken);
+    const url = `${FIRESTORE_API}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${collectionId}?${params}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(`listDocuments ${collectionId} failed: ${r.status} ${txt.slice(0, 200)}`);
+    }
+    const j = await r.json();
+    if (Array.isArray(j.documents)) all.push(...j.documents);
+    if (!j.nextPageToken) break;
+    pageToken = j.nextPageToken;
+  }
+  return all;
 }
 
 async function listBackups(env, limit) {
