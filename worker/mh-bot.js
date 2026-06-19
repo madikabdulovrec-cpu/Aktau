@@ -929,6 +929,16 @@ async function processMessage(msg, env) {
   // скипал по night-window → клиент оставался без ответа.
   const pendingRaw = await env.BOT_KV.get(`confirm_pending:user:${msg.userId}`);
   if (pendingRaw) {
+    // В чат уже вступил человек-менеджер (op:-пауза выставляется, когда менеджер
+    // пишет клиенту) — НЕ перебиваем его своей цепочкой подтверждения. Менеджер
+    // доведёт сам; иначе бот и человек дублируют «подтвердите запись». Гасим
+    // pending, отмечаем seen, молчим.
+    if (await env.BOT_KV.get(`op:${msg.userId}`)) {
+      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+      await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
+      console.log(`confirm_pending: operator active -> bot silent ${tag}`);
+      return;
+    }
     let pending = null;
     try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
     const kind = classifyConfirmationResponse(msg.text);
@@ -968,6 +978,13 @@ async function processMessage(msg, env) {
   // вопросы про цену конкретной программы и т.п.).
   const engageRaw = await env.BOT_KV.get(`broadcast_engage_pending:user:${msg.userId}`);
   if (engageRaw) {
+    // Менеджер уже в чате (op:-пауза) — не перебиваем ответом на акцию.
+    if (await env.BOT_KV.get(`op:${msg.userId}`)) {
+      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+      await env.BOT_KV.delete(`broadcast_engage_pending:user:${msg.userId}`);
+      console.log(`engage_pending: operator active -> bot silent ${tag}`);
+      return;
+    }
     let engage = null;
     try { engage = JSON.parse(engageRaw); } catch (_) { engage = null; }
     const kind = classifyConfirmationResponse(msg.text);
