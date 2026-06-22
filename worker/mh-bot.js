@@ -773,6 +773,20 @@ export default {
       if (env.WEBHOOK_SECRET && url.searchParams.get('consultfutest') === env.WEBHOOK_SECRET) {
         return json(await consultFollowupDryRun(env));
       }
+      // Ops: полный каталог услуг Altegio с ценами (сверка с промптом) —
+      // GET ?servicesdump=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('servicesdump') === env.WEBHOOK_SECRET) {
+        const co = env.ALTEGIO_COMPANY_ID;
+        const sres = await fetch(`${ALTEGIO_API}/company/${co}/services`, { headers: altegioHeaders(env) });
+        if (!sres.ok) return json({ ok: false, status: sres.status, body: (await sres.text()).slice(0, 300) });
+        const sdata = await sres.json().catch(() => null);
+        const slist = (sdata && sdata.data) || [];
+        const services = (Array.isArray(slist) ? slist : []).map((s) => ({
+          id: s.id, title: s.title, price_min: s.price_min, price_max: s.price_max,
+          active: s.active, category_id: s.category_id,
+        }));
+        return json({ ok: true, count: services.length, services });
+      }
       // Ops: воронка бота за сегодня/вчера — GET ?stats=<WEBHOOK_SECRET>.
       if (env.WEBHOOK_SECRET && url.searchParams.get('stats') === env.WEBHOOK_SECRET) {
         const n = almatyNow();
