@@ -801,6 +801,30 @@ export default {
         }));
         return json({ ok: true, count: services.length, services });
       }
+      // Ops: проба форматов поиска клиента Altegio (clients/search сломан на
+      // quick_search) — GET ?clienttest=<WEBHOOK_SECRET>&phone=7701...
+      if (env.WEBHOOK_SECRET && url.searchParams.get('clienttest') === env.WEBHOOK_SECRET) {
+        const co = env.ALTEGIO_COMPANY_ID;
+        const phone = (url.searchParams.get('phone') || '77012345678').replace(/\D/g, '');
+        const tries = [];
+        const tryReq = async (variant, method, path, body) => {
+          try {
+            const r = await fetch(`${ALTEGIO_API}${path}`, {
+              method, headers: altegioHeaders(env),
+              body: body ? JSON.stringify(body) : undefined,
+            });
+            tries.push({ variant, status: r.status, body: (await r.text()).slice(0, 300) });
+          } catch (e) { tries.push({ variant, err: String(e && e.message) }); }
+        };
+        await tryReq('v1_search_state_value', 'POST', `/company/${co}/clients/search`,
+          { page: 1, page_size: 5, fields: ['id', 'name', 'phone', 'visit_count', 'last_visit_date'],
+            filters: [{ type: 'quick_search', state: { value: phone } }] });
+        await tryReq('v2_search_nofilter', 'POST', `/company/${co}/clients/search`,
+          { page: 1, page_size: 5, fields: ['id', 'name', 'phone', 'visit_count'] });
+        await tryReq('v3_get_clients_phone', 'GET', `/clients/${co}?phone=${phone}`, null);
+        await tryReq('v4_company_clients', 'GET', `/company/${co}/clients?phone=${phone}`, null);
+        return json({ ok: true, phone, tries });
+      }
       // Ops: воронка бота за сегодня/вчера — GET ?stats=<WEBHOOK_SECRET>.
       if (env.WEBHOOK_SECRET && url.searchParams.get('stats') === env.WEBHOOK_SECRET) {
         const n = almatyNow();
