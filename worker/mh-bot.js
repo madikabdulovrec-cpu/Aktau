@@ -1485,6 +1485,31 @@ function appendTurn(history, role, content) {
 // serviceNote (опц.) — служебный контекст хода («КЭВ уже передан» / «не хватает
 // полей»), добавляется ТОЛЬКО в последнее user-сообщение запроса; в KV-историю
 // не попадает, prompt cache системного префикса не ломает.
+// Критический алерт «бот не отвечает клиентам» — в Telegram (группа управления).
+// Дедуп per-kind (botdown_alert:{kind}) на 30 мин: при сбое алерт уходит ОДИН раз,
+// а не на каждое входящее сообщение, пока проблема держится.
+const BOTDOWN_ALERT_TTL = 1800;
+async function alertBotDown(env, kind, detail) {
+  try {
+    if (!env.BOT_KV) return;
+    const dk = `botdown_alert:${kind}`;
+    if (await env.BOT_KV.get(dk)) return;
+    await env.BOT_KV.put(dk, '1', { expirationTtl: BOTDOWN_ALERT_TTL });
+    const map = {
+      balance: 'Закончился баланс Anthropic API — бот Алия НЕ отвечает клиентам.\n'
+        + 'Пополните: console.anthropic.com/settings/billing',
+      apikey: 'Проблема с ключом Anthropic API (неверный/отозван) — бот Алия НЕ отвечает.\n'
+        + 'Проверьте: console.anthropic.com/settings/keys',
+      overload: 'Claude API перегружен или недоступен — бот Алия временно не отвечает (идут повторы).',
+      http: 'Claude API вернул ошибку — бот Алия не отвечает клиентам.',
+    };
+    await sendTelegramAlert(env, `⚠️ БОТ АЛИЯ: СБОЙ\n\n${map[kind] || map.http}`
+      + (detail ? `\n\nДетали: ${detail}` : ''));
+  } catch (e) {
+    console.error('alertBotDown:', e && e.message);
+  }
+}
+
 async function callClaude(env, history, serviceNote) {
   // Слоты в промпт НЕ подмешиваем — бот не показывает временные слоты.
   // НО подмешиваем ТЕКУЩУЮ ДАТУ (Almaty) в последнее user-сообщение —
@@ -1552,13 +1577,20 @@ async function callClaude(env, history, serviceNote) {
 
     // 429 / 5xx — ретраить; 4xx (кроме 429) — нет смысла
     if (res.status !== 429 && res.status < 500) {
-      console.error(`Claude API ${res.status}:`, (await res.text()).slice(0, 200));
+      const body = (await res.text()).slice(0, 400);
+      console.error(`Claude API ${res.status}:`, body.slice(0, 200));
+      const low = body.toLowerCase();
+      let kind = 'http';
+      if (res.status === 401 || low.includes('authentication') || low.includes('invalid x-api-key') || low.includes('api key')) kind = 'apikey';
+      else if (low.includes('credit') || low.includes('balance') || low.includes('billing') || low.includes('quota') || low.includes('insufficient')) kind = 'balance';
+      await alertBotDown(env, kind, `HTTP ${res.status}`);
       return '';
     }
     const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
     await sleep(retryAfter ? retryAfter * 1000 : 800 * (attempt + 1));
   }
   console.error('Claude API: retries exhausted');
+  await alertBotDown(env, 'overload', 'повторы исчерпаны (429/5xx)');
   return '';
 }
 
