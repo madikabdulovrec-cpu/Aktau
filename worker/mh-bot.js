@@ -825,6 +825,10 @@ export default {
         await tryReq('v4_company_clients', 'GET', `/company/${co}/clients?phone=${phone}`, null);
         return json({ ok: true, phone, tries });
       }
+      // Ops: проверка готовой функции узнавания клиента — GET ?clientlookup=<WEBHOOK_SECRET>&phone=7701...
+      if (env.WEBHOOK_SECRET && url.searchParams.get('clientlookup') === env.WEBHOOK_SECRET) {
+        return json({ ok: true, result: await altegioClientLookup(env, url.searchParams.get('phone') || '') });
+      }
       // Ops: воронка бота за сегодня/вчера — GET ?stats=<WEBHOOK_SECRET>.
       if (env.WEBHOOK_SECRET && url.searchParams.get('stats') === env.WEBHOOK_SECRET) {
         const n = almatyNow();
@@ -1113,6 +1117,7 @@ async function processMessage(msg, env) {
   const histKey = `hist:${msg.userId}`;
   const histBefore = (await env.BOT_KV.get(histKey, { type: 'json' })) || [];
   const baseLen = histBefore.length;
+  let returningNote = '';   // контекст «действующий клиент» для модели (узнавание по Altegio)
 
   // Первый контакт бота с этим клиентом (истории ещё нет) — два гейта:
   if (baseLen === 0) {
@@ -1172,6 +1177,20 @@ async function processMessage(msg, env) {
       }
       return;
     }
+    // Действующий клиент БЕЗ будущей записи — узнаём по истории визитов Altegio
+    // (быстрый clients/search). Был у нас → подмешаем контекст модели, чтобы она
+    // не вела его как нового лида (тёплое узнавание, без анкеты). firstPhone — выше.
+    if (firstPhone) {
+      const known = await altegioClientLookup(env, firstPhone);
+      if (known && known.returning) {
+        returningNote = '[Контекст из базы (клиенту НЕ сообщай, что смотришь карточку): это '
+          + 'ДЕЙСТВУЮЩИЙ клиент студии, уже был у нас'
+          + (known.lastVisitDate ? ` (последний визит ${String(known.lastVisitDate).slice(0, 10)})` : '')
+          + '. Веди тепло, как с тем, кто уже бывал, можно «рады снова вас видеть». НЕ допрашивай '
+          + 'по анкете и НЕ выясняй заново имя/противопоказания. НЕ называй его по имени, пока он сам '
+          + 'не представится. Если хочет записаться — помоги и передай администратору.]';
+      }
+    }
   }
 
   // Голосовое не распозналось, чат ведёт бот (все проверки принадлежности
@@ -1189,7 +1208,8 @@ async function processMessage(msg, env) {
   // Но подмешиваем доступность авто-записи СЕЙЧАС: только тогда Claude эмитит
   // OFFER_SLOTS (иначе ведёт обычный КЭВ). См. блок АВТО-ЗАПИСЬ в SYSTEM_PROMPT.
   const reply = await callClaude(env, contextHistory,
-    buildServiceNote(kevPending, kevMissing, autobookEnabled(env, almatyNow())));
+    buildServiceNote(kevPending, kevMissing, autobookEnabled(env, almatyNow()))
+    + (returningNote ? `\n\n${returningNote}` : ''));
 
   // Если Claude недоступен — НЕ молчим: мягкий ответ + handoff менеджеру.
   let clientText;
@@ -1497,6 +1517,38 @@ async function altegioHasVisitHistory(env, phone) {
 // Берём через records (start_date/end_date = ДАТА ВИЗИТА; clients/search в этом
 // кабинете Altegio отдаёт 400 на quick_search). Бот только читает. Любая
 // ошибка / нет токенов / нет телефона → null (безопасный фоллбэк на обычный поток).
+// Быстрый поиск клиента по телефону (clients/search, quick_search → state.value
+// — РАБОЧИЙ формат, в отличие от прежней пробы). Возвращает {found, name,
+// lastVisitDate, returning} или null. Кэш clientlk:{tail} на 7 дней.
+async function altegioClientLookup(env, phone) {
+  if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN || !env.ALTEGIO_COMPANY_ID) return null;
+  const norm = normalizePhone(phone);
+  const tail = String(norm || '').replace(/\D/g, '').slice(-10);
+  if (tail.length < 10) return null;
+  const ck = `clientlk:${tail}`;
+  try { const cached = await env.BOT_KV.get(ck); if (cached) return JSON.parse(cached); } catch (_) { /* пересоберём */ }
+  let result = { found: false, name: null, lastVisitDate: null, returning: false };
+  try {
+    const res = await fetch(`${ALTEGIO_API}/company/${env.ALTEGIO_COMPANY_ID}/clients/search`, {
+      method: 'POST', headers: altegioHeaders(env),
+      body: JSON.stringify({
+        page: 1, page_size: 5, fields: ['id', 'name', 'phone', 'last_visit_date'],
+        filters: [{ type: 'quick_search', state: { value: norm } }],
+      }),
+    });
+    if (!res.ok) { console.error('clientLookup:', res.status); return null; } // ошибку не кэшируем
+    const data = await res.json().catch(() => null);
+    const list = (data && data.data) || [];
+    const hit = (Array.isArray(list) ? list : []).find((c) =>
+      String(c.phone || '').replace(/\D/g, '').slice(-10) === tail);
+    if (hit) {
+      result = { found: true, name: hit.name || null, lastVisitDate: hit.last_visit_date || null, returning: !!hit.last_visit_date };
+    }
+  } catch (e) { console.error('clientLookup fetch:', e && e.message); return null; }
+  try { await env.BOT_KV.put(ck, JSON.stringify(result), { expirationTtl: 7 * 24 * 3600 }); } catch (_) {}
+  return result;
+}
+
 async function altegioUpcomingBooking(env, phone) {
   if (!env.ALTEGIO_PARTNER_TOKEN || !env.ALTEGIO_USER_TOKEN || !env.ALTEGIO_COMPANY_ID) return null;
   const tail = String(phone || '').replace(/\D/g, '').slice(-10);
