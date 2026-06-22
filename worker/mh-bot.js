@@ -773,6 +773,19 @@ export default {
       if (env.WEBHOOK_SECRET && url.searchParams.get('consultfutest') === env.WEBHOOK_SECRET) {
         return json(await consultFollowupDryRun(env));
       }
+      // Ops: воронка бота за сегодня/вчера — GET ?stats=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('stats') === env.WEBHOOK_SECRET) {
+        const n = almatyNow();
+        const days = [n.ymd, ymdDaysAhead(n, -1)];
+        const metrics = ['in', 'kev', 'handoff', 'confirm_yes', 'confirm_no'];
+        const stats = {};
+        for (const d of days) {
+          const row = {};
+          for (const m of metrics) row[m] = await readStat(env, d, m);
+          stats[d] = row;
+        }
+        return json({ ok: true, stats });
+      }
       return json({ status: 'ok', service: 'mh-bot', ts: new Date().toISOString() });
     }
     if (request.method !== 'POST') {
@@ -828,6 +841,8 @@ export default {
       console.error('kev nudge failed:', e && e.message)));
     ctx.waitUntil(runConsultFollowupJob(env).catch((e) =>
       console.error('consult followup failed:', e && e.message)));
+    ctx.waitUntil(runDailyBotReport(env).catch((e) =>
+      console.error('daily report failed:', e && e.message)));
   },
 };
 
@@ -906,6 +921,7 @@ async function processMessage(msg, env) {
   // на ответ «Да/Нет»).
   const seenKey = `seen:${msg.messageId}`;
   if (await env.BOT_KV.get(seenKey)) return;
+  await bumpStat(env, 'in');                            // воронка: входящее обработано
 
   // Голосовое → текст (Whisper, Workers AI). Удалось — сообщение дальше
   // живёт как обычный текст (включая «Да/Нет» на подтверждение записи).
@@ -1485,6 +1501,49 @@ function appendTurn(history, role, content) {
 // serviceNote (опц.) — служебный контекст хода («КЭВ уже передан» / «не хватает
 // полей»), добавляется ТОЛЬКО в последнее user-сообщение запроса; в KV-историю
 // не попадает, prompt cache системного префикса не ломает.
+// ── Аналитика воронки бота (грубые дневные счётчики) ─────────────────────────
+// stat:{ymd}:{metric} в KV, TTL 8 дней. read-modify-write — при гонке возможен
+// небольшой недоучёт; для приблизительной аналитики это допустимо.
+const STAT_TTL = 8 * 24 * 3600;
+async function bumpStat(env, metric, n = 1) {
+  try {
+    if (!env.BOT_KV) return;
+    const k = `stat:${almatyNow().ymd}:${metric}`;
+    const cur = parseInt((await env.BOT_KV.get(k)) || '0', 10) || 0;
+    await env.BOT_KV.put(k, String(cur + n), { expirationTtl: STAT_TTL });
+  } catch (e) { console.error('bumpStat:', e && e.message); }
+}
+async function readStat(env, ymd, metric) {
+  try { return parseInt((await env.BOT_KV.get(`stat:${ymd}:${metric}`)) || '0', 10) || 0; }
+  catch (_) { return 0; }
+}
+
+// Дневной отчёт воронки бота + heartbeat «я жив» в Telegram управления. Раз в
+// сутки в DAILY_REPORT_HOUR за ПРОШЕДШИЕ сутки, дедуп per-day.
+const DAILY_REPORT_HOUR = 9;
+async function runDailyBotReport(env) {
+  const now = almatyNow();
+  if (now.hour !== (Number(env.DAILY_REPORT_HOUR) || DAILY_REPORT_HOUR)) return;
+  if (!env.BOT_KV) return;
+  const y = ymdDaysAhead(now, -1);
+  const dk = `dailyreport_sent:${y}`;
+  if (await env.BOT_KV.get(dk)) return;
+  await env.BOT_KV.put(dk, '1', { expirationTtl: STAT_TTL });
+  const [inc, kev, handoff, yes, no] = await Promise.all([
+    readStat(env, y, 'in'), readStat(env, y, 'kev'), readStat(env, y, 'handoff'),
+    readStat(env, y, 'confirm_yes'), readStat(env, y, 'confirm_no'),
+  ]);
+  await sendTelegramAlert(env, [
+    `📊 Бот Алия — за ${y}`,
+    `• Входящих обработано: ${inc}`,
+    `• Договорённостей о визите (КЭВ): ${kev}`,
+    `• Передач менеджеру: ${handoff}`,
+    `• Ответов на подтверждение: +${yes} / −${no}`,
+    '',
+    'Бот работает в штатном режиме ✅',
+  ].join('\n'));
+}
+
 // Критический алерт «бот не отвечает клиентам» — в Telegram (группа управления).
 // Дедуп per-kind (botdown_alert:{kind}) на 30 мин: при сбое алерт уходит ОДИН раз,
 // а не на каждое входящее сообщение, пока проблема держится.
@@ -1886,6 +1945,7 @@ async function handleHandoff(env, msg, reason) {
     'Подхватите диалог в message.help.',
   ].join('\n'));
 
+  await bumpStat(env, 'handoff');                       // воронка: передача менеджеру
   console.log(`handoff saved u${msg.userId} reason=${reason}`);
 }
 
@@ -1918,6 +1978,7 @@ async function handleBooking(env, msg, booking) {
     { expirationTtl: LEAD_TTL });
   await env.BOT_KV.put(`kev:${msg.userId}:${nowMs}`, JSON.stringify(card),
     { expirationTtl: KEV_CARD_TTL });
+  await bumpStat(env, 'kev');                           // воронка: договорённость о визите
 
   // КЭВ состоялся — но бот НЕ умолкает (раньше тут была op:-пауза на 7 дней, и
   // клиент, спросивший в 2 часа ночи «а парковка есть?», получал тишину).
@@ -3960,6 +4021,7 @@ async function handleConfirmationResponse(env, msg, kind, pending) {
       catch (e) { console.error('attendance set error:', e && e.message); }
     }
     await sendMessage(env, msg, 'Спасибо! Ждём вас 🌷');
+    await bumpStat(env, 'confirm_yes');
     // Локальная отметка на случай если Altegio не дался — менеджер увидит лог
     await env.BOT_KV.put(`confirm_done:${pending && pending.recordId}`, JSON.stringify({
       kind: 'confirmed', altegio: altOk, at: new Date().toISOString(),
@@ -3971,6 +4033,7 @@ async function handleConfirmationResponse(env, msg, kind, pending) {
 
   if (kind === 'no') {
     await sendMessage(env, msg, 'Поняла, передаю менеджеру — он(а) свяжется и поможет 🤍');
+    await bumpStat(env, 'confirm_no');
     if (msg.userId) {
       await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
     }
