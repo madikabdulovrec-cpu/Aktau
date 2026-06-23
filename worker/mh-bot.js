@@ -1167,6 +1167,14 @@ async function processMessage(msg, env) {
     //    кабинете Altegio отдаёт 400 на quick_search и не возвращает visit_count,
     //    т.е. altegioHasVisitHistory молча возвращал 'new' (гейт не работал).
     const firstPhone = await getContactPhone(env, msg);
+    // Внутренний номер (менеджер/сотрудник) — бот его НЕ ведёт как лида: молчит
+    // и ставит op-паузу (как при подключении человека).
+    if (firstPhone && isInternalPhone(env, firstPhone)) {
+      await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
+      if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+      console.log(`internal phone -> bot silent ${tag}`);
+      return;
+    }
     const booking = firstPhone ? await altegioUpcomingBooking(env, firstPhone) : null;
     if (booking) {
       await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
@@ -3463,6 +3471,7 @@ async function collectConfirmCandidates(env, records, now) {
       || r.client_phone || '';
     const phone = normalizePhone(rawPhone);
     if (!phone) continue;
+    if (isInternalPhone(env, phone)) continue;   // внутренний номер (менеджер) — не напоминаем
 
     const parts = parseAltegioParts(r.date || r.datetime);
     if (!parts) continue;
@@ -4352,6 +4361,22 @@ function normalizePhone(raw) {
   if (d.length === 11 && d[0] === '7') return d;
   if (d.length === 10) return '7' + d;
   return d;
+}
+
+// Внутренние номера (менеджеры/сотрудники) из секрета INTERNAL_PHONES (CSV).
+// Бот их НЕ ведёт как лидов и НЕ шлёт им напоминаний. Сверка по последним 10 цифрам.
+function internalPhoneSet(env) {
+  const set = new Set();
+  for (const p of String(env.INTERNAL_PHONES || '').split(/[,\s]+/)) {
+    const tail = p.replace(/\D/g, '').slice(-10);
+    if (tail.length === 10) set.add(tail);
+  }
+  return set;
+}
+function isInternalPhone(env, phone) {
+  const tail = String(phone || '').replace(/\D/g, '').slice(-10);
+  if (tail.length < 10) return false;
+  return internalPhoneSet(env).has(tail);
 }
 
 function maskPhone(p) {
