@@ -1979,6 +1979,40 @@ function computeAdminFunnel(records, usersMap, txn) {
     recordsTruncated: !!(records && records.truncated) }; // журнал обрезан потолком выгрузки (honesty WS-1)
 }
 
+// KPI МАСТЕРОВ-исполнителей из журнала записи (staff_id заполнен у 100% записей,
+// длительности тоже). Деньги УСЛУГ честно идут мастеру (он выполнил услугу, привязка
+// по record_id) — в отличие от кассира; курсы (record_id=0) сюда НЕ идут. Плюс горизонт
+// планирования (lead time). seance_length — в секундах.
+function computeMasterFunnel(records, txn) {
+  const byRecord = (txn && txn.byRecord) || null;
+  const by = new Map();
+  const leads = []; let sameDay = 0, withDate = 0;
+  for (const r of records) {
+    if (!r || r.deleted) continue;
+    const c = parseAltegioCreateTs(r.create_date), d = parseAltegioCreateTs(r.datetime);
+    if (c != null && d != null && d >= c) { leads.push(d - c); withDate++; if (d - c < 86400000) sameDay++; }
+    const sid = r.staff_id || 0;
+    if (!sid) continue;
+    if (!by.has(sid)) by.set(sid, { sid, name: (r.staff && r.staff.name) || `#${sid}`, total: 0, attended: 0, noshow: 0, waiting: 0, bookedMin: 0, revenue: 0, paidVisits: 0 });
+    const m = by.get(sid);
+    m.total++;
+    if (r.attendance === 1) m.attended++; else if (r.attendance === -1) m.noshow++; else m.waiting++;
+    m.bookedMin += Math.round((r.seance_length || r.length || 0) / 60);
+    if (byRecord) { const rv = byRecord.get(r.id) || 0; if (rv > 0) { m.revenue += rv; m.paidVisits++; } }
+  }
+  for (const m of by.values()) {
+    m.hours = Math.round(m.bookedMin / 6) / 10;                 // часы (1 знак)
+    m.avgMin = m.total ? Math.round(m.bookedMin / m.total) : 0;
+    m.avgCheck = m.revenue && m.paidVisits ? Math.round(m.revenue / m.paidVisits) : null;
+  }
+  leads.sort((a, b) => a - b);
+  return {
+    masters: [...by.values()].sort((x, y) => y.bookedMin - x.bookedMin),
+    leadMedianDays: leads.length ? Math.round(leads[Math.floor(leads.length / 2)] / 8640000) / 10 : null,
+    sameDayPct: withDate ? Math.round((100 * sameDay) / withDate) : null,
+  };
+}
+
 const pct = (num, den) => (den > 0 ? Math.round((num / den) * 100) : null);
 
 // Раздел «Администраторы» = низ воронки: записи → доходимость → неявка (только из Altegio).
@@ -2034,8 +2068,29 @@ function formatAdminReport(label, range, funnel, discLimit) {
   if (f.auto && f.auto.total) {
     lines.push(`🤖 Авто/онлайн-запись: ${f.auto.total} (дошли ${f.auto.attended}/неявка ${f.auto.noshow})`);
   }
+  // KPI МАСТЕРОВ-исполнителей из журнала (staff_id). Деньги услуг честно идут мастеру (он
+  // выполнил услугу, привязка по record_id); курсы (record_id=0) сюда не входят. Загрузка — забронированные часы.
+  const mk = f.masterKpi;
+  if (mk && mk.masters && mk.masters.length) {
+    const shown = mk.masters.filter((m) => m.total >= 2);
+    lines.push('');
+    lines.push('👩‍⚕️ По мастерам (журнал записи):');
+    for (const m of shown.slice(0, 10)) {
+      const dr = pct(m.attended, m.attended + m.noshow);
+      lines.push(`• ${m.name} — ${m.total} визитов · дошли ${m.attended}/неявка ${m.noshow} · доход. ${dr != null ? dr + '%' : '—'} · загрузка ${m.hours}ч`);
+      const mm = [];
+      if (m.revenue) mm.push(`💰 услуг ${fmtTg(m.revenue)}₸`);
+      if (m.avgCheck) mm.push(`ср.чек ${fmtTg(m.avgCheck)}₸`);
+      if (m.avgMin) mm.push(`ср.визит ${m.avgMin}мин`);
+      if (mm.length) lines.push(`   ${mm.join(' · ')}`);
+    }
+    if (shown.length > 10) lines.push(`…и ещё ${shown.length - 10} мастеров`);
+  }
+  if (mk && mk.leadMedianDays != null) {
+    lines.push(`🗓 Планирование: горизонт записи ~${mk.leadMedianDays} дн (медиана)${mk.sameDayPct != null ? ` · в день визита ${mk.sameDayPct}%` : ''}`);
+  }
   lines.push('');
-  lines.push(`ℹ️ Записи — по дате оформления (вкл. повторных). Доходимость — ВМЕНЁННАЯ кассиру (приход зависит и от обзвона ОП/бота), не повод для санкций; отмена и неявка в Altegio неразличимы. Деньги кассиру НЕ атрибутируются (курсы ≈89% не привязаны к записи, кассир в чеке не указан) — выручка только по студии. «Оплачено %» и «подтв. %» — по записям этого автора. «Без оплаты» = визит был, следов оплаты в записи нет (проверить кассу). «0₸» = консультации/отработка. Скидка — по услугам с прайс-ценой; ⚠️ = выше порога ${discLimit || 60}% (cfg:discount_limit, правится без деплоя).`);
+  lines.push(`ℹ️ Записи — по дате оформления (вкл. повторных). Доходимость — ВМЕНЁННАЯ (приход зависит и от обзвона ОП/бота), не повод для санкций; отмена и неявка в Altegio неразличимы. Деньги кассиру НЕ атрибутируются (курсы ≈89% не привязаны к записи, кассир в чеке не указан) — выручка только по студии. По МАСТЕРАМ деньги услуг идут исполнителю (привязка record_id), курсы не учтены; загрузка — забронированные часы. «Без оплаты» = визит был, следов оплаты нет (проверить кассу). «0₸» = консультации/отработка. Скидка — по услугам с прайс-ценой; ⚠️ = выше ${discLimit || 60}% (cfg:discount_limit).`);
   return lines.join('\n');
 }
 
@@ -2058,6 +2113,7 @@ async function buildAdminReport(env, period, now, custom) {
   const usersMap = await fetchAltegioUsers(env, token);
   const txn = await fetchAltegioTransactions(env, token, range.from, range.to);
   const funnel = computeAdminFunnel(records, usersMap, txn);
+  funnel.masterKpi = computeMasterFunnel(records, txn); // KPI мастеров-исполнителей из журнала
   // Порог скидки правится без деплоя через KV cfg:discount_limit; дефолт 60% (норма студии — пробное −50%).
   const discLimit = parseInt(await env.PULSE_KV.get('cfg:discount_limit'), 10) || 60;
   return formatAdminReport(label, range, funnel, discLimit);
