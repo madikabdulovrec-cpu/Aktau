@@ -119,6 +119,14 @@ const ADMIN_NAMES = { 12842041: 'Мевиш', 12840574: 'Вероника', 1283
 // сотрудников. Сотрудники (SELLERS_KEY в KV) только отмечают свою смену кнопкой.
 const adminIds = (env) => new Set(String(env.ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean));
 const isAdmin = (env, userId) => adminIds(env).has(String(userId));
+// Владелец — для ЧУВСТВИТЕЛЬНЫХ алертов «только лично» (визит без оплаты, удаления задним
+// числом, скидки выше порога — WS-3). OWNER_ID (через запятую), иначе первый из ADMIN_IDS.
+const ownerIds = (env) => {
+  const explicit = String(env.OWNER_ID || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (explicit.length) return explicit;
+  const a = [...adminIds(env)];
+  return a.length ? [a[0]] : [];
+};
 // seed-список из env.SELLERS — только если KV пуст (миграция/первый запуск).
 const seedSellers = (env) => String(env.SELLERS || '').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -1905,7 +1913,7 @@ function computeAdminFunnel(records, usersMap, txn) {
     const uid = r.created_user_id || 0;
     const name = (usersMap && usersMap[uid]) || ADMIN_NAMES[uid] || (uid ? `#${uid}` : 'не указан');
     if (uid === 0 || isAutoCreator(name)) { auto.total++; auto[att]++; continue; }
-    if (!by.has(uid)) by.set(uid, { uid, name, total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0, revenue: 0, paidVisits: 0, paid: 0, priceFull: 0, pricePay: 0, paidSvc: 0, zeroSvc: 0, services: {} });
+    if (!by.has(uid)) by.set(uid, { uid, name, total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0, revenue: 0, paidVisits: 0, paid: 0, priceFull: 0, pricePay: 0, paidSvc: 0, zeroSvc: 0, paidFull: 0, attendedPriced: 0, noPay: 0, services: {} });
     const a = by.get(uid);
     a.total++; a[att]++;
     if (r.confirmed === 1) a.confirmed++;
@@ -1918,13 +1926,25 @@ function computeAdminFunnel(records, usersMap, txn) {
     if (svcs.some((v) => (v.cost_to_pay || v.cost || 0) > 0)) { a.paidSvc++; if (r.paid_full === 1) a.paid++; }
     else a.zeroSvc++;
     for (const v of svcs) if (v.title) a.services[v.title] = (a.services[v.title] || 0) + 1;
+    // Дисциплина оплаты — ТОЛЬКО по состоявшимся ПЛАТНЫМ визитам (консультации/0₸ не считаем).
+    const hasPriced = svcs.some((v) => (v.cost_to_pay || v.cost || v.first_cost || 0) > 0);
+    if (att === 'attended' && hasPriced) {
+      a.attendedPriced++;
+      // «оплата зафиксирована» = полностью оплачено ИЛИ есть привязанная транзакция.
+      // paidFull + noPay = attendedPriced (взаимодополняют → проценты сходятся).
+      const hasPayTrace = r.paid_full === 1 || (byRecord ? (byRecord.get(r.id) || 0) : 0) > 0;
+      if (hasPayTrace) a.paidFull++;
+      else a.noPay++; // визит был, услуга платная, следов оплаты нет → проверить кассу
+    }
   }
   for (const a of by.values()) {
     a.topServices = Object.entries(a.services).sort((x, y) => y[1] - x[1]).slice(0, 3).map((e) => e[0]);
     a.avgCheck = a.revenue && a.paidVisits ? Math.round(a.revenue / a.paidVisits) : null;
     a.discount = a.priceFull > 0 ? Math.round((1 - a.pricePay / a.priceFull) * 100) : null;
   }
+  const sum = (k) => [...by.values()].reduce((s, a) => s + (a[k] || 0), 0);
   return { ...agg, admins: [...by.values()].sort((x, y) => y.total - x.total), auto, money: txn || null,
+    noPay: sum('noPay'), paidFull: sum('paidFull'), attendedPriced: sum('attendedPriced'), // дисциплина оплаты по студии
     recordsTruncated: !!(records && records.truncated) }; // журнал обрезан потолком выгрузки (honesty WS-1)
 }
 
@@ -1947,24 +1967,28 @@ function formatAdminReport(label, range, funnel) {
   if (resolved === 0) lines.push(`Доходимость: — (все ${f.waiting} визитов ещё впереди)`);
   else if (f.waiting > resolved) lines.push(`Доходимость (по ${resolved} состоявшимся): ${reach}% · ещё ${f.waiting} впереди`);
   else lines.push(`Доходимость: ${reach}% · неявка ${100 - reach}%`);
-  // Деньги компании за период: курсы (товары) vs услуги.
+  // Деньги — ТОЛЬКО агрегат студии (на кассира не атрибутируются: курсы ≈89% не привязаны
+  // к записи record_id=0, кассир в чеке Altegio не указан). Курсы vs услуги.
   if (f.money && f.money.total) {
-    lines.push(`💰 Выручка периода: ${fmtTg(f.money.total)}₸ (курсы ${pct(f.money.goods, f.money.total)}% · услуги ${pct(f.money.service, f.money.total)}%)`);
+    lines.push(`💰 Выручка студии: ${fmtTg(f.money.total)}₸ (курсы ${pct(f.money.goods, f.money.total)}% · услуги ${pct(f.money.service, f.money.total)}%) — на кассира не делится`);
   }
-  // По администраторам — расширенно (2–3 строки на каждого).
+  // Визиты без следа оплаты по студии — сигнал проверить кассу (не обвинение).
+  if (f.noPay) lines.push(`⚠️ Визитов без следа оплаты: ${f.noPay} — проверьте кассу (возможна оплата курсом/наличными вне привязки)`);
+  // По администраторам — операционка + ДИСЦИПЛИНА (честно атрибутируется автору записи).
   if (f.admins.length) {
     lines.push('');
     lines.push('По администраторам:');
     for (const a of f.admins.slice(0, 10)) {
       const ar = pct(a.attended, a.attended + a.noshow);
       lines.push(`• ${a.name} — ${a.total} зап · дошли ${a.attended}/неявка ${a.noshow} · доход. ${ar != null ? ar + '%' : '—'}`);
-      const money = [];
-      if (a.revenue) money.push(`💰 услуг ${fmtTg(a.revenue)}₸`);
-      if (a.avgCheck) money.push(`ср.чек ${fmtTg(a.avgCheck)}₸`);
-      if (a.discount != null) money.push(`скидка ${a.discount}%`);
-      if (money.length) lines.push(`   ${money.join(' · ')}`);
+      const disc = [];
+      if (a.attendedPriced) disc.push(`оплачено ${pct(a.paidFull, a.attendedPriced)}% платных визитов`);
+      disc.push(`подтв. ${pct(a.confirmed, a.total)}%`);
+      if (a.noPay) disc.push(`⚠️ без оплаты ${a.noPay}`);
+      lines.push(`   ${disc.join(' · ')}`);
       const extra = [];
-      if (a.zeroSvc) extra.push(`0₸-записей ${pct(a.zeroSvc, a.total)}%`);
+      if (a.discount != null) extra.push(`скидка ${a.discount}%`);
+      if (a.zeroSvc) extra.push(`0₸ ${pct(a.zeroSvc, a.total)}%`);
       if (a.topServices && a.topServices.length) extra.push(`топ: ${a.topServices.join(', ')}`);
       if (extra.length) lines.push(`   ${extra.join(' · ')}`);
     }
@@ -1974,7 +1998,7 @@ function formatAdminReport(label, range, funnel) {
     lines.push(`🤖 Авто/онлайн-запись: ${f.auto.total} (дошли ${f.auto.attended}/неявка ${f.auto.noshow})`);
   }
   lines.push('');
-  lines.push('ℹ️ Записи — по дате оформления (вкл. повторных). «Выручка услуг» — привязанные оплаты (часть транзакций); деньги за курс атрибутируются мастеру, не админу. «0₸» = консультации/отработка курса/услуга не проставлена. Скидка = прайс vs к оплате.');
+  lines.push('ℹ️ Записи — по дате оформления (вкл. повторных). Доходимость — ВМЕНЁННАЯ кассиру (приход зависит и от обзвона ОП/бота), не повод для санкций; отмена и неявка в Altegio неразличимы. Деньги кассиру НЕ атрибутируются (курсы ≈89% не привязаны к записи, кассир в чеке не указан) — выручка только по студии. «Оплачено %» и «подтв. %» — по записям этого автора. «Без оплаты» = визит был, следов оплаты в записи нет (проверить кассу). «0₸» = консультации/отработка.');
   return lines.join('\n');
 }
 

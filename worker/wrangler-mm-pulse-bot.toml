@@ -60,6 +60,7 @@ KEV_DM_OVERDUE_MIN = "120"              # просрочка сверх SLA (м�
 #   wrangler secret put INTERNAL_PHONES    --config worker/wrangler-mm-pulse-bot.toml
 #   wrangler secret put INTERNAL_NAMES     --config worker/wrangler-mm-pulse-bot.toml  (имена внутр. контактов без телефона, напр. владелец в IG)
 #   wrangler secret put ADMIN_IDS          --config worker/wrangler-mm-pulse-bot.toml
+#   wrangler secret put OWNER_ID           --config worker/wrangler-mm-pulse-bot.toml  (опц.: TG id ВЛАДЕЛЬЦА для чувствительных алертов «только лично» — визит без оплаты, удаления задним числом, скидки. Если не задан — берётся первый из ADMIN_IDS)
 #   --- Altegio (кнопка «Администраторы», только чтение журнала записей) ---
 #   значения секретов — в worker/pulse-deploy.local.txt (gitignored):
 #   wrangler secret put ALTEGIO_PARTNER_TOKEN  --config worker/wrangler-mm-pulse-bot.toml
