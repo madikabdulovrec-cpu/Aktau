@@ -127,6 +127,12 @@ const ownerIds = (env) => {
   const a = [...adminIds(env)];
   return a.length ? [a[0]] : [];
 };
+// Чувствительный алерт ТОЛЬКО владельцу лично (не в группу) — WS-3: деньги/удаления/скидки.
+async function sendOwner(env, text) {
+  for (const id of ownerIds(env)) {
+    await tgCall(env, 'sendMessage', { chat_id: id, text, disable_web_page_preview: true });
+  }
+}
 // seed-список из env.SELLERS — только если KV пуст (миграция/первый запуск).
 const seedSellers = (env) => String(env.SELLERS || '').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -502,6 +508,14 @@ export default {
       return json({ ok: true, hours, result: nb || { error: 'нет owner-токена или Altegio недоступен' } });
     }
 
+    // [ТЕСТ] контроль администраторов (снапшот-дифф) — GET ?adminctl=<DIGEST_SECRET>.
+    // Первый запуск только сохранит снимок; на следующих — дифф + алерт владельцу, если есть исчезнувшие.
+    if (env.DIGEST_SECRET && url.searchParams.get('adminctl') === env.DIGEST_SECRET) {
+      const snap = await runAdminControl(env, Date.now()).catch((e) => ({ error: String((e && e.message) || e) }));
+      const latest = await env.PULSE_KV.get('admin:snap:latest', { type: 'json' });
+      return json({ ok: true, snapshotNow: (snap && snap.count != null) ? { count: snap.count, truncated: snap.truncated } : snap, stored: latest ? latest.count : null });
+    }
+
     // Отчёт за период — GET ?report=<DIGEST_SECRET>&sec=sales|admins&period=day|week|month (тест/ops).
     if (env.DIGEST_SECRET && url.searchParams.get('report') === env.DIGEST_SECRET) {
       const sec = url.searchParams.get('sec') || 'sales';
@@ -787,6 +801,11 @@ async function runDigest(env, meta) {
     // и алертит владельцев. Каждый тик, до «тихой» ветки. Сбой не роняет дайджест.
     try { await maybeBreakerPause(env, now); }
     catch (e) { console.error('[breaker] failed:', e && e.message); }
+
+    // Контроль администраторов (WS-3): снапшот-дифф журнала Altegio (удаление задним
+    // числом). Алерты — только владельцу лично. Best-effort: сбой не роняет дайджест.
+    try { await runAdminControl(env, now); }
+    catch (e) { console.error('[admctl] failed:', e && e.message); }
 
     // «Тихо»: за 3 часа ничего нового и нет зависших — короткая строка, без LLM.
     if (!isFinal && metrics.deltaLeads === 0 && metrics.unanswered.length === 0) {
@@ -1993,6 +2012,7 @@ function formatAdminReport(label, range, funnel, discLimit) {
   if (f.admins.length) {
     lines.push('');
     lines.push('По администраторам:');
+    if (f.recordsTruncated) lines.push('(⚠️ журнал обрезан потолком выгрузки — per-admin цифры неполные, сравнивать осторожно)');
     for (const a of f.admins.slice(0, 10)) {
       const ar = pct(a.attended, a.attended + a.noshow);
       lines.push(`• ${a.name} — ${a.total} зап · дошли ${a.attended}/неявка ${a.noshow} · доход. ${ar != null ? ar + '%' : '—'}`);
@@ -2040,6 +2060,81 @@ async function buildAdminReport(env, period, now, custom) {
   // Порог скидки правится без деплоя через KV cfg:discount_limit; дефолт 60% (норма студии — пробное −50%).
   const discLimit = parseInt(await env.PULSE_KV.get('cfg:discount_limit'), 10) || 60;
   return formatAdminReport(label, range, funnel, discLimit);
+}
+
+/* ── Контроль администраторов: снапшот-дифф журнала (WS-3, #11) ──────────────────
+ * Раз в час снимаем компактный снимок записей на окно ВИЗИТА (вчера..завтра, по
+ * start_date/end_date) в KV admin:snap:latest (предыдущий → :prev). Дифф ловит
+ * записи, которые ИСЧЕЗЛИ из журнала ПОСЛЕ того, как их визит прошёл — возможное
+ * удаление задним числом (скрытие неявки/отмены постфактум). Self-check: если объём
+ * упал >30% — подозрение на сбой выгрузки, дифф ПОДАВЛЯЕМ (первая ложная тревога
+ * похоронит доверие). Алерты — ТОЛЬКО владельцу лично (sendOwner), с дедупом. */
+async function fetchVisitSnapshot(env, token, fromDate, toDate) {
+  const co = env.ALTEGIO_COMPANY_ID;
+  if (!co || !token) return null;
+  const H = altegioHeaders(token, env);
+  const snap = {}; let truncated = false;
+  for (let page = 1; page <= 25; page++) {
+    let r;
+    try { r = await fetch(`${ALTEGIO_API}/records/${co}?start_date=${fromDate}&end_date=${toDate}&count=200&page=${page}`, { headers: H }); }
+    catch (e) { console.error('[admctl] snap error:', e && e.message); return null; }
+    if (!r.ok) { console.error('[admctl] snap', r.status); if (page === 1) return null; break; }
+    const arr = ((await r.json().catch(() => null)) || {}).data || [];
+    if (!Array.isArray(arr) || !arr.length) break;
+    for (const rec of arr) {
+      if (!rec || rec.id == null) continue;
+      const svcs = rec.services || [];
+      const ph = norm10(rec.client && rec.client.phone);
+      snap[rec.id] = {
+        dt: rec.datetime || rec.date || '', att: rec.attendance,
+        uid: rec.created_user_id || 0, del: !!rec.deleted,
+        ph: ph ? '…' + ph.slice(-4) : '', // маска (PII в логи не льём)
+      };
+    }
+    if (arr.length < 200) break;
+    if (page === 25) truncated = true;
+  }
+  return { snap, count: Object.keys(snap).length, truncated };
+}
+
+async function runAdminControl(env, now) {
+  const token = await altegioUserToken(env);
+  if (!token) return;
+  const from = almatyDateStr(now - 86400000), to = almatyDateStr(now + 86400000); // окно визитов вчера..завтра
+  const fromMs = almatyTimeTs(from, 0); // начало окна — чтобы отличить «исчезла» от «состарилась за окно»
+  const cur = await fetchVisitSnapshot(env, token, from, to);
+  if (!cur) { console.error('[admctl] снимок не получен — тик пропущен'); return; }
+  const prev = await env.PULSE_KV.get('admin:snap:latest', { type: 'json' });
+  // Self-check: резкое падение объёма → возможен сбой выгрузки, дифф подавляем и снимок НЕ сдвигаем.
+  if (prev && prev.count > 5 && cur.count < prev.count * 0.7) {
+    console.warn(`[admctl] объём ${prev.count}→${cur.count} (−${Math.round((1 - cur.count / prev.count) * 100)}%), дифф пропущен`);
+    return;
+  }
+  if (prev && prev.snap) {
+    const alerted = new Set((await env.PULSE_KV.get('admin:snap:alerted', { type: 'json' })) || []);
+    const gone = [];
+    for (const [id, p] of Object.entries(prev.snap)) {
+      if (cur.snap[id] || alerted.has(id) || p.del) continue;     // ещё есть / уже алертили / была удалена
+      const visitTs = parseAltegioCreateTs(p.dt);
+      // визит ПРОШЁЛ и ещё внутри текущего окна (не «состарился» за его пределы) → реально исчезла.
+      // Будущие визиты, исчезнувшие, — это обычная отмена, НЕ «задним числом» (visitTs<now отсекает).
+      if (visitTs != null && visitTs >= fromMs && visitTs < now) gone.push({ id, p });
+    }
+    if (gone.length) {
+      let users = {}; try { users = await fetchAltegioUsers(env, token); } catch (_) { /* фоллбэк ADMIN_NAMES */ }
+      const nm = (uid) => users[uid] || ADMIN_NAMES[uid] || (uid ? `#${uid}` : 'не указан');
+      const lines = ['🚨 Записи исчезли из журнала ПОСЛЕ визита (возможное удаление задним числом):'];
+      for (const g of gone.slice(0, 10)) { lines.push(`• ${fmtRecDatetime(g.p.dt)} · ${nm(g.p.uid)} · отметка ${g.p.att} · тел ${g.p.ph || '—'}`); alerted.add(g.id); }
+      if (gone.length > 10) lines.push(`…и ещё ${gone.length - 10}`);
+      lines.push('Проверьте в Altegio — это могло скрыть неявку/отмену постфактум.');
+      await sendOwner(env, lines.join('\n'));
+      await env.PULSE_KV.put('admin:snap:alerted', JSON.stringify([...alerted].slice(-500)), { expirationTtl: 7 * 86400 });
+      console.log(`[admctl] алерт владельцу: исчезло ${gone.length} записей`);
+    }
+    await env.PULSE_KV.put('admin:snap:prev', JSON.stringify(prev), { expirationTtl: 3 * 86400 });
+  }
+  await env.PULSE_KV.put('admin:snap:latest', JSON.stringify(cur), { expirationTtl: 3 * 86400 });
+  return cur;
 }
 
 /* ============================================================
