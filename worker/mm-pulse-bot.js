@@ -1928,13 +1928,14 @@ function isAutoCreator(name) {
 function computeAdminFunnel(records, usersMap, txn) {
   const byRecord = (txn && txn.byRecord) || null;
   const by = new Map();
-  const agg = { total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0 };
+  const agg = { total: 0, confirmed: 0, attended: 0, noshow: 0, waiting: 0, confirmedVisit: 0 };
   const auto = { total: 0, attended: 0, noshow: 0, waiting: 0 };
   for (const r of records) {
     if (!r || r.deleted) continue;
     const att = r.attendance === 1 ? 'attended' : r.attendance === -1 ? 'noshow' : 'waiting';
     agg.total++; agg[att]++;
     if (r.confirmed === 1) agg.confirmed++;
+    if (r.attendance === 2) agg.confirmedVisit++; // клиент подтвердил приход (из «ждут») — #12
     const uid = r.created_user_id || 0;
     const name = (usersMap && usersMap[uid]) || ADMIN_NAMES[uid] || (uid ? `#${uid}` : 'не указан');
     if (uid === 0 || isAutoCreator(name)) { auto.total++; auto[att]++; continue; }
@@ -1990,7 +1991,7 @@ function formatAdminReport(label, range, funnel, discLimit) {
   const resolved = f.attended + f.noshow;                 // визиты с финальным исходом (пришёл/нет)
   const reach = pct(f.attended, resolved);                // доходимость среди разрешённых (1/-1)
   const bits = [`📝 записей ${f.total}`, `✅ дошли ${f.attended}`, `❌ неявка ${f.noshow}`];
-  if (f.waiting) bits.push(`⏳ ждут ${f.waiting}`);
+  if (f.waiting) bits.push(`⏳ ждут ${f.waiting}${f.confirmedVisit ? ` (подтвердили ${f.confirmedVisit})` : ''}`);
   lines.push(bits.join(' · '));
   if (f.recordsTruncated) lines.push('⚠️ данные неполные: журнал записей обрезан потолком выгрузки — цифры занижены, сузьте период');
   // Доходимость честна только когда визиты состоялись; если большинство впереди — помечаем «предварительно».
