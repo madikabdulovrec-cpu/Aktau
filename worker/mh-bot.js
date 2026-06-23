@@ -829,6 +829,33 @@ export default {
       if (env.WEBHOOK_SECRET && url.searchParams.get('clientlookup') === env.WEBHOOK_SECRET) {
         return json({ ok: true, result: await altegioClientLookup(env, url.searchParams.get('phone') || '') });
       }
+      // Ops: dry-run напоминаний за сутки — кого бот напомнил бы СЕЙЧАС (без
+      // отправки) — GET ?confirmtest=<WEBHOOK_SECRET>.
+      if (env.WEBHOOK_SECRET && url.searchParams.get('confirmtest') === env.WEBHOOK_SECRET) {
+        const now = almatyNow();
+        const inWindow = now.hour >= CONFIRM_HOUR_START && now.hour < CONFIRM_HOUR_END;
+        const preflight = confirmPreflightOk(env);
+        const tomorrowStr = ymdDaysAhead(now, 1);
+        const records = await fetchTomorrowRecordsSafe(env, tomorrowStr);
+        if (records === null) {
+          return json({ ok: false, error: 'altegio_fetch_failed', preflight, inWindow, tomorrow: tomorrowStr });
+        }
+        const candidates = await collectConfirmCandidates(env, records, now);
+        return json({
+          ok: true,
+          now: `${now.ymd} ${String(now.hour).padStart(2, '0')}:${String(now.minute).padStart(2, '0')}`,
+          window: `${CONFIRM_HOUR_START}:00–${CONFIRM_HOUR_END}:00`,
+          inWindow, preflight,
+          tomorrow: tomorrowStr,
+          tomorrowRecords: records.length,
+          candidates: candidates.length,
+          sample: candidates.slice(0, 12).map((c) => ({
+            phone: maskPhone(c.phone),
+            appt: c.parts ? `${String(c.parts.hour).padStart(2, '0')}:${String(c.parts.minute).padStart(2, '0')}` : '?',
+            name: (c.record && c.record.client && firstName(c.record.client.name)) || '',
+          })),
+        });
+      }
       // Ops: воронка бота за сегодня/вчера — GET ?stats=<WEBHOOK_SECRET>.
       if (env.WEBHOOK_SECRET && url.searchParams.get('stats') === env.WEBHOOK_SECRET) {
         const n = almatyNow();
