@@ -370,9 +370,14 @@ const SYSTEM_PROMPT = `# КТО ТЫ
 - Клиент просит ОТМЕНИТЬ уже существующую запись («хочу отменить запись», «не смогу прийти», «отмените меня») — поставь тег:
   [[CANCEL_REQUEST]]
   Система сама найдёт запись клиента, предложит перенос или отмену и всё оформит. В тексте — короткая тёплая фраза («Поняла, секунду 🌷»); дату, время и детали записи НЕ называй (их подставит система).
-- Клиент просит ПЕРЕНЕСТИ запись на другой день/время («перенесите меня», «можно перенести на воскресенье», «давайте на другой день») — поставь тег:
+- УЖЕ ЗАПИСАННЫЙ клиент хочет на ДРУГОЙ день/время — поставь тег:
   [[RESCHEDULE_REQUEST]]
-  Система найдёт запись, покажет реальные свободные окна и перенесёт (консультацию — сама; процедуру/курс — передаст администратору). Если клиент назвал день («на воскресенье») — это ок, система учтёт. В тексте — короткая тёплая фраза («Поняла, секунду 🌷»); конкретные день/время НЕ называй (подставит система).
+  Это перенос ДАЖЕ БЕЗ слова «перенести». Ставь тег, если клиент с записью:
+  • называет другой день/период: «приеду в понедельник», «давайте во вторник», «только в субботу», «на следующей неделе», «после праздников», «можно 28 числа», «попозже на неделе»;
+  • болеет/форс-мажор и придёт ПОЗЖЕ: «болею, приду как поправлюсь», «температура, давайте на той неделе», «в командировке, как вернусь»;
+  • просит другой слот: «можно поменять время», «не получается в этот день», «запишите на другой день».
+  НЕ перенос (НЕ ставь тег): «приду / буду / да» без другого дня (это подтверждение); «опоздаю на 15 минут», «задержусь» (придёт в тот же день); «болею, не приду совсем» (это [[CANCEL_REQUEST]]).
+  Система найдёт запись, покажет реальные свободные окна того же мастера и перенесёт САМА (любую услугу; нет окон — передаст администратору). В тексте — короткая тёплая фраза («Поняла, секунду 🌷»); конкретные день/время НЕ называй (подставит система).
 Если события нет — тег не ставь. Старый формат [[BOOKING | … | …]] не используй.
 
 # АВТО-ЗАПИСЬ НА КОНСУЛЬТАЦИЮ (через систему — ты время НЕ называешь)
@@ -1089,28 +1094,73 @@ async function processMessage(msg, env) {
     }
     let pending = null;
     try { pending = JSON.parse(pendingRaw); } catch (_) { pending = null; }
-    const kind = classifyConfirmationResponse(msg.text);
     await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
-    if (kind === 'yes' || kind === 'no') {
-      await handleConfirmationResponse(env, msg, kind, pending);
-    } else if (arrivalWithinTolerance(msg.text, pending && pending.apptMin,
-      Number(env.CONFIRM_LATE_TOLERANCE_MIN) || 10) || isLateButComing(msg.text)) {
-      // Назвал время прихода в пределах допуска ИЛИ «опоздаю/задержусь» — клиент
-      // ВСЁ РАВНО придёт. Подтверждаем, менеджера НЕ дёргаем.
+
+    // Распознаём интент глубоко (перенос/болезнь/отмена/подтверждение/опоздание).
+    // sameBookedDay: клиент назвал ИМЕННО день записи («завтра же, да?») — не перенос.
+    const nowR = almatyNow();
+    const horizonR = parseInt(env.AUTOBOOK_HORIZON_DAYS, 10) || AUTOBOOK_HORIZON_DEFAULT;
+    let bookedYmd = '';
+    if (pending && pending.apptDate) {
+      const apb = parseAltegioParts(pending.apptDate);
+      if (apb) bookedYmd = `${apb.year}-${String(apb.month).padStart(2, '0')}-${String(apb.day).padStart(2, '0')}`;
+    }
+    const namedDays = resolveTargetDates(msg.text, nowR, horizonR);
+    const sameBookedDay = !!bookedYmd && namedDays.size > 0 && [...namedDays].every((d) => d === bookedYmd);
+    const ri = classifyReminderIntent(msg.text, { sameBookedDay });
+    const phoneR = (pending && pending.phone) || '';
+
+    if (ri.intent === 'reschedule') {
+      // Бот сам ведёт перенос (любая услуга): находит запись, показывает реальные
+      // окна того же мастера. Нет окон/ошибка → handleRescheduleStart отдаёт админу.
+      await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
+      let rs = { clientText: 'Поняла 🌷 Передаю администратору — поможет с переносом.', handoff: 'перенос' };
+      try { rs = await handleRescheduleStart(env, msg, phoneR); }
+      catch (e) { console.error('reminder reschedule:', e && e.message); }
+      if (rs.clientText) await sendMessage(env, msg, rs.clientText);
+      if (rs.handoff) {
+        if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+        await assignToManager(env, msg);
+        await sendTelegramAlert(env, [
+          `🔁 ПЕРЕНОС (с напоминания) → ${rs.handoff} · ${almatyHHMM()}`,
+          `${phoneR ? fmtPhoneHuman(phoneR) : 'чат №' + msg.userId} · запись #${(pending && pending.recordId) || '—'}`,
+          ri.reason ? `причина: ${ri.reason}` : `«${String(msg.text || '').slice(0, 40)}»`,
+        ].join('\n'));
+      }
+    } else if (ri.intent === 'cancel') {
+      await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
+      if (cancelEnabled(env)) {
+        let cs = { clientText: 'Поняла 🌷 Передаю менеджеру.', found: false, handoff: 'отмена' };
+        try { cs = await handleCancelStart(env, msg, phoneR); }
+        catch (e) { console.error('reminder cancel:', e && e.message); }
+        if (cs.clientText) await sendMessage(env, msg, cs.clientText);
+        if (!cs.found && cs.handoff) {
+          if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+          await assignToManager(env, msg);
+        }
+      } else {
+        await sendMessage(env, msg, 'Поняла, передаю менеджеру — он(а) свяжется и поможет 🤍');
+        if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+        await assignToManager(env, msg);
+      }
+      await sendTelegramAlert(env, [
+        `🔴 ОТМЕНА/«не приду» (с напоминания) · ${almatyHHMM()}`,
+        `${phoneR ? fmtPhoneHuman(phoneR) : 'чат №' + msg.userId} · запись #${(pending && pending.recordId) || '—'}`,
+        ri.reason ? `причина: ${ri.reason}` : `«${String(msg.text || '').slice(0, 40)}»`,
+      ].join('\n'));
+    } else if (ri.intent === 'confirm' || ri.intent === 'late'
+      || arrivalWithinTolerance(msg.text, pending && pending.apptMin, Number(env.CONFIRM_LATE_TOLERANCE_MIN) || 10)) {
+      // Подтверждение / опоздание / названо время в пределах допуска — клиент придёт.
       await handleConfirmationResponse(env, msg, 'yes', pending);
     } else if (isAddressQuestion(msg.text)) {
-      // Простой вопрос про адрес/как доехать — отвечаем сами, pending оставляем
-      // активным (клиент ещё может подтвердить). Менеджера не дёргаем.
-      await sendMessage(env, msg, STUDIO_ADDRESS_LINE);
+      await sendMessage(env, msg, STUDIO_ADDRESS_LINE);    // pending оставляем активным
+    } else if (ri.intent === 'question') {
+      await handleConfirmationFollowUp(env, msg, pending); // реальный вопрос → менеджер
     } else if (isPoliteClosing(msg.text)) {
-      // «Спасибо» / 🙏 — вежливое закрытие, менеджера не дёргаем.
       await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
       await sendMessage(env, msg, 'Будем рады видеть вас! 🌷');
-    } else if (isQuestionOrRequest(msg.text)) {
-      await handleConfirmationFollowUp(env, msg, pending);   // реальный вопрос/перенос/отмена → менеджер
     } else {
-      // Неясное/приветствие, НЕ вопрос — мягко переспрашиваем ОДИН раз; второй
-      // раз — тёплое закрытие БЕЗ менеджера (по пустякам не дёргаем).
+      // Неясное/приветствие — мягко переспрашиваем ОДИН раз; второй → тёплое закрытие.
       const rk = `confirm_reprompt:${msg.userId}`;
       if (await env.BOT_KV.get(rk)) {
         await env.BOT_KV.delete(`confirm_pending:user:${msg.userId}`);
@@ -1265,40 +1315,45 @@ async function processMessage(msg, env) {
     const booking = firstPhone ? await altegioUpcomingBooking(env, firstPhone) : null;
     if (booking) {
       await env.BOT_KV.put(seenKey, '1', { expirationTtl: DEDUP_TTL });
-      // Просьба ОТМЕНИТЬ/ПЕРЕНЕСТИ свою запись — отдельный флоу, ДО confirmKind
-      // (классификатор подтверждения трактует «отмена»/«перенос» как «нет»).
-      if (cancelEnabled(env) && isCancelRequest(msg.text)) {
+      // Глубокое распознавание интента (перенос/болезнь/отмена/подтверждение/
+      // опоздание/вопрос). ДО подтверждения — иначе «приеду в понедельник» / «болею»
+      // трактуются как «приду». sameBookedDay: назван ИМЕННО день записи → не перенос.
+      const nowB = almatyNow();
+      const horizonB = parseInt(env.AUTOBOOK_HORIZON_DAYS, 10) || AUTOBOOK_HORIZON_DEFAULT;
+      const apB = parseAltegioParts(booking.date);
+      const bookedYmdB = apB ? `${apB.year}-${String(apB.month).padStart(2, '0')}-${String(apB.day).padStart(2, '0')}` : '';
+      const apptMinB = apB ? apB.hour * 60 + apB.minute : null;
+      const tolMinB = Number(env.CONFIRM_LATE_TOLERANCE_MIN) || 10;
+      const namedB = resolveTargetDates(msg.text, nowB, horizonB);
+      const sameB = !!bookedYmdB && namedB.size > 0 && [...namedB].every((d) => d === bookedYmdB);
+      const riB = classifyReminderIntent(msg.text, { sameBookedDay: sameB });
+
+      if (riB.intent === 'reschedule' && cancelEnabled(env)) {
+        // Бот сам ведёт перенос (любая услуга, тот же мастер).
+        let rs = { clientText: 'Поняла 🌷 Передаю администратору — поможет с переносом.', handoff: 'перенос' };
+        try { rs = await handleRescheduleStart(env, msg, firstPhone); }
+        catch (e) { console.error('booked reschedule:', e && e.message); }
+        await sendMessage(env, msg, rs.clientText);
+        if (rs.handoff) await handleHandoff(env, msg, rs.handoff);
+        console.log(`booked client reschedule ${tag} handoff=${!!rs.handoff}`);
+      } else if (riB.intent === 'cancel' && cancelEnabled(env)) {
         const cs = await handleCancelStart(env, msg, firstPhone);
         await sendMessage(env, msg, cs.clientText);
         if (!cs.found && cs.handoff) await handleHandoff(env, msg, cs.handoff);
-        console.log(`booked client cancel-intent ${tag} found=${cs.found}`);
-        return;
-      }
-      if (cancelEnabled(env) && isRescheduleRequest(msg.text)) {
-        await sendMessage(env, msg,
-          'Хорошо 🌷 Передаю администратору — он(а) подберёт удобное время для переноса и свяжется с вами.');
-        await handleHandoff(env, msg, 'перенос записи');
-        console.log(`booked client reschedule-intent ${tag} -> handoff`);
-        return;
-      }
-      const confirmKind = classifyConfirmationResponse(msg.text);
-      const ap = parseAltegioParts(booking.date);
-      const apptMin = ap ? ap.hour * 60 + ap.minute : null;
-      const tolMin = Number(env.CONFIRM_LATE_TOLERANCE_MIN) || 10;
-      if (confirmKind) {
-        await handleBookedReminderReply(env, msg, confirmKind, booking, firstPhone);
-      } else if (arrivalWithinTolerance(msg.text, apptMin, tolMin) || isLateButComing(msg.text)) {
-        // Назвал время прихода в пределах допуска ИЛИ «опоздаю/задержусь» → придёт.
+        console.log(`booked client cancel ${tag} found=${cs.found}`);
+      } else if (riB.intent === 'confirm' || riB.intent === 'late'
+        || arrivalWithinTolerance(msg.text, apptMinB, tolMinB)) {
         await handleBookedReminderReply(env, msg, 'yes', booking, firstPhone);
       } else if (isAddressQuestion(msg.text)) {
-        // Простой вопрос про адрес — отвечаем сами, менеджера не дёргаем.
         await sendMessage(env, msg, STUDIO_ADDRESS_LINE);
         console.log(`booked client address-q ${tag}`);
       } else if (isPoliteClosing(msg.text)) {
-        // «Спасибо» / 🙏 — вежливое закрытие, БЕЗ передачи менеджеру.
         await sendMessage(env, msg, 'Будем рады видеть вас! 🌷');
         console.log(`booked client polite-closing ${tag}`);
-      } else if (isQuestionOrRequest(msg.text)) {
+      } else if (riB.intent === 'reschedule' || riB.intent === 'cancel') {
+        // Перенос/отмена, но фича выключена → администратору.
+        await handleBookedReminderReply(env, msg, 'no', booking, firstPhone);
+      } else if (riB.intent === 'question') {
         await sendMessage(env, msg,
           'Вы уже записаны к нам 🌷 Передаю администратору — он(а) свяжется и поможет с вашей записью.');
         if (msg.userId) {
@@ -1306,8 +1361,7 @@ async function processMessage(msg, env) {
         }
         console.log(`booked client question ${tag} -> handoff`);
       } else {
-        // Неясное/приветствие — мягко переспрашиваем ОДИН раз; второй раз —
-        // тёплое закрытие БЕЗ менеджера (по пустякам не дёргаем).
+        // Неясное/приветствие — мягкий переспрос ОДИН раз; второй → тёплое закрытие.
         const rk = `confirm_reprompt:${msg.userId}`;
         if (await env.BOT_KV.get(rk)) {
           await env.BOT_KV.delete(rk);
@@ -1439,8 +1493,8 @@ async function processMessage(msg, env) {
       }
     }
 
-    // Просьба ПЕРЕНЕСТИ запись (тег от Claude). Консультацию бот переносит САМ
-    // (показывает реальные новые окна Altegio), процедуру/курс → администратору.
+    // Просьба ПЕРЕНЕСТИ запись (тег от Claude). Бот переносит ЛЮБУЮ услугу САМ
+    // (тот же мастер, реальные новые окна Altegio); нет окон/ошибка → администратору.
     // Решение клиента (день → выбор слота) ловит reschedule_pending на след. ходах.
     if (parsed.rescheduleRequest && !parsed.cancelRequest && !autobookHandled) {
       try {
@@ -2295,8 +2349,8 @@ function parseControlTags(text) {
   const cancelRe = /\[\[\s*CANCEL_REQUEST\s*(?:\|[\s\S]*?)?\]\]/gi;
   if (cancelRe.test(text)) cancelRequest = true;
 
-  // [[RESCHEDULE_REQUEST]] — клиент просит ПЕРЕНЕСТИ запись. Код находит запись:
-  // консультацию бот переносит сам (показывает реальные новые окна), процедуру/курс
+  // [[RESCHEDULE_REQUEST]] — клиент просит ПЕРЕНЕСТИ запись. Код находит запись и
+  // переносит ЛЮБУЮ услугу сам (тот же мастер, реальные новые окна); нет окон/ошибка
   // — отдаёт администратору.
   const reschedRe = /\[\[\s*RESCHEDULE_REQUEST\s*(?:\|[\s\S]*?)?\]\]/gi;
   if (reschedRe.test(text)) rescheduleRequest = true;
@@ -2617,7 +2671,8 @@ async function handleCancelStart(env, msg, phone) {
   await env.BOT_KV.put(`cancel_pending:${msg.userId}`, JSON.stringify({
     recordId: rec.recordId, datetime: rec.datetime, ms: rec.ms,
     hhmm: rec.hhmm, human, service: rec.serviceTitle || '', phone, at: Date.now(),
-    serviceId: rec.serviceId || '', staffId: rec.staffId || '', clientName: rec.clientName || '',
+    serviceId: rec.serviceId || '', staffId: rec.staffId || '', staffName: rec.staffName || '',
+    clientName: rec.clientName || '',
   }), { expirationTtl: CANCEL_PENDING_TTL });
   await env.BOT_KV.delete(`cancel_reprompt:${msg.userId}`);
   await bumpStat(env, 'cancel_req');
@@ -2643,11 +2698,13 @@ async function handleCancelDecision(env, msg, pending) {
   if (decision === 'reschedule') {
     await env.BOT_KV.delete(`cancel_reprompt:${msg.userId}`);
     await bumpStat(env, 'reschedule_req');
-    // Консультацию бот переносит САМ (реальные новые окна Altegio); процедуру/курс
-    // — администратору (другие услуги/мастера/кабинеты, безопасно сам не подберёт).
-    if (isConsultService(env, pending.serviceId) && autobookEnabled(env, almatyNow())) {
+    // Бот переносит САМ любую услугу (тот же мастер, реальные новые окна Altegio).
+    // Нет окон / фича выключена → buildRescheduleStart вернёт handoff администратору.
+    if (rescheduleByBotEnabled(env)) {
       const r = await buildRescheduleStart(env, msg, {
         oldRecordId: pending.recordId, phone: pending.phone, fullname: pending.clientName || '',
+        serviceId: pending.serviceId, staffId: pending.staffId, staffName: pending.staffName,
+        serviceTitle: pending.service,
         oldHuman: pending.human, oldHhmm: pending.hhmm, dayText: msg.text,
       });
       await sendMessage(env, msg, r.clientText);
@@ -2666,7 +2723,7 @@ async function handleCancelDecision(env, msg, pending) {
       'Хорошо 🌷 Передаю администратору — он(а) подберёт удобное время для переноса и свяжется с вами.');
     if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
     await sendTelegramAlert(env, [
-      `🔁 ЗАПРОС ПЕРЕНОСА (процедура — бот не переносит) · ${almatyHHMM()}`,
+      `🔁 ЗАПРОС ПЕРЕНОСА (бот выключен) · ${almatyHHMM()}`,
       `${fmtPhoneHuman(pending.phone)} · запись ${pending.human} ${pending.hhmm}`
         + `${pending.service ? ` · ${pending.service}` : ''}`,
       `Altegio record #${pending.recordId}`,
@@ -2759,8 +2816,13 @@ async function buildRescheduleStart(env, msg, ctx) {
       JSON.stringify({ ...ctx, awaiting: 'day', at: now.ms }), { expirationTtl: CANCEL_PENDING_TTL });
     return { clientText: 'На какой день удобно перенести? Подберу свободное время 🌷' };
   }
+  // Окна ТОГО ЖЕ мастера по ТОЙ ЖЕ услуге, что в записи (для консультации
+  // serviceId/staffId тоже из записи — поведение прежнее). Нет staffId → дефолт.
+  const staffMap = ctx.staffId
+    ? new Map([[String(ctx.staffId), ctx.staffName || `#${ctx.staffId}`]])
+    : undefined;
   let slots = [];
-  try { slots = await fetchConsultSlots(env, { dayHint: ctx.dayText }); }
+  try { slots = await fetchConsultSlots(env, { dayHint: ctx.dayText, serviceId: ctx.serviceId, staffMap }); }
   catch (e) { console.error('reschedule slots:', e && e.message); }
   if (!slots.length) {
     await env.BOT_KV.delete(`reschedule_pending:${msg.userId}`);
@@ -2774,15 +2836,23 @@ async function buildRescheduleStart(env, msg, ctx) {
     + `\n\nКакой вариант удобнее? Ответьте номером (${slots.map((s) => s.ref).join(', ')}).` };
 }
 
-// Вход по тегу [[RESCHEDULE_REQUEST]] (прямая просьба «перенесите»). Возвращает
-// {clientText, handoff} — шлёт processMessage. Консультацию ведёт сам, иначе → админ.
+// Перенос ботом активен? Токены Altegio есть + kill-switch (RESCHEDULE_BY_BOT≠0).
+// 24/7 (в отличие от авто-записи): отвечаем на явную просьбу клиента в любое время.
+function rescheduleByBotEnabled(env) {
+  return String(env.RESCHEDULE_BY_BOT || '1') !== '0'
+    && !!env.ALTEGIO_PARTNER_TOKEN && !!env.ALTEGIO_USER_TOKEN && !!env.ALTEGIO_COMPANY_ID;
+}
+
+// Вход по тегу [[RESCHEDULE_REQUEST]] / интенту переноса. Возвращает
+// {clientText, handoff} — шлёт вызывающий. Бот переносит ЛЮБУЮ услугу сам
+// (тот же мастер, реальные новые окна Altegio); нет окон/ошибка → администратору.
 async function handleRescheduleStart(env, msg, phone) {
   phone = normalizePhone(phone) || String(phone || '').replace(/\D/g, '');
   if (!phone) {
     return { handoff: 'перенос: нет телефона',
       clientText: 'Поняла 🌷 Передаю администратору — поможет с переносом записи.' };
   }
-  if (!cancelEnabled(env)) {
+  if (!rescheduleByBotEnabled(env)) {
     return { handoff: 'перенос записи (ручной)',
       clientText: 'Поняла 🌷 Передаю администратору — подберёт удобное время для переноса.' };
   }
@@ -2794,12 +2864,11 @@ async function handleRescheduleStart(env, msg, phone) {
       clientText: 'Не вижу активной записи на ваш номер 🌷 Передаю администратору — проверит и поможет.' };
   }
   await bumpStat(env, 'reschedule_req');
-  if (!isConsultService(env, rec.serviceId) || !autobookEnabled(env, almatyNow())) {
-    return { handoff: 'перенос записи',
-      clientText: 'Хорошо 🌷 Передаю администратору — он(а) подберёт удобное время для переноса и свяжется с вами.' };
-  }
+  // Переносим на ТУ ЖЕ услугу и к ТОМУ ЖЕ мастеру — берём окна именно его.
   return buildRescheduleStart(env, msg, {
     oldRecordId: rec.recordId, phone, fullname: rec.clientName || '',
+    serviceId: rec.serviceId, staffId: rec.staffId, staffName: rec.staffName,
+    serviceTitle: rec.serviceTitle,
     oldHuman: humanizeSlotDate(rec.ms, almatyNow()), oldHhmm: rec.hhmm, dayText: msg.text,
   });
 }
@@ -2865,17 +2934,18 @@ async function doReschedule(env, msg, pending, slot, now) {
   }
   if (phone) await env.BOT_KV.put(lockKey, '1', { expirationTtl: AUTOBOOK_LOCK_TTL });
 
-  // 1) Новая запись (приоритет — не потерять старую при сбое).
-  let result = await createConsultRecord(env, {
+  // 1) Новая запись (приоритет — не потерять старую при сбое). Услуга/мастер — те
+  // же, что в исходной записи (serviceId по умолчанию = консультация, если пусто).
+  const recOpts = {
     phone, fullname: pending.fullname || '', datetime: slot.datetime,
-    staffId: slot.staffId, userId: msg.userId,
-  });
+    staffId: slot.staffId, userId: msg.userId, serviceId: pending.serviceId,
+    comment: `Перенос записи через бота ${kevMarker(env)}`
+      + (pending.serviceTitle ? ` · ${String(pending.serviceTitle).slice(0, 60)}` : ''),
+  };
+  let result = await createConsultRecord(env, recOpts);
   if (!result.ok && (result.networkError || (result.httpStatus >= 500))) {
     await sleep(1500);
-    result = await createConsultRecord(env, {
-      phone, fullname: pending.fullname || '', datetime: slot.datetime,
-      staffId: slot.staffId, userId: msg.userId,
-    });
+    result = await createConsultRecord(env, recOpts);
   }
   if (!result.ok || !result.recordId) {
     if (phone) await env.BOT_KV.delete(lockKey);
@@ -3536,10 +3606,12 @@ function parseTimeWindow(dayHint) {
 // (до maxOffers, сортировка по времени). dayHint: жёсткий фильтр по ВРЕМЕНИ
 // (parseTimeWindow) + жёсткий приоритет конкретного ДНЯ (resolveTargetDates).
 async function fetchConsultSlots(env, opts = {}) {
-  const staff = parseConsultStaff(env);
+  // staffMap/serviceId переданы при ПЕРЕНОСЕ (мастер+услуга записи); по умолчанию —
+  // консультанты + услуга «Консультация» (авто-запись КЭВ).
+  const staff = opts.staffMap instanceof Map ? opts.staffMap : parseConsultStaff(env);
   if (!staff.size) return [];
   const co = env.ALTEGIO_COMPANY_ID;
-  const sid = encodeURIComponent(env.ALTEGIO_CONSULT_SERVICE_ID);
+  const sid = encodeURIComponent(opts.serviceId || env.ALTEGIO_CONSULT_SERVICE_ID);
   const horizon = parseInt(env.AUTOBOOK_HORIZON_DAYS, 10) || AUTOBOOK_HORIZON_DEFAULT;
   const maxOffers = parseInt(env.AUTOBOOK_MAX_OFFERS, 10) || AUTOBOOK_MAX_OFFERS_DEFAULT;
   const now = almatyNow();
@@ -3623,15 +3695,19 @@ async function fetchConsultSlots(env, opts = {}) {
 // {ok:false, networkError:true}.
 async function createConsultRecord(env, opts) {
   const co = env.ALTEGIO_COMPANY_ID;
+  // serviceId по умолчанию — консультация (авто-запись КЭВ); при переносе
+  // передаётся реальная услуга записи (любая процедура).
+  const serviceId = Number(opts.serviceId || env.ALTEGIO_CONSULT_SERVICE_ID);
+  const comment = opts.comment || `Запись через бота (КЭВ-консультация) ${kevMarker(env)}`;
   const body = {
     phone: opts.phone,
     fullname: opts.fullname,
-    comment: `Запись через бота (КЭВ-консультация) ${kevMarker(env)}`,
+    comment,
     api_id: `kev-${opts.userId}-${Date.now()}`,
     appointments: [{
       id: 1,
       staff_id: Number(opts.staffId),
-      services: [Number(env.ALTEGIO_CONSULT_SERVICE_ID)],
+      services: [serviceId],
       datetime: opts.datetime,
     }],
   };
@@ -4551,6 +4627,7 @@ async function persistPending(env, g, firstRecord, sent) {
     phone: g.phone,
     channelUuid: sent.channelUuid,
     apptMin: ap ? ap.hour * 60 + ap.minute : null, // время брони (мин от полуночи) — для допуска опоздания
+    apptDate: firstRecord.date || firstRecord.datetime, // день брони — для сравнения с названным днём (перенос vs «завтра же»)
   }), { expirationTtl: CONFIRM_PENDING_TTL });
 }
 
@@ -4980,6 +5057,132 @@ function buildConfirmationText(partsList, variant) {
 }
 
 // ── Ответ клиента на подтверждение: Да / Нет ───────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
+// РАСПОЗНАВАНИЕ ИНТЕНТА ответа на напоминание (перенос/болезнь/отмена/подтвержд.)
+// Валидировано на корпусе из 153 реальных формулировок (ru+kz+латиница, опечатки).
+// ВАЖНО: \b и \w в JS НЕ работают с кириллицей — границы делаем через классы
+// (?:^|[^а-яёa-zі]) … (?![а-яёa-zі]). Не использовать \b/\w вокруг кириллицы!
+// ════════════════════════════════════════════════════════════════════════════
+const INTENT_NB = '[^а-яёa-zі0-9]';
+
+// Явные слова переноса (устойчивость к опечаткам корня «перенес-»).
+function hasRescheduleWord(t) {
+  return /(перен[еио]с|перенест|перенисит|перинес|перезапи|сдвин|передвин|подвин|поменя[а-яё]*\s*(?:врем|день|дат|запис|час)|поменя[йт]|измен[а-яё]*\s*(?:врем|день|дат)|на\s+друг[а-яё]*\s+(?:день|врем|дат|раз)|в\s+друг[а-яё]*\s+(?:день|врем|раз)|друг[а-яё]*\s+день|запиш[а-яё]*\s+(?:меня\s+)?на\s+друг|ауыстыр|кейінге\s?қалдыр|кейинге\s?калдыр|басқа\s?(?:күн|уақыт|кезге)|баска\s?(?:кун|уакыт)|baska\s?(?:kun|kún|uaqyt|uakyt))/i.test(t);
+}
+
+// Называет КОНКРЕТНЫЙ день/период/сдвиг времени (не «сейчас придёт на запись»).
+function namesDayOrPeriod(t) {
+  t = String(t || '').toLowerCase();
+  if (new RegExp(`(?:^|${INTENT_NB})(?:понедельник[а-яё]*|вторник[а-яё]*|сред[ауыео](?![а-яё])|четверг[а-яё]*|пятниц[а-яё]*|суббот[а-яё]*|воскрес[а-яё]*)`, 'i').test(t)) return true;
+  if (new RegExp(`(?:^|${INTENT_NB})(пн|вт|ср|чт|пт|сб|вс)(?![а-яёa-z])`, 'i').test(t)) return true;
+  if (/(послезавтра|завтра|сегодня)/i.test(t)) return true;
+  if (/(выходн|будни|будн[ия])/i.test(t)) return true;
+  if (/(след(?:ующ[а-яё]*|\.)?\s*недел|на\s+той\s+недел|через\s+недел|через\s+\d+\s*(?:дн|недел)|на\s+этой\s+недел|попозже\s+на\s+недел|в\s+начале\s+(?:недел|месяц|июл|июн|август|сентяб)|в\s+конце\s+недел|ближе\s+к\s+выходн|после\s+праздник|в\s+следующий\s+раз|в\s+друг[а-яё]*\s+раз|как-?нибудь|следующ[а-яё]*\s+сеанс|после\s+возвращени|как\s+верн|когда\s+выздоров|как\s+поправл|через\s+недельк)/i.test(t)) return true;
+  if (/((?:перв|втор)[а-яё]*\s+половин|во\s+второй\s+половин|ближе\s+к\s+вечер|на\s+\d+\s*час[а-яё]*\s+(?:позже|раньше)|на\s+час\s+(?:позже|раньше)|часом\s+(?:позже|раньше)|к\s+вечеру\s+передвин)/i.test(t)) return true;
+  if (/(\d{1,2}\s*-?\s*го(?![а-яё])|\d{1,2}\s*числ|числ[а-яё]*\s*\d{1,2}|\d{1,2}\s*(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентяб|октяб|нояб|декаб)|\b\d{1,2}[.\/]\d{1,2}\b)/i.test(t)) return true;
+  if (/(дүйсенбі|сейсенбі|сәрсенбі|бейсенбі|жұма|сенбі|жексенбі|келесі\s?апта|ертең|кейін|сауығып|сауығ|кейінірек)/i.test(t)) return true;
+  if (new RegExp(`(?:^|${INTENT_NB})(duisenbi|seisenbi|sarsenbi|beisenbi|juma|jeksenbi|erten|keler|keyin)`, 'i').test(t)) return true;
+  return false;
+}
+
+function isIllnessReason(t) {
+  return /(боле[юе]|заболе|приболе|простыл|простуж|простуд|температур|темпратур|температурю|грипп|ковид|covid|недомог|плохо\s+себя\s+чувств|нездоров|сляг|сл[её]г|ауыр|сырқат|сркат)/i.test(t);
+}
+
+function isForceMajeureReason(t) {
+  return /(командировк|в\s+отъезд|уехал|уезжаю|аврал|не\s+отпуска|дела\s+навал|не\s+успева|форс-?мажор|машина\s+сломал|реб[её]нок\s+заболе|срочно\s+вызвал|вызвали\s+на\s+работ|никак\s+не\s+вырват)/i.test(t);
+}
+
+// Хочет прийти ПОЗЖЕ (намерение визита сохраняется).
+function wantsToComeLater(t) {
+  return /(прид[уёе]|прийд|приед|приех|(?:^|[^а-яёa-z])буду(?![а-яё])|подойд|подъед|запиш|жазыл|жазсам|жазайы|боламын|барамын|kel(?:em|ip|edi)?)/i.test(t);
+}
+
+// НЕ придёт совсем.
+function wontComeAtAll(t) {
+  return /(не\s+смогу|не\s+получ(?:ится|у)?(?:\s+(?:прийти|подойти|быть|приехать))?|не\s+приду|не\s+буду\s+приход|никак\s+не\s+доберусь|не\s+доберусь|не\s+выйдет|бара\s?алмай|келе\s?алмай|жаза\s?алмай|kele\s?almai|bara\s?almai)/i.test(t);
+}
+
+function hasCancelWordIntent(t) {
+  return /(отмен(?:и|ить|ите|яю|ю|а|у|её|ее)|отказ(?:ать|аться|ыва|ываюсь|усь)?|удал(?:и|ите|ить)\s+запис|снять\s+запис|\bcancel\b|otmena|бас\s?тарт|болдырма)/i.test(t);
+}
+
+// Мягкий отказ ИМЕННО от записанного дня (без нового дня и без «отмена») = перенос.
+function rejectsBookedDay(t) {
+  return /((?:не\s+(?:получ|могу|выйдет|сложит|удобн)[а-яё]*|никак)[^.!?]{0,18}(?:этот\s+день|в\s+этот\s+день|сегодня|в\s+назначенн|в\s+это\s+время)|не\s+в\s+этот\s+день|в\s+этот\s+раз\s+не|не\s+успе[юе][^.!?]{0,12}(?:к\s+\d|вовремя|к\s+начал))/i.test(t);
+}
+
+// Вопрос (нужен человек) — ru+kz, в т.ч. без «?».
+function isQuestionIntent(t) {
+  if (String(t).indexOf('?') !== -1) return true;
+  return /(во\s?сколько|во\s?скока|сколько\s+стоит|цена|стоит|можно\s+ли|с\s+подруг|с\s+ребёнк|перезвон|позвони|можете\s+позвон|қанша|неше(?:де|ге)?|қашан|неге|қай\s?(?:күн|жер|маст)|бола\s?ма|болады\s?ма|qansha|qashan|qai\s?kun|qai\s?kuni|nese)/i.test(t);
+}
+
+// Опоздание (тот же день, позже) — без переноса/отмены/другого дня.
+function isLateButComingIntent(t) {
+  t = String(t || '').toLowerCase();
+  if (t.length > 90) return false;
+  return /(опозда|задерж|чуть\s+позже|немного\s+позже|по-?позже|буд[уе]\s+позже|приед[уе][^.!?]{0,18}позже|приду\s+позже|позже\s+чем\s+договар|на\s+\d+\s*мин(?:ут[а-яё]*)?\s*позже|минут[а-яё]*\s+на\s+\d+|позже\s+на\s+\d+|кешіг|кешік|keship|keshik|пробк)/i.test(t)
+    && !hasRescheduleWord(t) && !hasCancelWordIntent(t) && !namesDayOrPeriod(t) && !rejectsBookedDay(t);
+}
+
+// Короткое подтверждение (без знания дня) — да/ок/приду/эмодзи 👍.
+function isPlainConfirmIntent(t) {
+  let s = String(t || '').trim().toLowerCase();
+  if (!s || s.length > 120) return false;
+  if (s.indexOf('?') !== -1) return false;
+  if (/[👎❌✖✗]/u.test(s)) return false;
+  if (/[👍✅☑✔❤🌷👌🙏🤍]/u.test(s)) return true;
+  const words = s.split(/[^a-zа-яёі]+/i).filter(Boolean);
+  const wset = new Set(words);
+  const exact = (arr) => arr.some((x) => wset.has(x));
+  const prefix = (arr) => words.some((w) => arr.some((p) => w.startsWith(p)));
+  if (exact(['да', 'ия', 'иа', 'иә', 'плюс', 'ок', 'окей', 'оке', 'хорошо', 'харош', 'харошо',
+    'конечно', 'приду', 'прийду', 'буду', 'ага', 'угу', 'yes', 'ok', 'еду', 'иду', 'пути',
+    'месте', 'рядом', 'обязательно', 'договорились', 'договорилис', 'бегу', 'подъезжаю', 'выезжаю',
+    'выезжаем', 'барамын', 'боламын', 'келемін', 'келемин', 'келемыз', 'келем', 'келе', 'жатырмын',
+    'жолдамын', 'келеді', 'jane', 'keled', 'keledi', 'kelemin', 'bolamyn', 'baramyn'])
+    || prefix(['подтвержд', 'приед', 'подойд', 'подъед', 'подъезж', 'выезж', 'выех', 'доед', 'добира'])
+    || s === '1' || s === '+' || /(?:^|\s)\+(?:\s|$)/.test(s)) {
+    return true;
+  }
+  return false;
+}
+
+// Оркестратор интента ответа на напоминание о записи.
+// Возвращает {intent: 'confirm'|'reschedule'|'cancel'|'late'|'question'|'other', reason?, dayText?}.
+// ctx (опц.): { sameBookedDay: bool } — клиент ссылается ТОЛЬКО на день записи
+// («завтра же, да?» когда завтра = день брони) → не считать переносом.
+function classifyReminderIntent(text, ctx = {}) {
+  const t = String(text || '').trim();
+  if (!t) return { intent: 'other' };
+  const low = t.toLowerCase();
+  const day = namesDayOrPeriod(low) && !ctx.sameBookedDay;
+  const ill = isIllnessReason(low) || isForceMajeureReason(low);
+  const wont = wontComeAtAll(low);
+  const later = wantsToComeLater(low) && !wont;
+  const exResched = hasRescheduleWord(low);
+  const exCancel = hasCancelWordIntent(low);
+  if (exResched || rejectsBookedDay(low)) {
+    return { intent: 'reschedule', reason: ill ? 'болезнь/форс-мажор' : '', dayText: t };
+  }
+  if (exCancel) {
+    if (later) return { intent: 'reschedule', reason: ill ? 'болезнь/форс-мажор' : '', dayText: t };
+    return { intent: 'cancel', reason: ill ? 'болезнь/форс-мажор' : '' };
+  }
+  if (day) return { intent: 'reschedule', reason: ill ? 'болезнь/форс-мажор' : '', dayText: t };
+  if (isLateButComingIntent(low)) return { intent: 'late' };
+  if (ill) {
+    if (wont) return { intent: 'cancel', reason: 'болезнь/форс-мажор' };
+    if (later) return { intent: 'confirm' };
+    return { intent: 'reschedule', reason: 'болезнь/форс-мажор', dayText: t };
+  }
+  if (wont) return { intent: 'cancel' };
+  if (isQuestionIntent(low)) return { intent: 'question' };
+  if (isPlainConfirmIntent(low)) return { intent: 'confirm' };
+  return { intent: 'other' };
+}
 
 function classifyConfirmationResponse(rawText) {
   if (!rawText) return null;
