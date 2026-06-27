@@ -518,6 +518,13 @@ const VOICE_MODEL_FALLBACK = '@cf/openai/whisper';       // вход — мас�
 const IMAGE_TYPES = ['image', 'photo', 'picture'];
 const IMAGE_MAX_BYTES = 5 * 1024 * 1024;  // лимит Anthropic на изображение
 const IMAGE_MIME_OK = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+// Дедуп ПАЧКИ фото: клиент часто шлёт несколько фото разом, каждое = отдельный
+// вебхук со своим message_id (обычный seen-дедуп их НЕ ловит). Без этого бот
+// отвечал по разу на каждое фото («бот гонит»). Лок выбора «победителя» +
+// cooldown после ответа.
+const VISION_BURST_TTL = 120;       // сек — жизнь лока выбора победителя пачки
+const VISION_BURST_WAIT_MS = 3000;  // мс — окно сбора пачки фото + сходимость KV
+const VISION_DONE_TTL = 60;         // сек — cooldown после ответа (трейлинг-фото молчат)
 // Гайки против медицинских claim'ов + увод на консультацию (см. handleClientImage).
 const VISION_SYSTEM = `Ты — Алия, виртуальный ассистент студии коррекции фигуры и косметологии «Фабрика красивых тел M&M» (Алматы). Клиент прислал своё фото в WhatsApp. Задача: тепло отреагировать и мягко привести на БЕСПЛАТНУЮ консультацию (там мастер с диагностикой даст точный план).
 СТРОГО ЗАПРЕЩЕНО: ставить медицинские диагнозы, называть болезни; обещать или гарантировать результат и сроки; осуждающе оценивать вес/тело; называть конкретные цены/программы; выдумывать процедуры. Точную оценку и план даёт ТОЛЬКО мастер на консультации.
@@ -1049,6 +1056,16 @@ async function processMessage(msg, env) {
         if (await handleClientImage(env, msg)) { console.log(`vision answered ${tag}`); return; }
       } catch (e) { console.error('vision failed:', e && e.message); }
     }
+    // op-паузу ставим ВСЕГДА (дальше ведёт человек). Карточку менеджеру — ОДИН
+    // раз на пачку: видео/стикеры/доки тоже приходят по разу на файл, иначе
+    // менеджер получает дубли. Дубль в окне cooldown гасим (человек уже вызван).
+    if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
+    const cardKey = `media_card:${msg.userId}`;
+    if (msg.userId && await env.BOT_KV.get(cardKey)) {
+      console.log(`media -> manager (дубль карточки погашен) ${tag} type=${mt}`);
+      return;
+    }
+    if (msg.userId) await env.BOT_KV.put(cardKey, '1', { expirationTtl: VISION_DONE_TTL });
     let mphone = null;
     try { mphone = await getContactPhone(env, msg); } catch (_) { /* без телефона */ }
     await sendTelegramAlert(env, [
@@ -1056,7 +1073,6 @@ async function processMessage(msg, env) {
       `Клиент: ${mphone ? fmtPhoneHuman(mphone) : `чат №${msg.userId}`}`,
       'Бот поставил диалог на паузу — откройте вложение в message.help и продолжите.',
     ].join('\n'));
-    if (msg.userId) await env.BOT_KV.put(`op:${msg.userId}`, '1', { expirationTtl: OPERATOR_PAUSE_TTL });
     console.log(`media -> manager ${tag} type=${mt}`);
     return;
   }
@@ -1704,6 +1720,26 @@ function bufToBase64(buf) {
 // если ответил клиенту; false → вызывающий падает на уведомление менеджеру.
 async function handleClientImage(env, msg) {
   if (!msg.fileUrl || !env.ANTHROPIC_API_KEY) return false;
+
+  // Дедуп ПАЧКИ фото — отвечаем ОДИН раз на серию фото, присланных разом.
+  // claim+verify: каждый вызов пишет свой id, ждёт сбор пачки, перечитывает —
+  // отвечает ТОЛЬКО последний writer (KV last-write-wins). Остальные → return true
+  // (обслужено, без карточки менеджеру). После ответа ставим 'done' (cooldown).
+  const burstKey = `vision_burst:${msg.userId}`;
+  const myId = String(msg.messageId || msg.fileUrl || '');
+  if (myId && msg.userId) {
+    const cur = await env.BOT_KV.get(burstKey);
+    if (cur === 'done') { console.log(`vision burst: пачка уже отвечена, skip u${msg.userId}`); return true; }
+    await env.BOT_KV.put(burstKey, myId, { expirationTtl: VISION_BURST_TTL });
+    await sleep(VISION_BURST_WAIT_MS);                  // собрать пачку + дать KV сойтись
+    const owner = await env.BOT_KV.get(burstKey);
+    if (owner === 'done') return true;                  // победитель уже ответил
+    if (owner && owner !== myId) {                      // не я — ответит победитель
+      console.log(`vision burst: не победитель, skip u${msg.userId}`);
+      return true;
+    }
+  }
+
   let buf;
   let mime = '';
   try {
@@ -1752,6 +1788,12 @@ async function handleClientImage(env, msg) {
 
   const sent = await sendMessage(env, msg, reply);
   if (!sent) return false;
+
+  // Пачка обслужена — cooldown, чтобы трейлинг-фото из той же серии не вызвали 2-й ответ.
+  if (msg.userId) {
+    try { await env.BOT_KV.put(`vision_burst:${msg.userId}`, 'done', { expirationTtl: VISION_DONE_TTL }); }
+    catch (_) { /* best-effort */ }
+  }
 
   // История: фиксируем, что был фото-обмен (следующий ход бот ведёт с контекстом).
   try {
