@@ -1229,6 +1229,58 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
   background:#000;
   object-fit: contain;
 }
+
+/* Полоса плейлиста под видео (много частей) */
+.video-playlist-strip {
+  margin-top:12px; padding:14px 18px;
+  background:#fff; border:2px solid rgba(0,0,0,0.08);
+  border-radius:var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.vps-nav {
+  display:flex; align-items:center; justify-content:space-between;
+  gap:12px; margin-bottom:12px;
+}
+.vps-btn {
+  padding:8px 16px; border-radius:var(--radius-pill);
+  background:var(--gray); border:2px solid rgba(0,0,0,0.08);
+  font-family:'Space Grotesk',sans-serif; font-size:12px; font-weight:700;
+  cursor:pointer; transition:all 0.15s; color:var(--black);
+}
+.vps-btn:hover:not([disabled]) { border-color:var(--black); transform:translateY(-1px); }
+.vps-btn[disabled] { opacity:0.4; cursor:not-allowed; }
+.vps-btn-next { background:var(--pink); color:#fff; border-color:var(--pink); }
+.vps-btn-next:hover:not([disabled]) { background:var(--pink-dark, #e01e6c); }
+.vps-label {
+  font-size:13px; color:#666; font-weight:600; text-align:center; flex:1;
+}
+.vps-label strong { color:var(--black); font-family:'Unbounded',sans-serif; font-size:14px; }
+.vps-chips {
+  display:flex; flex-wrap:wrap; gap:6px;
+}
+.vps-chip {
+  width:36px; height:36px; border-radius:10px;
+  background:var(--gray); border:2px solid rgba(0,0,0,0.06);
+  font-family:'Unbounded',sans-serif; font-size:12px; font-weight:800;
+  cursor:pointer; transition:all 0.15s; color:#666;
+  display:flex; align-items:center; justify-content:center;
+}
+.vps-chip:hover { border-color:var(--black); color:var(--black); transform:translateY(-1px); }
+.vps-chip.active {
+  background:var(--pink); color:#fff; border-color:var(--pink);
+  box-shadow: 0 4px 12px rgba(255,45,123,0.35);
+}
+
+@media (max-width:768px) {
+  .video-playlist-strip { padding:12px 14px; margin-top:10px; }
+  .vps-btn { padding:8px 12px; font-size:11px; min-height:44px; }
+  .vps-label { font-size:12px; }
+  .vps-chip { width:32px; height:32px; font-size:11px; }
+  .video-part-badge {
+    top:8px !important; right:8px !important;
+    padding:3px 8px !important; font-size:10px !important;
+  }
+}
 .video-play {
   width:80px; height:80px; border-radius:50%;
   background:var(--pink); color:#fff;
@@ -14063,15 +14115,31 @@ let videoInterval = null;
 let videoProgress = 0;
 
 // ===== LESSON VIDEOS =====
-// Карта {lessonIdx: relativeUrl} — какие уроки имеют MP4-видео.
+// Карта {lessonIdx: 'url' | ['url1','url2',...]} — какие уроки имеют MP4-видео.
 // Файлы должны лежать на Plesk в httpdocs/videos/ рядом с index.html.
-// Индексы берутся из массива LESSONS (0..85). Чтобы добавить видео к новому
-// уроку — загрузить MP4 в httpdocs/videos/ и добавить сюда строку.
+//
+// Значение может быть:
+//   - строка: один MP4-файл (одно видео)
+//   - массив строк: плейлист (стажёр смотрит по частям, авто-переход к
+//     следующей при завершении текущей).
 //
 // Актуальные индексы важных уроков:
-//   40 — Золотое сечение (module 3 «Ручные техники», категория 2 «Вакуумный специалист»)
+//   40 — Золотое сечение (module 3, категория 2 «Вакуумный специалист»)
+//     — 11 частей записи процедуры на iPhone, каждая ~2–7 минут.
 const LESSON_VIDEOS = {
-  40: 'videos/zolotoe-sechenie.mp4',   // Авторская процедура M&M
+  40: [
+    'videos/zolotoe-sechenie/part-01.mp4',
+    'videos/zolotoe-sechenie/part-02.mp4',
+    'videos/zolotoe-sechenie/part-03.mp4',
+    'videos/zolotoe-sechenie/part-04.mp4',
+    'videos/zolotoe-sechenie/part-05.mp4',
+    'videos/zolotoe-sechenie/part-06.mp4',
+    'videos/zolotoe-sechenie/part-07.mp4',
+    'videos/zolotoe-sechenie/part-08.mp4',
+    'videos/zolotoe-sechenie/part-09.mp4',
+    'videos/zolotoe-sechenie/part-10.mp4',
+    'videos/zolotoe-sechenie/part-11.mp4',
+  ],
 };
 
 // Если URL относительный — превратим в абсолютный (одинаково работает
@@ -15800,34 +15868,31 @@ function openMaterial(name) {
 }
 
 // ===== VIDEO =====
+// Состояние плейлиста для многочастевого видео (например «Золотое сечение»
+// — 11 частей). Хранится глобально, потому что onclick-и в плейлисте
+// должны иметь к нему доступ.
+let lessonVideoPlaylist = [];   // список URL
+let lessonVideoCurrentIdx = 0;  // индекс текущей части (0-based)
+let lessonVideoLessonIdx = -1;  // idx урока (для persist прогресса)
+
+// Возвращает список URL для урока (даже если LESSON_VIDEOS[idx] — одна строка).
+function getLessonVideoList(idx) {
+  const v = LESSON_VIDEOS[idx];
+  if (!v) return [];
+  if (typeof v === 'string') return [v];
+  if (Array.isArray(v)) return v.filter(function(u){ return u && isBrowserVideo(u); });
+  return [];
+}
+
 // Рендерит видео-блок урока. Если LESSON_VIDEOS[idx] задан — настоящий
-// <video controls> с MP4-файлом. Иначе — placeholder «скоро появится».
+// <video controls> с MP4-файлом. Для плейлиста добавляется бейдж «Часть N
+// из M» + мини-навигация ниже.
 function renderLessonVideo(idx, lesson, isDone) {
   const host = document.getElementById('videoArea');
   if (!host) return;
 
-  const url = LESSON_VIDEOS[idx];
-  if (url && isBrowserVideo(url)) {
-    // Реальное видео. Прогресс просмотра трекаем через события timeupdate/ended.
-    // При просмотре >= 90% автоматически ставим videoWatched=true и галочку.
-    const resolved = resolveVideoUrl(url);
-    host.classList.add('has-video');
-    host.innerHTML =
-      '<video id="lessonVideoPlayer" controls playsinline preload="metadata" ' +
-        'style="width:100%;height:100%;display:block;background:#000;border-radius:inherit;" ' +
-        'onplay="onLessonVideoPlay()" ' +
-        'ontimeupdate="onLessonVideoTimeupdate(this)" ' +
-        'onended="onLessonVideoEnded()">' +
-        '<source src="' + escapeHtml(resolved) + '" type="video/mp4">' +
-        'Ваш браузер не поддерживает воспроизведение видео.' +
-      '</video>' +
-      '<div class="video-progress" style="position:absolute;bottom:0;left:0;right:0;pointer-events:none;">' +
-        '<div class="video-progress-fill" id="videoProgressFill" style="width:' + (isDone ? 100 : 0) + '%;"></div>' +
-      '</div>' +
-      '<div class="video-title-real" id="videoTitle" style="position:absolute;top:12px;left:14px;background:rgba(0,0,0,0.55);color:#fff;padding:4px 10px;border-radius:8px;font-size:11px;font-weight:700;letter-spacing:0.5px;pointer-events:none;">' +
-        escapeHtml(lesson.title) +
-      '</div>';
-  } else {
+  const list = getLessonVideoList(idx);
+  if (list.length === 0) {
     // Placeholder — старый стиль-плеер, но без fake-прогресса.
     host.classList.remove('has-video');
     host.innerHTML =
@@ -15835,7 +15900,107 @@ function renderLessonVideo(idx, lesson, isDone) {
       '<div class="video-play" id="videoPlay" style="opacity:0.4;cursor:default;">&#127909;</div>' +
       '<div class="video-duration" id="videoDuration">📹 Видео скоро появится</div>' +
       '<div class="video-progress"><div class="video-progress-fill" id="videoProgressFill" style="width:' + (isDone ? 100 : 0) + '%;"></div></div>';
+    // Убираем плейлист-стрип если он был для прошлого урока
+    var oldStrip = document.getElementById('lessonPlaylistStrip');
+    if (oldStrip) oldStrip.remove();
+    return;
   }
+
+  // Устанавливаем плейлист. По умолчанию — часть 1. Если стажёр уже
+  // смотрел этот урок — можно было бы восстановить последнюю часть,
+  // но пока просто начинаем сначала.
+  lessonVideoPlaylist = list;
+  lessonVideoLessonIdx = idx;
+  lessonVideoCurrentIdx = 0;
+
+  renderVideoPlayer(lesson, isDone);
+  renderPlaylistStrip(lesson);
+}
+
+// Рендерит только сам <video> + бейдж «Часть N из M». Вызывается заново
+// при переключении части.
+function renderVideoPlayer(lesson, isDone) {
+  const host = document.getElementById('videoArea');
+  if (!host) return;
+  const list = lessonVideoPlaylist;
+  const curIdx = lessonVideoCurrentIdx;
+  const url = list[curIdx];
+  const resolved = resolveVideoUrl(url);
+  const isMulti = list.length > 1;
+
+  host.classList.add('has-video');
+  host.innerHTML =
+    '<video id="lessonVideoPlayer" controls playsinline preload="metadata" ' +
+      'style="width:100%;height:100%;display:block;background:#000;border-radius:inherit;" ' +
+      'onplay="onLessonVideoPlay()" ' +
+      'ontimeupdate="onLessonVideoTimeupdate(this)" ' +
+      'onended="onLessonVideoEnded()">' +
+      '<source src="' + escapeHtml(resolved) + '" type="video/mp4">' +
+      'Ваш браузер не поддерживает воспроизведение видео.' +
+    '</video>' +
+    '<div class="video-progress" style="position:absolute;bottom:0;left:0;right:0;pointer-events:none;">' +
+      '<div class="video-progress-fill" id="videoProgressFill" style="width:' + (isDone ? 100 : 0) + '%;"></div>' +
+    '</div>' +
+    '<div class="video-title-real" id="videoTitle" style="position:absolute;top:12px;left:14px;background:rgba(0,0,0,0.55);color:#fff;padding:4px 10px;border-radius:8px;font-size:11px;font-weight:700;letter-spacing:0.5px;pointer-events:none;">' +
+      escapeHtml(lesson.title) +
+    '</div>' +
+    (isMulti
+      ? '<div class="video-part-badge" style="position:absolute;top:12px;right:12px;background:var(--pink);color:#fff;padding:4px 10px;border-radius:8px;font-size:11px;font-weight:700;letter-spacing:0.5px;pointer-events:none;">Часть ' + (curIdx + 1) + ' из ' + list.length + '</div>'
+      : ''
+    );
+}
+
+// Мини-навигация под плеером: кнопки «← Пред · Часть N/M · След →» +
+// компактный ряд номеров для быстрого перехода.
+function renderPlaylistStrip(lesson) {
+  const list = lessonVideoPlaylist;
+  if (list.length <= 1) {
+    var oldStrip = document.getElementById('lessonPlaylistStrip');
+    if (oldStrip) oldStrip.remove();
+    return;
+  }
+  var host = document.getElementById('videoArea');
+  if (!host || !host.parentElement) return;
+  var strip = document.getElementById('lessonPlaylistStrip');
+  if (!strip) {
+    strip = document.createElement('div');
+    strip.id = 'lessonPlaylistStrip';
+    strip.className = 'video-playlist-strip';
+    host.parentElement.insertBefore(strip, host.nextSibling);
+  }
+  var cur = lessonVideoCurrentIdx;
+  var prevDisabled = cur <= 0 ? ' disabled' : '';
+  var nextDisabled = cur >= list.length - 1 ? ' disabled' : '';
+
+  var chips = list.map(function(_, i) {
+    var active = i === cur ? ' active' : '';
+    return '<button class="vps-chip' + active + '" onclick="playPlaylistPart(' + i + ')">' + (i + 1) + '</button>';
+  }).join('');
+
+  strip.innerHTML =
+    '<div class="vps-nav">' +
+      '<button class="vps-btn"' + prevDisabled + ' onclick="playPlaylistPart(' + (cur - 1) + ')">&larr; Пред</button>' +
+      '<div class="vps-label">Часть <strong>' + (cur + 1) + '</strong> из ' + list.length + '</div>' +
+      '<button class="vps-btn vps-btn-next"' + nextDisabled + ' onclick="playPlaylistPart(' + (cur + 1) + ')">След &rarr;</button>' +
+    '</div>' +
+    '<div class="vps-chips">' + chips + '</div>';
+}
+
+// Переключение на нужную часть.
+function playPlaylistPart(newIdx) {
+  var list = lessonVideoPlaylist;
+  if (newIdx < 0 || newIdx >= list.length) return;
+  lessonVideoCurrentIdx = newIdx;
+  var lesson = LESSONS[lessonVideoLessonIdx];
+  if (!lesson) return;
+  var isDone = state.scores && state.scores[lessonVideoLessonIdx] > 0;
+  renderVideoPlayer(lesson, isDone);
+  renderPlaylistStrip(lesson);
+  // Автовоспроизведение при переключении
+  setTimeout(function() {
+    var v = document.getElementById('lessonVideoPlayer');
+    if (v) { try { v.play(); } catch(_){} }
+  }, 50);
 }
 
 // Обработчики для реального <video>. Прогресс = процент просмотренного.
@@ -15859,10 +16024,20 @@ function onLessonVideoTimeupdate(video) {
 }
 
 function onLessonVideoEnded() {
+  const list = lessonVideoPlaylist;
+  // Для плейлиста — автопереход к следующей части. videoWatched ставим
+  // только когда закончилась ПОСЛЕДНЯЯ часть.
+  if (list && list.length > 1 && lessonVideoCurrentIdx < list.length - 1) {
+    playPlaylistPart(lessonVideoCurrentIdx + 1);
+    return;
+  }
   state.videoWatched = true;
   videoProgress = 100;
   const fill = document.getElementById('videoProgressFill');
   if (fill) fill.style.width = '100%';
+  if (list && list.length > 1) {
+    showToast('🎬', 'Все части просмотрены', 'Теперь можно выполнять задание');
+  }
 }
 
 // Оставляем как no-op — раньше здесь был fake setInterval, но реальный
