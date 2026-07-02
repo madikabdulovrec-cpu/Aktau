@@ -1222,6 +1222,13 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
   display:flex; align-items:center; justify-content:center; flex-direction:column;
   border:2px solid var(--black); box-shadow: var(--shadow-lg);
 }
+/* Реальный <video> занимает всё пространство контейнера. */
+.video-area.has-video { padding:0; }
+.video-area.has-video video {
+  width:100%; height:100%; display:block;
+  background:#000;
+  object-fit: contain;
+}
 .video-play {
   width:80px; height:80px; border-radius:50%;
   background:var(--pink); color:#fff;
@@ -3533,12 +3540,11 @@ pre, code { white-space: pre-wrap; word-break: break-word; }
 
     <div class="lesson-content">
       <div>
-        <div class="video-area" id="videoArea">
-          <div class="video-title" id="videoTitle">Урок 1</div>
-          <div class="video-play" id="videoPlay" onclick="toggleVideo()">&#9654;</div>
-          <div class="video-duration" id="videoDuration">&#128249; 18:45</div>
-          <div class="video-progress"><div class="video-progress-fill" id="videoProgressFill"></div></div>
-        </div>
+        <!-- Видео-блок. openLesson() рендерит один из двух вариантов:
+             (а) реальный <video> с MP4-файлом (если LESSON_VIDEOS[idx] задан)
+             (б) placeholder-заглушка (для уроков без видео).
+             Fake-плеер со ставкой прогресс-бара удалён. -->
+        <div class="video-area" id="videoArea"></div>
       </div>
 
       <div class="lesson-sidebar">
@@ -14056,6 +14062,31 @@ let state = {
 let videoInterval = null;
 let videoProgress = 0;
 
+// ===== LESSON VIDEOS =====
+// Карта {lessonIdx: relativeUrl} — какие уроки имеют MP4-видео.
+// Файлы должны лежать на Plesk в httpdocs/videos/ рядом с index.html.
+// Индексы берутся из массива LESSONS (0..85). Чтобы добавить видео к новому
+// уроку — загрузить MP4 в httpdocs/videos/ и добавить сюда строку.
+//
+// Актуальные индексы важных уроков:
+//   40 — Золотое сечение (module 3 «Ручные техники», категория 2 «Вакуумный специалист»)
+const LESSON_VIDEOS = {
+  40: 'videos/zolotoe-sechenie.mp4',   // Авторская процедура M&M
+};
+
+// Если URL относительный — превратим в абсолютный (одинаково работает
+// и на локальной проверке через file://, и на боевом academy.mmfabrica.com).
+function resolveVideoUrl(url) {
+  if (!url) return '';
+  if (/^https?:\/\//i.test(url)) return url;
+  return url; // относительный путь — браузер сам разрешит от текущего HTML
+}
+
+// Проверяем что расширение поддерживается тегом <video>.
+function isBrowserVideo(url) {
+  return /\.(mp4|webm|ogg|mov|m4v)(\?|$)/i.test(url);
+}
+
 // ===== SCREENS =====
 function showScreen(id, tab) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
@@ -15676,18 +15707,17 @@ function openLesson(idx) {
     ltc.style.display = 'none';
   }
 
-  document.getElementById('videoDuration').innerHTML = '&#127909; Видео будет добавлено';
-  document.getElementById('videoTitle').textContent = lesson.title;
-  document.getElementById('videoTitle').style.display = 'none';
   document.getElementById('assignmentText').textContent = lesson.task;
 
-  // Reset video
+  // Reset video state
   stopVideo();
   state.videoWatched = isDone;
-  document.getElementById('videoPlay').classList.remove('playing');
-  document.getElementById('videoPlay').innerHTML = '&#9654;';
-  document.getElementById('videoProgressFill').style.width = isDone ? '100%' : '0%';
   videoProgress = isDone ? 100 : 0;
+
+  // === Video rendering ===
+  // Если у урока есть MP4 (см. LESSON_VIDEOS сверху) — рендерим настоящий
+  // <video controls>. Иначе placeholder с надписью «Видео скоро появится».
+  renderLessonVideo(idx, lesson, isDone);
 
   // Checklist
   const cl = document.getElementById('lessonChecklist');
@@ -15770,37 +15800,85 @@ function openMaterial(name) {
 }
 
 // ===== VIDEO =====
-function toggleVideo() {
-  const btn = document.getElementById('videoPlay');
-  const title = document.getElementById('videoTitle');
-  if (videoInterval) {
-    stopVideo();
-    btn.classList.remove('playing');
-    btn.innerHTML = '&#9654;';
-    title.style.display = 'none';
+// Рендерит видео-блок урока. Если LESSON_VIDEOS[idx] задан — настоящий
+// <video controls> с MP4-файлом. Иначе — placeholder «скоро появится».
+function renderLessonVideo(idx, lesson, isDone) {
+  const host = document.getElementById('videoArea');
+  if (!host) return;
+
+  const url = LESSON_VIDEOS[idx];
+  if (url && isBrowserVideo(url)) {
+    // Реальное видео. Прогресс просмотра трекаем через события timeupdate/ended.
+    // При просмотре >= 90% автоматически ставим videoWatched=true и галочку.
+    const resolved = resolveVideoUrl(url);
+    host.classList.add('has-video');
+    host.innerHTML =
+      '<video id="lessonVideoPlayer" controls playsinline preload="metadata" ' +
+        'style="width:100%;height:100%;display:block;background:#000;border-radius:inherit;" ' +
+        'onplay="onLessonVideoPlay()" ' +
+        'ontimeupdate="onLessonVideoTimeupdate(this)" ' +
+        'onended="onLessonVideoEnded()">' +
+        '<source src="' + escapeHtml(resolved) + '" type="video/mp4">' +
+        'Ваш браузер не поддерживает воспроизведение видео.' +
+      '</video>' +
+      '<div class="video-progress" style="position:absolute;bottom:0;left:0;right:0;pointer-events:none;">' +
+        '<div class="video-progress-fill" id="videoProgressFill" style="width:' + (isDone ? 100 : 0) + '%;"></div>' +
+      '</div>' +
+      '<div class="video-title-real" id="videoTitle" style="position:absolute;top:12px;left:14px;background:rgba(0,0,0,0.55);color:#fff;padding:4px 10px;border-radius:8px;font-size:11px;font-weight:700;letter-spacing:0.5px;pointer-events:none;">' +
+        escapeHtml(lesson.title) +
+      '</div>';
   } else {
-    btn.classList.add('playing');
-    btn.innerHTML = '&#9208;';
-    title.style.display = 'block';
-    videoInterval = setInterval(() => {
-      videoProgress += 2;
-      document.getElementById('videoProgressFill').style.width = Math.min(videoProgress, 100) + '%';
-      if (videoProgress >= 100) {
-        stopVideo();
-        state.videoWatched = true;
-        btn.classList.remove('playing');
-        btn.innerHTML = '&#9654;';
-        showToast('&#127909;', 'Видеоурок просмотрен!', 'Теперь выполните задание');
-        // Auto-check first checklist item
-        const firstLi = document.querySelector('#lessonChecklist li');
-        if (firstLi && !firstLi.classList.contains('checked')) toggleCheck(firstLi);
-      }
-    }, 300);
+    // Placeholder — старый стиль-плеер, но без fake-прогресса.
+    host.classList.remove('has-video');
+    host.innerHTML =
+      '<div class="video-title" id="videoTitle" style="display:none;">' + escapeHtml(lesson.title) + '</div>' +
+      '<div class="video-play" id="videoPlay" style="opacity:0.4;cursor:default;">&#127909;</div>' +
+      '<div class="video-duration" id="videoDuration">📹 Видео скоро появится</div>' +
+      '<div class="video-progress"><div class="video-progress-fill" id="videoProgressFill" style="width:' + (isDone ? 100 : 0) + '%;"></div></div>';
+  }
+}
+
+// Обработчики для реального <video>. Прогресс = процент просмотренного.
+function onLessonVideoPlay() {
+  // Автоматически подсветим первый пункт чек-листа при начале просмотра
+  const first = document.querySelector('#lessonChecklist li');
+  if (first && !first.classList.contains('checked')) toggleCheck(first);
+}
+
+function onLessonVideoTimeupdate(video) {
+  if (!video || !video.duration) return;
+  const pct = Math.round(video.currentTime / video.duration * 100);
+  videoProgress = pct;
+  const fill = document.getElementById('videoProgressFill');
+  if (fill) fill.style.width = pct + '%';
+  // При просмотре 90%+ считаем что урок посмотрен.
+  if (pct >= 90 && !state.videoWatched) {
+    state.videoWatched = true;
+    showToast('🎬', 'Видеоурок просмотрен', 'Теперь можно выполнять задание');
+  }
+}
+
+function onLessonVideoEnded() {
+  state.videoWatched = true;
+  videoProgress = 100;
+  const fill = document.getElementById('videoProgressFill');
+  if (fill) fill.style.width = '100%';
+}
+
+// Оставляем как no-op — раньше здесь был fake setInterval, но реальный
+// <video> ничего своего не крутит. Сохраняем сигнатуру, потому что функция
+// вызывается из openLesson и других мест.
+function toggleVideo() {
+  const v = document.getElementById('lessonVideoPlayer');
+  if (v) {
+    if (v.paused) v.play(); else v.pause();
   }
 }
 
 function stopVideo() {
   if (videoInterval) { clearInterval(videoInterval); videoInterval = null; }
+  const v = document.getElementById('lessonVideoPlayer');
+  if (v) { try { v.pause(); v.currentTime = 0; } catch(_){} }
 }
 
 // ===== ASSIGNMENT =====
